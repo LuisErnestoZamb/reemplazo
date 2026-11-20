@@ -79,6 +79,8 @@ fn check(root: &Path) -> bool {
                 "xtask",
                 "-p",
                 "bootinfo",
+                "-p",
+                "pci",
                 "--all-targets",
                 "--",
                 "-D",
@@ -100,7 +102,11 @@ fn check(root: &Path) -> bool {
                 "warnings",
             ],
         )
-        && sh(root, "cargo", &["test", "-p", "xtask", "-p", "bootinfo"])
+        && sh(
+            root,
+            "cargo",
+            &["test", "-p", "xtask", "-p", "bootinfo", "-p", "pci"],
+        )
         && build_kernel(root)
 }
 
@@ -261,14 +267,15 @@ fn run(root: &Path) -> bool {
     }
 }
 
-/// Machine-checked boot test: boot the ISO headless and require the kernel
-/// to print `BOOT_OK` (Multiboot2 parse) followed by `INT_OK` (IDT + PIC
-/// remap + PIT ticks + int3 resume) within `SMOKE_TIMEOUT`. This is the
-/// test that fails on a broken boot path (header, trampoline, GDT, paging,
-/// mbi parse) or interrupt path (IDT, stubs, EOI, timer), so it gates both
-/// milestones.
+/// Machine-checked boot test: boot the ISO headless and require each
+/// milestone's serial marker in order — `BOOT_OK` (Multiboot2 parse),
+/// `MEM_OK` (frame-allocator selftest), `PCI_OK` (config scan), `INT_OK`
+/// (IDT + PIC remap + PIT ticks + int3 resume) — within `SMOKE_TIMEOUT`.
+/// This is the test that fails on a broken boot path (header, trampoline,
+/// GDT, paging, mbi parse), memory path, PCI scan, or interrupt path
+/// (IDT, stubs, EOI, timer), so it gates all four milestones.
 fn smoke(root: &Path) -> bool {
-    const MARKERS: [&str; 2] = ["BOOT_OK", "INT_OK"];
+    const MARKERS: [&str; 4] = ["BOOT_OK", "MEM_OK", "PCI_OK", "INT_OK"];
     if !iso(root) {
         return false;
     }

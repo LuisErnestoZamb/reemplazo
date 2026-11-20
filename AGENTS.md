@@ -20,6 +20,7 @@
   - Audio: HDA (`PipeWire` on Debian) · SMC/fan: `applesmc` + `coretemp`
   - DVD SuperDrive boots ISOs via **Option/C** — the primary way to test on real hardware
   - Bluetooth: present, disabled
+- Network dev split (from the QEMU smoke scan): QEMU's NIC is **e1000** (`8086:100e`) — develop the TCP/IP stack against it; the MacBook's **sky2** (Marvell 88E8053, `11ab:4362`, constant `pci::SKY2_88E8053`) is *not* in QEMU, so the sky2 driver can only be validated on real hardware.
 
 ## Mistakes to avoid
 
@@ -32,7 +33,7 @@
 
 - Git: branch `main`, remote `git@github.com:LuisErnestoZamb/reemplazo.git`. Commits: conventional (`feat:`, `fix:`, `docs:`, `build:`), one milestone per commit, message records what was actually verified.
 - **Before every commit:** `cargo xtask check` (fmt + clippy for host crates *and* kernel target + host tests + kernel cross-build). Kernel is never linted/tested for the host — it is `x86_64-unknown-none` only.
-- **Boot smoke test:** `cargo xtask smoke` — builds the ISO, boots it headless, asserts the serial `BOOT_OK` marker within 30s. This is the test that catches broken header/trampoline/GDT/paging/mbi code.
+- **Boot smoke test:** `cargo xtask smoke` — builds the ISO, boots it headless, asserts each milestone's serial marker in order (`BOOT_OK → MEM_OK → PCI_OK → INT_OK`) within 30s. This is the test that catches broken boot (header/trampoline/paging/mbi), frame-allocator, PCI-scan, or interrupt (IDT/PIC/PIT) code.
 - Interactive boot: `cargo xtask run` (Ctrl-C quits; stale VM containers are force-cleaned on next run).
 - Single test: `cargo test -p bootinfo <name>`.
 - Toolchain quirk (macOS 13, verified): no native `grub-mkrescue`, and Homebrew **cannot** build QEMU (Tier 3 → source build fails). Everything runs in the `reemplazo-tools` image (`tools/Dockerfile`: grub + xorriso + qemu); xtask prefers a host `qemu-system-x86_64` if one ever exists. Docker daemon must be running.

@@ -44,3 +44,41 @@ pub(crate) unsafe fn inb(port: u16) -> u8 {
     }
     val
 }
+
+/// Output a dword to I/O port `port` (x86 `out` instruction).
+/// Needed for PCI configuration (CF8/CFC).
+///
+/// # Safety
+/// Same contract as [`outb`], for 32-bit access width.
+#[inline]
+pub(crate) unsafe fn outl(port: u16, val: u32) {
+    // SAFETY: forwarded to the caller's contract above.
+    unsafe {
+        core::arch::asm!(
+            "out dx, eax",
+            in("dx") port,
+            in("eax") val,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+}
+
+/// Read a dword from I/O port `port` (x86 `in` instruction).
+///
+/// # Safety
+/// Same contract as [`inb`], for 32-bit access width.
+#[inline]
+pub(crate) unsafe fn inl(port: u16) -> u32 {
+    let val: u32;
+    // SAFETY: forwarded to the caller's contract above; output operand is
+    // always initialized by the `in` instruction.
+    unsafe {
+        core::arch::asm!(
+            "in eax, dx",
+            out("eax") val,
+            in("dx") port,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    val
+}

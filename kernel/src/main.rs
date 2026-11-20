@@ -14,6 +14,8 @@
 mod serial;
 
 mod idt;
+mod memory;
+mod pci;
 mod pic;
 mod pit;
 mod port;
@@ -45,12 +47,19 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
     }
 
     match read_mbi(mbi_addr) {
-        Ok(info) => report_boot_info(&info),
+        Ok(info) => {
+            report_boot_info(&info);
+            memory::init(&info, mbi_addr);
+            memory::selftest(&info, mbi_addr);
+        }
         Err(e) => {
             serial_println!("FATAL: bad multiboot2 info: {:?}", e);
             halt();
         }
     }
+
+    let scan = crate::pci::scan();
+    crate::pci::selftest(&scan);
 
     arm_and_test_interrupts();
 

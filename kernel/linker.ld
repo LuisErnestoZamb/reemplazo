@@ -12,6 +12,9 @@ ENTRY(_start)
 
 SECTIONS {
     . = 2M;
+    /* Used by the frame allocator (memory.rs) to reserve the kernel image
+     * — incl. .bss: boot stack, page tables, bitmap — from free RAM. */
+    kernel_start = .;
 
     .multiboot_header : {
         KEEP(*(.multiboot_header))
@@ -34,6 +37,10 @@ SECTIONS {
         *(COMMON)
         *(.bss .bss.*)
     }
+
+    /* Page-align the end so whole-frame reservation covers everything. */
+    . = ALIGN(4K);
+    kernel_end = .;
 
     /DISCARD/ : {
         *(.eh_frame*)

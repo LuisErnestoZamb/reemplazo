@@ -11,7 +11,12 @@ name = "kernel"
 version = "0.1.0"
 dependencies = [
  "bootinfo",
+ "pci",
 ]
+
+[[package]]
+name = "pci"
+version = "0.1.0"
 
 [[package]]
 name = "xtask"
