@@ -262,10 +262,13 @@ fn run(root: &Path) -> bool {
 }
 
 /// Machine-checked boot test: boot the ISO headless and require the kernel
-/// to print the `BOOT_OK` marker on serial within `SMOKE_TIMEOUT`. This is
-/// the test that fails on a broken boot path (bad header, trampoline, GDT,
-/// paging, or mbi parse), so it gates the boot milestone.
+/// to print `BOOT_OK` (Multiboot2 parse) followed by `INT_OK` (IDT + PIC
+/// remap + PIT ticks + int3 resume) within `SMOKE_TIMEOUT`. This is the
+/// test that fails on a broken boot path (header, trampoline, GDT, paging,
+/// mbi parse) or interrupt path (IDT, stubs, EOI, timer), so it gates both
+/// milestones.
 fn smoke(root: &Path) -> bool {
+    const MARKERS: [&str; 2] = ["BOOT_OK", "INT_OK"];
     if !iso(root) {
         return false;
     }
@@ -311,22 +314,26 @@ fn smoke(root: &Path) -> bool {
     drop(tx); // channels close when both readers hit EOF → recv errs end the loop
 
     let deadline = Instant::now() + SMOKE_TIMEOUT;
-    let mut passed = false;
+    let mut next_marker = 0usize;
     let mut collected: Vec<String> = Vec::new();
     while let Ok(line) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
         println!("smoke| {line}");
-        if line.contains("BOOT_OK") {
-            passed = true;
-            break;
+        if line.contains(MARKERS[next_marker]) {
+            next_marker += 1;
+            if next_marker == MARKERS.len() {
+                break;
+            }
         }
         collected.push(line);
     }
+    let passed = next_marker == MARKERS.len();
     stop_vm(&mut child, container.as_deref());
 
     if passed {
-        println!("smoke: PASS — kernel reached BOOT_OK");
+        println!("smoke: PASS — kernel reached {}", MARKERS.join(" + "));
     } else {
-        eprintln!("smoke: FAIL — no BOOT_OK within {SMOKE_TIMEOUT:?}");
+        let missing = MARKERS[next_marker..].join(" + ");
+        eprintln!("smoke: FAIL — missing {missing} within {SMOKE_TIMEOUT:?}");
         for line in &collected {
             eprintln!("smoke| {line}");
         }

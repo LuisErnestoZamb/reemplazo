@@ -4,50 +4,10 @@
 //! compile-time constant, so the type is stateless — no `static mut`, no
 //! locking; safe to call from `kernel_main` and the panic path alike.
 
+use crate::port::{inb, outb};
 use core::fmt;
 
 const COM1_BASE: u16 = 0x3F8;
-
-/// Output byte `val` to I/O port `port` (x86 `out` instruction).
-///
-/// # Safety
-/// The caller must ensure the port is a valid, writable I/O port for the
-/// device being addressed; out-of-range or wrong-device writes are a
-/// hardware-contract violation, not a memory-safety one.
-#[inline]
-unsafe fn outb(port: u16, val: u8) {
-    // SAFETY: forwarded to the caller's contract above; `out` to a port
-    // touches I/O space only, never memory.
-    unsafe {
-        core::arch::asm!(
-            "out dx, al",
-            in("dx") port,
-            in("al") val,
-            options(nomem, nostack, preserves_flags)
-        );
-    }
-}
-
-/// Read a byte from I/O port `port` (x86 `in` instruction).
-///
-/// # Safety
-/// The caller must ensure the port is a valid, readable I/O port for the
-/// device being addressed.
-#[inline]
-unsafe fn inb(port: u16) -> u8 {
-    let val: u8;
-    // SAFETY: forwarded to the caller's contract above; `in` from a port
-    // touches I/O space only and the output operand is always initialized.
-    unsafe {
-        core::arch::asm!(
-            "in al, dx",
-            out("al") val,
-            in("dx") port,
-            options(nomem, nostack, preserves_flags)
-        );
-    }
-    val
-}
 
 /// A polled UART at a fixed COM-port base.
 #[derive(Clone, Copy)]

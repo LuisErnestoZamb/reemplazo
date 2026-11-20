@@ -1,9 +1,10 @@
 //! Kernel entry point after the 32→64-bit trampoline in `entry.S`.
 //!
 //! Flow: init COM1 → validate Multiboot2 magic → parse+report the boot
-//! information → park the CPU. All user/hardware-provided data is treated
-//! as untrusted: bounds-checked by the `bootinfo` crate, `Result`-propagated,
-//! no `unwrap`.
+//! information → arm interrupts (IDT, PIC remap, PIT) → prove exception
+//! and timer paths → park the CPU. All user/hardware-provided data is
+//! treated as untrusted: bounds-checked by the `bootinfo` crate,
+//! `Result`-propagated, no `unwrap`.
 
 #![no_std]
 #![no_main]
@@ -11,6 +12,11 @@
 
 #[macro_use]
 mod serial;
+
+mod idt;
+mod pic;
+mod pit;
+mod port;
 
 use bootinfo::{BootInfo, ParseError};
 use core::panic::PanicInfo;
@@ -45,6 +51,8 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
             halt();
         }
     }
+
+    arm_and_test_interrupts();
 
     serial_println!("kernel_main: idle (no scheduler yet)");
     halt()
@@ -130,8 +138,35 @@ fn report_boot_info(info: &BootInfo) {
     serial_println!("BOOT_OK"); // machine-checked by `cargo xtask smoke`
 }
 
-/// Park the CPU forever (interrupts are off; nothing can wake us).
-fn halt() -> ! {
+/// Arm interrupts and prove both delivery paths before parking.
+fn arm_and_test_interrupts() {
+    idt::init(); // build + lidt (needs the GDT64 from entry.S)
+    pic::init(); // remap IRQs to 32..=47, mask all but IRQ0
+    pit::init(); // PIT channel 0 at HZ
+    serial_println!("interrupts: IDT loaded, PIC remapped, PIT {} Hz", pit::HZ);
+
+    // Enable maskable interrupts (IF was off since the trampoline).
+    // SAFETY: `sti` is the documented way to enable interrupts after the
+    // IDT/PIC are armed; single-core, no races possible yet.
+    unsafe { core::arch::asm!("sti", options(nomem, nostack)) }
+
+    // Prove the exception path: int3 must hit our handler and return here.
+    unsafe { core::arch::asm!("int3", options(nomem, nostack)) }
+    serial_println!("interrupts: int3 returned to caller");
+
+    // Prove the IRQ path: wait for three timer ticks (hlt sleeps until one).
+    let deadline = pit::ticks() + 3;
+    while pit::ticks() < deadline {
+        // SAFETY: hlt with IF=1 sleeps until the next interrupt; harmless
+        // if a tick already raced in (loop re-checks).
+        unsafe { core::arch::asm!("hlt", options(nomem, nostack)) }
+    }
+    serial_println!("interrupts: {} PIT ticks received", pit::ticks());
+    serial_println!("INT_OK"); // machine-checked by `cargo xtask smoke`
+}
+
+/// Park the CPU forever (interrupts off; nothing can wake us).
+pub(crate) fn halt() -> ! {
     loop {
         // SAFETY: `hlt` with interrupts disabled is the canonical idle; it
         // cannot violate memory safety.
