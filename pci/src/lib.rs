@@ -24,6 +24,42 @@ pub fn is_sky2_target(vendor_id: u16, device_id: u16) -> bool {
     vendor_id == MARVELL_VENDOR && device_id == SKY2_88E8053
 }
 
+/// Intel (pci.ids) — QEMU's e1000 lives under this vendor.
+pub const INTEL_VENDOR: u16 = 0x8086;
+/// Intel 82540EM Gigabit Ethernet = QEMU's `e1000` device
+/// (`E1000_DEV_ID_82540EM`, seen as `8086:100e` in our own PCI smoke scan).
+pub const E1000_82540EM: u16 = 0x100E;
+
+/// PCI command register (offset 0x04), bit 1: Memory Space Enable
+/// (PCI Local Bus Spec).
+pub const CMD_MEMORY_SPACE: u16 = 1 << 1;
+/// PCI command register, bit 2: Bus Master Enable (needed for DMA).
+pub const CMD_BUS_MASTER: u16 = 1 << 2;
+
+/// Decode a *memory* base address from BAR0 (+ BAR1 when the BAR is
+/// 64-bit). Per the PCI spec the low 4 bits of a memory BAR are flags
+/// (bit0 space type, bits2:1 size, bit3 prefetchable) — Linux clears them
+/// with `PCI_BASE_ADDRESS_MEM_MASK = ~0x0f`.
+///
+/// Returns `None` for I/O-space BARs (bit0 set) and unassigned BARs (0).
+pub fn mem_bar_address(bar0: u32, bar1: u32) -> Option<u64> {
+    if bar0 & 1 != 0 {
+        return None; // I/O space BAR
+    }
+    let is_64bit = (bar0 >> 1) & 0b11 == 0b10; // bits2:1 == 0b10
+    let low = u64::from(bar0 & !0xF);
+    let addr = if is_64bit {
+        low | (u64::from(bar1) << 32)
+    } else {
+        low
+    };
+    if addr == 0 {
+        None // unassigned
+    } else {
+        Some(addr)
+    }
+}
+
 /// A PCI bus:device.function address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Location {
@@ -212,5 +248,30 @@ mod tests {
         assert_eq!(dev.to_string(), "1a:0b.2 11ab:4362 class 0200");
         assert!(is_sky2_target(MARVELL_VENDOR, SKY2_88E8053));
         assert!(!is_sky2_target(0x8086, 0x1237)); // QEMU host bridge
+    }
+
+    #[test]
+    fn mem_bar_decoding() {
+        // I/O-space BAR (bit0 set) → rejected.
+        assert_eq!(mem_bar_address(0x0000_C001, 0), None);
+        // Unassigned memory BAR → rejected.
+        assert_eq!(mem_bar_address(0, 0), None);
+        // 32-bit memory BAR: flags in low 4 bits are masked off.
+        assert_eq!(mem_bar_address(0xFEB8_0000, 0xDEAD_BEEF), Some(0xFEB8_0000));
+        // Prefetchable flag (bit3) also masked.
+        assert_eq!(mem_bar_address(0xFEB8_0008, 0), Some(0xFEB8_0000));
+        // 64-bit memory BAR (bits2:1 == 0b10): high dword joins in.
+        assert_eq!(
+            mem_bar_address(0xFEB8_0004, 0x0000_0001),
+            Some(0x0000_0001_FEB8_0000)
+        );
+    }
+
+    #[test]
+    fn command_bits_and_ids() {
+        assert_eq!(CMD_MEMORY_SPACE, 0x2);
+        assert_eq!(CMD_BUS_MASTER, 0x4);
+        assert_eq!(INTEL_VENDOR, 0x8086);
+        assert_eq!(E1000_82540EM, 0x100E);
     }
 }

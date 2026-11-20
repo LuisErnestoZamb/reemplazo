@@ -269,13 +269,14 @@ fn run(root: &Path) -> bool {
 
 /// Machine-checked boot test: boot the ISO headless and require each
 /// milestone's serial marker in order — `BOOT_OK` (Multiboot2 parse),
-/// `MEM_OK` (frame-allocator selftest), `PCI_OK` (config scan), `INT_OK`
-/// (IDT + PIC remap + PIT ticks + int3 resume) — within `SMOKE_TIMEOUT`.
-/// This is the test that fails on a broken boot path (header, trampoline,
-/// GDT, paging, mbi parse), memory path, PCI scan, or interrupt path
-/// (IDT, stubs, EOI, timer), so it gates all four milestones.
+/// `MEM_OK` (frame-allocator selftest), `PCI_OK` (config scan),
+/// `E1000_OK` (NIC probe + MMIO + MAC), `INT_OK` (IDT + PIC remap + PIT
+/// ticks + int3 resume) — within `SMOKE_TIMEOUT`. This is the test that
+/// fails on a broken boot path (header, trampoline, GDT, paging, mbi
+/// parse), memory path, PCI scan, e1000 driver, or interrupt path (IDT,
+/// stubs, EOI, timer), so it gates all five milestones.
 fn smoke(root: &Path) -> bool {
-    const MARKERS: [&str; 4] = ["BOOT_OK", "MEM_OK", "PCI_OK", "INT_OK"];
+    const MARKERS: [&str; 5] = ["BOOT_OK", "MEM_OK", "PCI_OK", "E1000_OK", "INT_OK"];
     if !iso(root) {
         return false;
     }

@@ -19,17 +19,44 @@ pub struct Scan {
     /// First [`MAX_DEVICES`] functions found, in scan order.
     pub devices: [Option<Device>; MAX_DEVICES],
     /// Total functions found (may exceed what was stored).
-    pub count: usize,
+    count: usize,
+}
+
+impl Scan {
+    /// First stored device matching vendor+device, if any.
+    pub fn find(&self, vendor_id: u16, device_id: u16) -> Option<&Device> {
+        self.devices
+            .iter()
+            .flatten()
+            .find(|d| d.vendor_id == vendor_id && d.device_id == device_id)
+    }
+
+    /// Total functions found (may exceed what was stored).
+    pub fn count(&self) -> usize {
+        self.count
+    }
 }
 
 /// Read one dword of a function's config space.
-fn read32(loc: Location, offset: u8) -> u32 {
+pub(crate) fn read32(loc: Location, offset: u8) -> u32 {
     let addr = pci::config_address(loc, offset);
     // SAFETY: PCI mechanism #1 is universal on PC-compatible chipsets
     // (i440fx in QEMU, ICH7 on the MacBook); CF8/CFC always exist there.
     unsafe {
         outl(CONFIG_ADDRESS, addr);
         inl(CONFIG_DATA)
+    }
+}
+
+/// Write one dword of a function's config space (read-modify-write the
+/// caller side when only some bits should change — mechanism #1 has no
+/// byte enables).
+pub(crate) fn write32(loc: Location, offset: u8, val: u32) {
+    let addr = pci::config_address(loc, offset);
+    // SAFETY: same contract as `read32`.
+    unsafe {
+        outl(CONFIG_ADDRESS, addr);
+        outl(CONFIG_DATA, val);
     }
 }
 
@@ -102,10 +129,10 @@ pub fn scan() -> Scan {
 /// Machine-checked PCI test: prints `PCI_OK` on success, otherwise dumps
 /// context and parks (so `cargo xtask smoke` fails on the marker).
 pub fn selftest(scan: &Scan) {
-    serial_println!("pci: {} devices found", scan.count);
+    serial_println!("pci: {} devices found", scan.count());
 
-    if scan.count < 3 {
-        serial_println!("FATAL: pci: only {} devices (scan broken?)", scan.count);
+    if scan.count() < 3 {
+        serial_println!("FATAL: pci: only {} devices (scan broken?)", scan.count());
         crate::halt();
     }
 

@@ -13,6 +13,7 @@
 #[macro_use]
 mod serial;
 
+mod e1000;
 mod idt;
 mod memory;
 mod pci;
@@ -60,6 +61,7 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
 
     let scan = crate::pci::scan();
     crate::pci::selftest(&scan);
+    crate::e1000::init(&scan);
 
     arm_and_test_interrupts();
 
