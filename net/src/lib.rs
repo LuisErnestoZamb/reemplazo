@@ -13,6 +13,8 @@ pub const ETHERTYPE_ARP: u16 = 0x0806;
 pub const ETHERTYPE_IPV4: u16 = 0x0800;
 /// IP protocol number for ICMP (IANA).
 pub const IPPROTO_ICMP: u8 = 1;
+/// IP protocol number for TCP (IANA).
+pub const IPPROTO_TCP: u8 = 6;
 /// IP protocol number for UDP (IANA).
 pub const IPPROTO_UDP: u8 = 17;
 /// ARP hardware type: Ethernet.
@@ -138,6 +140,13 @@ pub fn internet_checksum(data: &[u8]) -> u16 {
     complement(sum_be16_words(data))
 }
 
+/// RFC 768: a UDP checksum that computes to zero is transmitted as
+/// all ones — an all-zero field means "no checksum was computed" and
+/// receivers (slirp included) skip validation for it entirely.
+pub fn udp_csum(computed: u16) -> u16 {
+    if computed == 0 { 0xFFFF } else { computed }
+}
+
 /// Internet checksum over an IPv4 pseudo-header (RFC 768) + transport
 /// segment: used for UDP. `segment` must fit a u16 length field (true
 /// for every frame this OS builds).
@@ -163,6 +172,51 @@ impl Endpoint {
     }
 }
 
+/// Write the Ethernet and IPv4 headers of a frame whose transport
+/// segment is `transport_len` bytes, zeroing the whole frame region
+/// first (no stack junk may leak onto the wire) and storing the IPv4
+/// header checksum. `ip_id`/`ip_flags` are the IPv4 identification and
+/// flags/fragment fields: UDP/TCP/DHCP leave them zero (single
+/// datagrams), ICMP echoes carry the echo id plus DF.
+///
+/// The caller writes the transport segment *after* this returns — a
+/// transport checksum can only be computed once the payload is final
+/// (the bug that once broke DHCP). Returns the total frame length, or
+/// `None` when a length would overflow `u16` or `buf` is too small.
+fn write_eth_ipv4(
+    buf: &mut [u8],
+    src: Endpoint,
+    dst: Endpoint,
+    proto: u8,
+    transport_len: usize,
+    ip_id: u16,
+    ip_flags: u16,
+) -> Option<usize> {
+    let ip_total = u16::try_from(transport_len).ok()?.checked_add(20)?;
+    let total = ETHERNET_HDR + usize::from(ip_total);
+    let b = buf.get_mut(..total)?;
+    b.fill(0); // no stack junk on the wire
+
+    // Ethernet header.
+    b[..6].copy_from_slice(&dst.mac);
+    b[6..12].copy_from_slice(&src.mac);
+    b[12..14].copy_from_slice(&ETHERTYPE_IPV4.to_be_bytes());
+
+    // IPv4 header.
+    let ip = &mut b[ETHERNET_HDR..ETHERNET_HDR + 20];
+    ip[0] = 0x45; // version 4, IHL 5
+    ip[2..4].copy_from_slice(&ip_total.to_be_bytes());
+    ip[4..6].copy_from_slice(&ip_id.to_be_bytes());
+    ip[6..8].copy_from_slice(&ip_flags.to_be_bytes());
+    ip[8] = 64; // TTL
+    ip[9] = proto;
+    ip[12..16].copy_from_slice(&src.ip);
+    ip[16..20].copy_from_slice(&dst.ip);
+    let ip_csum = internet_checksum(ip);
+    ip[10..12].copy_from_slice(&ip_csum.to_be_bytes());
+    Some(total)
+}
+
 /// Build eth + IPv4 + UDP around a **final** `payload` and return the
 /// frame length, or `None` if `buf` is too small. The checksums are
 /// computed last, over the complete segment — passing an unfinished
@@ -180,33 +234,16 @@ pub fn build_udp_frame(
     // never truncate a length silently).
     let payload_len = u16::try_from(payload.len()).ok()?;
     let ip_total = payload_len.checked_add(20 + 8)?;
-    let total = ETHERNET_HDR + usize::from(ip_total);
-    let b = buf.get_mut(..total)?;
-    b.fill(0);
-
-    // Ethernet header.
-    b[..6].copy_from_slice(&dst.mac);
-    b[6..12].copy_from_slice(&src.mac);
-    b[12..14].copy_from_slice(&ETHERTYPE_IPV4.to_be_bytes());
-
-    // IPv4 header.
-    let ip = &mut b[ETHERNET_HDR..ETHERNET_HDR + 20];
-    ip[0] = 0x45; // version 4, IHL 5
-    ip[2..4].copy_from_slice(&ip_total.to_be_bytes());
-    ip[8] = 64; // TTL
-    ip[9] = IPPROTO_UDP;
-    ip[12..16].copy_from_slice(&src.ip);
-    ip[16..20].copy_from_slice(&dst.ip);
-    let ip_csum = internet_checksum(ip);
-    ip[10..12].copy_from_slice(&ip_csum.to_be_bytes());
+    let transport_len = usize::from(ip_total) - 20;
+    let total = write_eth_ipv4(buf, src, dst, IPPROTO_UDP, transport_len, 0, 0)?;
 
     // UDP header + payload (checksum after the payload is in place).
-    let udp = &mut b[ETHERNET_HDR + 20..];
+    let udp = &mut buf[ETHERNET_HDR + 20..total];
     udp[0..2].copy_from_slice(&src_port.to_be_bytes());
     udp[2..4].copy_from_slice(&dst_port.to_be_bytes());
     udp[4..6].copy_from_slice(&(8u16 + payload_len).to_be_bytes());
     udp[8..8 + payload.len()].copy_from_slice(payload);
-    let udp_csum = checksum_with_pseudo(src.ip, dst.ip, IPPROTO_UDP, udp);
+    let udp_csum = udp_csum(checksum_with_pseudo(src.ip, dst.ip, IPPROTO_UDP, udp));
     udp[6..8].copy_from_slice(&udp_csum.to_be_bytes());
     Some(total)
 }
@@ -232,33 +269,13 @@ pub fn build_icmp_echo(
     seq: u16,
     payload: &[u8],
 ) -> Option<usize> {
-    let ip_len = 20usize;
-    let icmp_len = 8usize + payload.len();
-    let total = ETHERNET_HDR + ip_len + icmp_len;
-    let b = buf.get_mut(..total)?;
-
-    // Ethernet header.
-    b[..6].copy_from_slice(&dst.mac);
-    b[6..12].copy_from_slice(&src.mac);
-    b[12..14].copy_from_slice(&ETHERTYPE_IPV4.to_be_bytes());
-
-    // IPv4 header (checksum field zeroed, then computed over it).
-    let ip = &mut b[ETHERNET_HDR..ETHERNET_HDR + ip_len];
-    ip[0] = 0x45; // version 4, IHL 5 (no options)
-    ip[1] = 0x00; // DSCP/ECN
-    ip[2..4].copy_from_slice(&((ip_len + icmp_len) as u16).to_be_bytes());
-    ip[4..6].copy_from_slice(&id.to_be_bytes()); // identification
-    ip[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // flags: DF
-    ip[8] = 64; // TTL
-    ip[9] = IPPROTO_ICMP;
-    ip[10..12].fill(0); // header checksum (placeholder)
-    ip[12..16].copy_from_slice(&src.ip);
-    ip[16..20].copy_from_slice(&dst.ip);
-    let ip_csum = internet_checksum(ip);
-    ip[10..12].copy_from_slice(&ip_csum.to_be_bytes());
+    let icmp_len = 8usize.checked_add(payload.len())?;
+    // ICMP echoes carry the echo id as the IPv4 identification field
+    // and set DF (no fragmentation of an echo probe).
+    let total = write_eth_ipv4(buf, src, dst, IPPROTO_ICMP, icmp_len, id, 0x4000)?;
 
     // ICMP echo request (checksum placeholder likewise).
-    let icmp = &mut b[ETHERNET_HDR + ip_len..];
+    let icmp = &mut buf[ETHERNET_HDR + 20..total];
     icmp[0] = ICMP_ECHO_REQUEST;
     icmp[1] = 0x00; // code
     icmp[4..6].copy_from_slice(&id.to_be_bytes());
@@ -465,6 +482,16 @@ mod tests {
         );
         // Odd length pads the tail byte with a zero.
         assert_eq!(internet_checksum(&[0x12]), 0xEDFF);
+    }
+
+    #[test]
+    fn rfc768_zero_udp_checksum_becomes_all_ones() {
+        // A computed zero must go on the wire as all ones: an all-zero
+        // field means "not computed" and the receiver skips validation.
+        assert_eq!(udp_csum(0x0000), 0xFFFF);
+        // Any other value passes through untouched.
+        assert_eq!(udp_csum(0x1234), 0x1234);
+        assert_eq!(udp_csum(0xFFFF), 0xFFFF);
     }
 
     #[test]

@@ -124,7 +124,7 @@ fn build_bootp(buf: &mut [u8], mac: [u8; 6], options: &[u8]) -> Option<usize> {
     d[240..240 + options.len()].copy_from_slice(options);
 
     // Now the payload is final: compute and store the UDP checksum.
-    let udp_csum = checksum_with_pseudo([0; 4], [0xFF; 4], IPPROTO_UDP, udp);
+    let udp_csum = crate::udp_csum(checksum_with_pseudo([0; 4], [0xFF; 4], IPPROTO_UDP, udp));
     udp[6..8].copy_from_slice(&udp_csum.to_be_bytes());
     Some(total)
 }
