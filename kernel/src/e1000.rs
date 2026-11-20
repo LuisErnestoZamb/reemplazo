@@ -462,9 +462,11 @@ impl E1000 {
         Some(n)
     }
 
-    /// End-to-end proof: transmit an ARP request for slirp's gateway and
-    /// require slirp's ARP reply back on the RX ring. Prints `NET_OK`.
-    pub fn selftest(&mut self) {
+    /// End-to-end proof of the TX/RX path: transmit an ARP request for
+    /// slirp's gateway, require slirp's ARP reply back on the RX ring,
+    /// print `NET_OK`, and return the peer's MAC (addressed by the ICMP
+    /// test that follows).
+    pub fn selftest(&mut self) -> [u8; 6] {
         let mut req = [0u8; 64];
         let len = match net::build_arp_request(
             &mut req,
@@ -502,7 +504,67 @@ impl E1000 {
         if net::dst_mac(frame) != Some(self.mac) {
             fatal("frame not addressed to our MAC (filter broken?)");
         }
+        let Some(peer) = net::arp_sender_mac(frame) else {
+            fatal("ARP reply carries no sender address");
+        };
+        if peer == self.mac {
+            fatal("ARP sender resolved to our own MAC");
+        }
         serial_println!("e1000: RX {n} bytes ARP reply from slirp");
         serial_println!("NET_OK"); // machine-checked by `cargo xtask smoke`
+        peer
+    }
+
+    /// ICMP echo roundtrip to the ARP-resolved peer: proves the IPv4
+    /// path end-to-end (both internet checksums are validated on the
+    /// reply). Prints `PING_OK`.
+    pub fn ping_test(&mut self, peer_mac: [u8; 6]) {
+        const PING_ID: u16 = 0x5252;
+        const PING_SEQ: u16 = 7;
+        const PING_PAYLOAD: [u8; 8] = *b"pingtest";
+
+        let mut req = [0u8; 128];
+        let src = net::Endpoint::new(self.mac, net::SLIRP_GUEST_IP);
+        let dst = net::Endpoint::new(peer_mac, net::SLIRP_GATEWAY);
+        let len = match net::build_icmp_echo(&mut req, src, dst, PING_ID, PING_SEQ, &PING_PAYLOAD) {
+            Some(n) => n,
+            None => fatal("cannot build ICMP echo (buffer bug?)"),
+        };
+        if let Err(e) = self.transmit(&req[..len]) {
+            fatal(e);
+        }
+        serial_println!("e1000: TX {len} bytes ICMP echo ->10.0.2.2");
+
+        // Poll until a *matching* reply arrives (skip stray frames).
+        let mut rx = [0u8; 2048];
+        let mut spins = 0u32;
+        let reply = loop {
+            if spins >= RX_POLLS {
+                fatal("timeout waiting for ICMP echo reply");
+            }
+            spins += 1;
+            if let Some(n) = self.receive(&mut rx) {
+                if let Some(reply) = net::parse_icmp_echo_reply(&rx[..n]) {
+                    break reply;
+                }
+            } else {
+                core::hint::spin_loop();
+            }
+        };
+        if reply.src_ip != net::SLIRP_GATEWAY || reply.dst_ip != net::SLIRP_GUEST_IP {
+            fatal("echo reply addressed to the wrong hosts");
+        }
+        if (reply.id, reply.seq) != (PING_ID, PING_SEQ) {
+            fatal("echo reply id/seq mismatch");
+        }
+        if reply.payload != PING_PAYLOAD {
+            fatal("echo reply payload corrupted");
+        }
+        serial_println!(
+            "e1000: ICMP echo reply from 10.0.2.2 (id={:#06x} seq={}, payload intact)",
+            reply.id,
+            reply.seq
+        );
+        serial_println!("PING_OK"); // machine-checked by `cargo xtask smoke`
     }
 }

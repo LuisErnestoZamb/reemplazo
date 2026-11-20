@@ -62,7 +62,8 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
     let scan = crate::pci::scan();
     crate::pci::selftest(&scan);
     if let Some(mut nic) = crate::e1000::init(&scan) {
-        nic.selftest();
+        let peer = nic.selftest();
+        nic.ping_test(peer);
     }
 
     arm_and_test_interrupts();
