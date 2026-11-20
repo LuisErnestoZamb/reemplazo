@@ -89,13 +89,21 @@ Estas reglas existen porque sus violaciones producen los fallos más caros de di
 - Nunca ejecutes `dd`, `mkfs`, `losetup`, `parted` ni escribas en `/dev/*` sin confirmación explícita y mostrando el dispositivo exacto. Para probar imágenes usa archivos y QEMU, no discos reales.
 - No instales software del sistema ni modifiques configuración global sin pedirlo.
 
+**Seguridad del software: muy seguro, sin bugs conocidos**
+- La meta explícita del proyecto es un sistema **muy seguro y sin bugs conocidos**. Ningún bug conocido queda "para después": o se arregla en el commit, o se documenta en `AGENTS.md` con reproducción y severidad. Un warning de compilación o de lint es un bug futuro: `-D warnings` nunca se relaja.
+- Todo dato externo — usuario, red, disco, MMIO, bootloader, firmware — es hostil: valida longitud, rango, checksum y tipo **antes** de usarlo, con aritmética comprobada. (Ya es regla arriba; esto la convierte en gate de seguridad: un parser que no tiene prueba de entrada maliciosa está incompleto.)
+- `unsafe` es una frontera de seguridad: sin `unsafe` nuevo sin comentario `SAFETY` que enumere las precondiciones. Revisa cada bloque como código adversarial — es el código que puede romper el aislamiento del kernel.
+- Cada parser puro (`bootinfo`, `pci`, `net`, …) tiene tests adversariales: truncados, longitudes gigantes, checksums incorrectos, tags malformados, offsets negativos. Un caso borde descubierto en producción se convierte en test antes del fix.
+- Dependencias: el kernel es `no_std` con **cero dependencias por diseño** — cada crate extra es código en ring0. Antes de añadir cualquiera (también en `xtask`), revisa su estado de seguridad (RustSec Advisory Database / `cargo audit`); nada con CVEs conocidas, sin mantenimiento o con `unsafe` no revisado.
+- Nada de criptografía casera: para ssh/TLS/git usa crates auditados — nunca algoritmos ni protocolos implementados a mano. Secretos y claves: nunca en el repo, en logs ni en dumps.
+
 **Honestidad técnica**
 - Distingue lo que has verificado, lo que infieres y lo que no sabes. "No lo sé, voy a comprobarlo en la especificación" es una respuesta correcta.
 - Si una API de un crate no coincide con tu recuerdo, lee la documentación de la versión instalada (`cargo doc`, `docs.rs`, el código en `~/.cargo/registry`).
 
 ## Definición de "hecho"
 
-Un cambio está terminado cuando: compila sin warnings; `cargo fmt --check` y `cargo clippy -- -D warnings` pasan; hay tests (host y/o QEMU) que fallarían sin el cambio; los `unsafe` nuevos tienen `SAFETY`; la documentación y el roadmap reflejan el estado; y el commit es atómico y bisectable. La lista completa está en `references/checklists.md`.
+Un cambio está terminado cuando: compila sin warnings; `cargo fmt --check` y `cargo clippy -- -D warnings` pasan; hay tests (host y/o QEMU) que fallarían sin el cambio; los `unsafe` nuevos tienen `SAFETY`; **ningún bug conocido queda sin registrar (arreglado o documentado con repro en `AGENTS.md`) y todo parser tiene tests adversariales**; la documentación y el roadmap reflejan el estado; y el commit es atómico y bisectable. La lista completa está en `references/checklists.md`.
 
 ## Anti-patrones frecuentes
 
