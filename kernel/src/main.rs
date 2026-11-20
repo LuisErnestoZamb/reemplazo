@@ -13,6 +13,7 @@
 #[macro_use]
 mod serial;
 
+mod dhcp;
 mod e1000;
 mod idt;
 mod memory;
@@ -64,6 +65,7 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
     if let Some(mut nic) = crate::e1000::init(&scan) {
         let peer = nic.selftest();
         nic.ping_test(peer);
+        let _net = dhcp::configure(&mut nic); // kept for TCP/DNS milestones
     }
 
     arm_and_test_interrupts();

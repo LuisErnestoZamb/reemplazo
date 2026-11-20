@@ -13,6 +13,8 @@ pub const ETHERTYPE_ARP: u16 = 0x0806;
 pub const ETHERTYPE_IPV4: u16 = 0x0800;
 /// IP protocol number for ICMP (IANA).
 pub const IPPROTO_ICMP: u8 = 1;
+/// IP protocol number for UDP (IANA).
+pub const IPPROTO_UDP: u8 = 17;
 /// ARP hardware type: Ethernet.
 pub const ARP_HTYPE_ETHERNET: u16 = 1;
 /// ARP protocol type: IPv4.
@@ -30,9 +32,9 @@ pub const ARP_FRAME_LEN: usize = 42;
 /// Broadcast destination MAC.
 pub const BROADCAST_MAC: [u8; 6] = [0xFF; 6];
 
-/// QEMU user-mode networking (slirp) defaults — hard-coded until the
-/// DHCP client milestone replaces the guest address. slirp answers ARP
-/// for its gateway, which is what makes the TX/RX roundtrip test work.
+/// QEMU user-mode networking (slirp) defaults — asserted by the DHCP
+/// client once it exists (a mismatch means this constant drifted from
+/// reality). The pre-DHCP tests (ARP/ping) also use them directly.
 pub const SLIRP_GUEST_IP: [u8; 4] = [10, 0, 2, 15];
 pub const SLIRP_GATEWAY: [u8; 4] = [10, 0, 2, 2];
 
@@ -87,8 +89,9 @@ pub fn arp_sender_mac(frame: &[u8]) -> Option<[u8; 6]> {
     frame.get(22..28)?.try_into().ok()
 }
 
-/// RFC 1071 internet checksum (one's complement of the one's sum).
-pub fn internet_checksum(data: &[u8]) -> u16 {
+/// Sum big-endian 16-bit words (odd tail byte padded with zero), per
+/// RFC 1071 — shared by the plain and pseudo-header checksums.
+fn sum_be16_words(data: &[u8]) -> u32 {
     let mut sum: u32 = 0;
     let mut i = 0;
     while i + 1 < data.len() {
@@ -98,10 +101,32 @@ pub fn internet_checksum(data: &[u8]) -> u16 {
     if i < data.len() {
         sum += u32::from(data[i]) << 8; // odd tail byte: pad with zero
     }
-    while sum > 0xFFFF {
-        sum = (sum & 0xFFFF) + (sum >> 16);
+    sum
+}
+
+fn complement(sum: u32) -> u16 {
+    let mut s = sum;
+    while s > 0xFFFF {
+        s = (s & 0xFFFF) + (s >> 16);
     }
-    !(sum as u16)
+    !(s as u16)
+}
+
+/// RFC 1071 internet checksum (one's complement of the one's sum).
+pub fn internet_checksum(data: &[u8]) -> u16 {
+    complement(sum_be16_words(data))
+}
+
+/// Internet checksum over an IPv4 pseudo-header (RFC 768) + transport
+/// segment: used for UDP. `segment` must fit a u16 length field (true
+/// for every frame this OS builds).
+pub fn checksum_with_pseudo(src_ip: [u8; 4], dst_ip: [u8; 4], proto: u8, segment: &[u8]) -> u16 {
+    let mut sum = sum_be16_words(&src_ip);
+    sum += sum_be16_words(&dst_ip);
+    sum += u32::from(proto); // pseudo: 0x00 | protocol
+    sum += (segment.len() & 0xFFFF) as u32; // pseudo: UDP length
+    sum += sum_be16_words(segment);
+    complement(sum)
 }
 
 /// A link-layer + network-layer address pair (MAC + IPv4).
@@ -212,6 +237,53 @@ pub fn parse_icmp_echo_reply(frame: &[u8]) -> Option<IcmpEchoReply<'_>> {
         id: u16::from_be_bytes([icmp[4], icmp[5]]),
         seq: u16::from_be_bytes([icmp[6], icmp[7]]),
         payload: icmp.get(8..)?,
+    })
+}
+
+pub mod dhcp;
+
+/// A validated UDP datagram carried by an IPv4 frame.
+#[derive(Debug, PartialEq, Eq)]
+pub struct UdpDatagram<'a> {
+    pub src_port: u16,
+    pub dst_port: u16,
+    pub payload: &'a [u8],
+}
+
+/// Parse eth + IPv4 + UDP from a received frame: version/IHL and
+/// protocol checked, IPv4 checksum verified, UDP length bounds-checked,
+/// and the UDP checksum verified *when non-zero* (RFC 768: zero means
+/// "not computed", which is legal and what some stacks send).
+pub fn parse_udp(frame: &[u8]) -> Option<UdpDatagram<'_>> {
+    if ethertype(frame)? != ETHERTYPE_IPV4 {
+        return None;
+    }
+    let ip = frame.get(ETHERNET_HDR..ETHERNET_HDR + 20)?;
+    if ip[0] != 0x45 || ip[9] != IPPROTO_UDP {
+        return None;
+    }
+    if internet_checksum(ip) != 0 {
+        return None; // corrupt IPv4 header
+    }
+    let ip_total = usize::from(u16::from_be_bytes([ip[2], ip[3]]));
+    let udp = frame.get(ETHERNET_HDR + 20..ETHERNET_HDR + ip_total)?;
+    if udp.len() < 8 {
+        return None;
+    }
+    let udp_len = usize::from(u16::from_be_bytes([udp[4], udp[5]])); // length field
+    if !(8..=udp.len()).contains(&udp_len) {
+        return None; // UDP length disagrees with the IP payload
+    }
+    let src_ip: [u8; 4] = ip[12..16].try_into().ok()?;
+    let dst_ip: [u8; 4] = ip[16..20].try_into().ok()?;
+    let csum = u16::from_be_bytes([udp[6], udp[7]]);
+    if csum != 0 && checksum_with_pseudo(src_ip, dst_ip, IPPROTO_UDP, &udp[..udp_len]) != 0 {
+        return None; // corrupt UDP checksum
+    }
+    Some(UdpDatagram {
+        src_port: u16::from_be_bytes([udp[0], udp[1]]),
+        dst_port: u16::from_be_bytes([udp[2], udp[3]]),
+        payload: udp.get(8..udp_len)?,
     })
 }
 

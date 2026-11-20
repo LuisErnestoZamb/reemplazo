@@ -83,8 +83,9 @@ const N_DESC: usize = 16;
 const BUF_BYTES: usize = 4096;
 /// Poll budgets (spins). TCG answers in microseconds; these bound the
 /// smoke test's failure path to ≈1–2 s instead of hanging forever.
-const TX_POLLS: u32 = 10_000_000;
-const RX_POLLS: u32 = 100_000_000;
+/// `RX_POLLS` is also the DHCP client's reply timeout.
+pub(crate) const TX_POLLS: u32 = 10_000_000;
+pub(crate) const RX_POLLS: u32 = 100_000_000;
 
 /// Poll attempts for an EEPROM read (QEMU answers immediately; real
 /// silicon takes microseconds — spin, never sleep: interrupts are off).
@@ -379,6 +380,11 @@ pub fn init(scan: &Scan) -> Option<E1000> {
 }
 
 impl E1000 {
+    /// The station MAC address read at probe time.
+    pub fn mac(&self) -> [u8; 6] {
+        self.mac
+    }
+
     /// Send one Ethernet frame, waiting for the descriptor's DD bit
     /// (synchronous TX — fine at boot, replaced by queueing later).
     pub fn transmit(&mut self, frame: &[u8]) -> Result<(), &'static str> {
