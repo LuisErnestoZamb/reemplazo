@@ -468,55 +468,66 @@ impl E1000 {
         Some(n)
     }
 
-    /// End-to-end proof of the TX/RX path: transmit an ARP request for
-    /// slirp's gateway, require slirp's ARP reply back on the RX ring,
-    /// print `NET_OK`, and return the peer's MAC (addressed by the ICMP
-    /// test that follows).
-    pub fn selftest(&mut self) -> [u8; 6] {
+    /// ARP-resolve `target_ip` as seen from `src_ip`: transmit a
+    /// request, wait for the reply on the RX ring, and return the
+    /// sender's MAC. Frames that are not *the* reply to this exact
+    /// request are skipped (post-DHCP the ring may carry strays), and
+    /// the reply's sender protocol address must equal the IP we asked
+    /// about — a reply from anyone else is not an answer. Fatal on
+    /// timeout: boot-time policy has no error channel yet.
+    pub fn arp_resolve(&mut self, src_ip: [u8; 4], target_ip: [u8; 4]) -> [u8; 6] {
         let mut req = [0u8; 64];
-        let len = match net::build_arp_request(
-            &mut req,
-            self.mac,
-            net::SLIRP_GUEST_IP,
-            net::SLIRP_GATEWAY,
-        ) {
+        let len = match net::build_arp_request(&mut req, self.mac, src_ip, target_ip) {
             Some(n) => n,
             None => fatal("cannot build ARP request (buffer bug?)"),
         };
         if let Err(e) = self.transmit(&req[..len]) {
             fatal(e);
         }
-        serial_println!("e1000: TX {len} bytes ARP request ->10.0.2.2, descriptor DD set");
+        serial_println!(
+            "e1000: TX {len} bytes ARP request ->{}.{}.{}.{}, descriptor DD set",
+            target_ip[0],
+            target_ip[1],
+            target_ip[2],
+            target_ip[3]
+        );
 
         let mut rx = [0u8; 2048];
-        let mut got = None;
-        for _ in 0..RX_POLLS {
-            if let Some(n) = self.receive(&mut rx) {
-                got = Some(n);
-                break;
+        let mut spins = 0u32;
+        loop {
+            if spins >= RX_POLLS {
+                fatal("timeout waiting for ARP reply (is the user-mode netdev attached?)");
             }
-            core::hint::spin_loop();
+            let Some(n) = self.receive(&mut rx) else {
+                spins += 1;
+                core::hint::spin_loop();
+                continue;
+            };
+            let frame = &rx[..n];
+            if net::ethertype(frame) != Some(net::ETHERTYPE_ARP)
+                || net::arp_opcode(frame) != Some(net::ARP_REPLY)
+                || net::dst_mac(frame) != Some(self.mac)
+                || net::arp_sender_ip(frame) != Some(target_ip)
+            {
+                continue; // stray or someone else's reply — not ours
+            }
+            let Some(peer) = net::arp_sender_mac(frame) else {
+                continue;
+            };
+            if peer == self.mac {
+                continue; // never resolve to ourselves
+            }
+            serial_println!("e1000: RX {n} bytes ARP reply from slirp");
+            return peer;
         }
-        let Some(n) = got else {
-            fatal("timeout waiting for ARP reply (is the user-mode netdev attached?)");
-        };
-        let frame = &rx[..n];
-        if net::ethertype(frame) != Some(net::ETHERTYPE_ARP) {
-            fatal("received a non-ARP frame");
-        }
-        if net::arp_opcode(frame) != Some(net::ARP_REPLY) {
-            fatal("ARP frame is not a reply");
-        }
-        if net::dst_mac(frame) != Some(self.mac) {
-            fatal("frame not addressed to our MAC (filter broken?)");
-        }
-        let Some(peer) = net::arp_sender_mac(frame) else {
-            fatal("ARP reply carries no sender address");
-        };
-        if peer == self.mac {
-            fatal("ARP sender resolved to our own MAC");
-        }
-        serial_println!("e1000: RX {n} bytes ARP reply from slirp");
+    }
+
+    /// End-to-end proof of the TX/RX path: ARP-resolve slirp's
+    /// gateway, require slirp's ARP reply back on the RX ring,
+    /// print `NET_OK`, and return the peer's MAC (addressed by the ICMP
+    /// test that follows).
+    pub fn selftest(&mut self) -> [u8; 6] {
+        let peer = self.arp_resolve(net::SLIRP_GUEST_IP, net::SLIRP_GATEWAY);
         serial_println!("NET_OK"); // machine-checked by `cargo xtask smoke`
         peer
     }

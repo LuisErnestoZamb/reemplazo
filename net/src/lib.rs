@@ -38,6 +38,18 @@ pub const BROADCAST_MAC: [u8; 6] = [0xFF; 6];
 pub const SLIRP_GUEST_IP: [u8; 4] = [10, 0, 2, 15];
 pub const SLIRP_GATEWAY: [u8; 4] = [10, 0, 2, 2];
 
+/// True when `ip` and `dst` fall in the same subnet defined by `mask`
+/// (RFC 911 §3.3 next-hop selection: on-subnet destinations are
+/// reached by direct ARP, off-subnet through the router). Every byte
+/// is masked before comparison; `mask = 0.0.0.0` makes everything
+/// on-subnet, which is the correct degenerate answer.
+pub fn on_subnet(ip: [u8; 4], mask: [u8; 4], dst: [u8; 4]) -> bool {
+    ip.iter()
+        .zip(mask.iter())
+        .zip(dst.iter())
+        .all(|((&a, &m), &b)| (a & m) == (b & m))
+}
+
 /// Write a complete ARP request (42 bytes) into `buf`.
 /// Returns `None` when `buf` is too small.
 pub fn build_arp_request(
@@ -87,6 +99,15 @@ pub fn dst_mac(frame: &[u8]) -> Option<[u8; 6]> {
 pub fn arp_sender_mac(frame: &[u8]) -> Option<[u8; 6]> {
     arp_opcode(frame)?; // must be an ARP frame
     frame.get(22..28)?.try_into().ok()
+}
+
+/// Sender protocol address (bytes 28..32) of an ARP frame — lets the
+/// caller verify a reply actually comes from the address it asked
+/// about, instead of trusting any ARP reply that shows up. `None` for
+/// non-ARP frames.
+pub fn arp_sender_ip(frame: &[u8]) -> Option<[u8; 4]> {
+    arp_opcode(frame)?; // must be an ARP frame
+    frame.get(28..32)?.try_into().ok()
 }
 
 /// Sum big-endian 16-bit words (odd tail byte padded with zero), per
@@ -140,6 +161,54 @@ impl Endpoint {
     pub const fn new(mac: [u8; 6], ip: [u8; 4]) -> Self {
         Self { mac, ip }
     }
+}
+
+/// Build eth + IPv4 + UDP around a **final** `payload` and return the
+/// frame length, or `None` if `buf` is too small. The checksums are
+/// computed last, over the complete segment — passing an unfinished
+/// payload here is exactly the bug that once produced an invalid DHCP
+/// UDP checksum (see `net::dhcp`).
+pub fn build_udp_frame(
+    buf: &mut [u8],
+    src: Endpoint,
+    dst: Endpoint,
+    src_port: u16,
+    dst_port: u16,
+    payload: &[u8],
+) -> Option<usize> {
+    // Checked arithmetic: the length fields are u16 (security rule —
+    // never truncate a length silently).
+    let payload_len = u16::try_from(payload.len()).ok()?;
+    let ip_total = payload_len.checked_add(20 + 8)?;
+    let total = ETHERNET_HDR + usize::from(ip_total);
+    let b = buf.get_mut(..total)?;
+    b.fill(0);
+
+    // Ethernet header.
+    b[..6].copy_from_slice(&dst.mac);
+    b[6..12].copy_from_slice(&src.mac);
+    b[12..14].copy_from_slice(&ETHERTYPE_IPV4.to_be_bytes());
+
+    // IPv4 header.
+    let ip = &mut b[ETHERNET_HDR..ETHERNET_HDR + 20];
+    ip[0] = 0x45; // version 4, IHL 5
+    ip[2..4].copy_from_slice(&ip_total.to_be_bytes());
+    ip[8] = 64; // TTL
+    ip[9] = IPPROTO_UDP;
+    ip[12..16].copy_from_slice(&src.ip);
+    ip[16..20].copy_from_slice(&dst.ip);
+    let ip_csum = internet_checksum(ip);
+    ip[10..12].copy_from_slice(&ip_csum.to_be_bytes());
+
+    // UDP header + payload (checksum after the payload is in place).
+    let udp = &mut b[ETHERNET_HDR + 20..];
+    udp[0..2].copy_from_slice(&src_port.to_be_bytes());
+    udp[2..4].copy_from_slice(&dst_port.to_be_bytes());
+    udp[4..6].copy_from_slice(&(8u16 + payload_len).to_be_bytes());
+    udp[8..8 + payload.len()].copy_from_slice(payload);
+    let udp_csum = checksum_with_pseudo(src.ip, dst.ip, IPPROTO_UDP, udp);
+    udp[6..8].copy_from_slice(&udp_csum.to_be_bytes());
+    Some(total)
 }
 
 /// An ICMP echo reply, fully validated (see [`parse_icmp_echo_reply`]).
@@ -241,10 +310,13 @@ pub fn parse_icmp_echo_reply(frame: &[u8]) -> Option<IcmpEchoReply<'_>> {
 }
 
 pub mod dhcp;
+pub mod dns;
 
 /// A validated UDP datagram carried by an IPv4 frame.
 #[derive(Debug, PartialEq, Eq)]
 pub struct UdpDatagram<'a> {
+    pub src_ip: [u8; 4],
+    pub dst_ip: [u8; 4],
     pub src_port: u16,
     pub dst_port: u16,
     pub payload: &'a [u8],
@@ -281,6 +353,8 @@ pub fn parse_udp(frame: &[u8]) -> Option<UdpDatagram<'_>> {
         return None; // corrupt UDP checksum
     }
     Some(UdpDatagram {
+        src_ip,
+        dst_ip,
         src_port: u16::from_be_bytes([udp[0], udp[1]]),
         dst_port: u16::from_be_bytes([udp[2], udp[3]]),
         payload: udp.get(8..udp_len)?,
@@ -292,6 +366,22 @@ mod tests {
     use super::*;
 
     const OUR_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+
+    #[test]
+    fn subnet_membership_decides_next_hop() {
+        let me = [10, 0, 2, 15];
+        let mask = [255, 255, 255, 0];
+        // On-subnet: the DNS server itself (direct ARP).
+        assert!(on_subnet(me, mask, [10, 0, 2, 3]));
+        // Off-subnet: public DNS → next hop is the router.
+        assert!(!on_subnet(me, mask, [8, 8, 8, 8]));
+        // Broadcast and network addresses are "on-subnet" by the mask.
+        assert!(on_subnet(me, mask, [10, 0, 2, 255]));
+        // /0 degenerates to everything on-subnet.
+        assert!(on_subnet(me, [0, 0, 0, 0], [1, 2, 3, 4]));
+        // Different subnet entirely.
+        assert!(!on_subnet([192, 168, 1, 1], mask, [10, 0, 2, 3]));
+    }
 
     #[test]
     fn arp_request_layout_is_exact() {
@@ -357,6 +447,13 @@ mod tests {
         buf[22..28].copy_from_slice(&gw);
         assert_eq!(arp_sender_mac(&buf[..n]), Some(gw));
         assert_eq!(arp_sender_mac(&[0u8; 60]), None); // not ARP
+        // Make it a real reply: slirp also fills the sender *protocol*
+        // address (bytes 28..32) with its own IP.
+        buf[28..32].copy_from_slice(&SLIRP_GATEWAY);
+        assert_eq!(arp_sender_ip(&buf[..n]), Some(SLIRP_GATEWAY));
+        buf[28..32].copy_from_slice(&[10, 0, 2, 99]); // spoof another IP
+        assert_eq!(arp_sender_ip(&buf[..n]), Some([10, 0, 2, 99]));
+        assert_eq!(arp_sender_ip(&[0u8; 60]), None); // not ARP
     }
 
     #[test]
@@ -403,6 +500,40 @@ mod tests {
         assert_eq!(reply.dst_ip, SLIRP_GUEST_IP);
         assert_eq!((reply.id, reply.seq), (0x1234, 7));
         assert_eq!(reply.payload, b"pingtest");
+    }
+
+    #[test]
+    fn udp_frame_roundtrip_via_build_and_parse() {
+        const GW_MAC: [u8; 6] = [0x52, 0x55, 0x0A, 0x00, 0x02, 0x02];
+        let src = Endpoint::new(OUR_MAC, SLIRP_GUEST_IP);
+        let dst = Endpoint::new(GW_MAC, SLIRP_GATEWAY);
+        let payload = b"some-udp-payload";
+        let mut buf = [0u8; 128];
+        let n = build_udp_frame(&mut buf, src, dst, 49152, 53, payload)
+            .expect("128-byte buffer must fit the frame");
+        assert_eq!(n, 14 + 20 + 8 + payload.len());
+        // Both checksums must self-validate over their own fields.
+        assert_eq!(internet_checksum(&buf[14..34]), 0);
+        let udp = &buf[34..n];
+        assert_eq!(
+            checksum_with_pseudo(SLIRP_GUEST_IP, SLIRP_GATEWAY, IPPROTO_UDP, udp),
+            0
+        );
+
+        // The frame must parse back to exactly what was built.
+        let dgram = parse_udp(&buf[..n]).expect("frame must parse as UDP");
+        assert_eq!(dgram.src_port, 49152);
+        assert_eq!(dgram.dst_port, 53);
+        assert_eq!(dgram.payload, payload);
+
+        // A too-small buffer yields None, never a partial frame.
+        let mut tiny = [0u8; 40];
+        assert_eq!(build_udp_frame(&mut tiny, src, dst, 1, 2, payload), None);
+        // A payload whose lengths overflow u16 is rejected, not truncated.
+        assert_eq!(
+            build_udp_frame(&mut buf, src, dst, 1, 2, &[0u8; u16::MAX as usize]),
+            None
+        );
     }
 
     #[test]
