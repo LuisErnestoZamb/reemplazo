@@ -1,0 +1,8 @@
+[alias]
+xtask = "run -p xtask --"
+
+# Hard constraint from AGENTS.md: the target CPU (Core2 Duo T7400) tops out at
+# SSSE3. Never use target-cpu=native here — the build host is a different CPU.
+# `x86-64` == x86-64-v1 baseline (SSE2 only), which is what we want.
+[target.x86_64-unknown-none]
+rustflags = ["-C", "target-cpu=x86-64"]
