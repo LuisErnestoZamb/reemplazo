@@ -6,4 +6,5 @@ publish.workspace = true
 
 [dependencies]
 bootinfo = { path = "../bootinfo" }
+net = { path = "../net" }
 pci = { path = "../pci" }

@@ -80,6 +80,8 @@ fn check(root: &Path) -> bool {
                 "-p",
                 "bootinfo",
                 "-p",
+                "net",
+                "-p",
                 "pci",
                 "--all-targets",
                 "--",
@@ -105,7 +107,9 @@ fn check(root: &Path) -> bool {
         && sh(
             root,
             "cargo",
-            &["test", "-p", "xtask", "-p", "bootinfo", "-p", "pci"],
+            &[
+                "test", "-p", "xtask", "-p", "bootinfo", "-p", "net", "-p", "pci",
+            ],
         )
         && build_kernel(root)
 }
@@ -181,6 +185,13 @@ fn qemu_std_args(iso: &str) -> Vec<String> {
         "-display".into(),
         "none".into(),
         "-no-reboot".into(),
+        // User-mode networking (slirp): the e1000 TX/RX test needs a
+        // peer that answers ARP (gateway 10.0.2.2). Explicit device
+        // (with fixed MAC) instead of relying on QEMU's implicit default.
+        "-netdev".into(),
+        "user,id=net0".into(),
+        "-device".into(),
+        "e1000,netdev=net0,mac=52:54:00:12:34:56".into(),
     ]
 }
 
@@ -270,13 +281,16 @@ fn run(root: &Path) -> bool {
 /// Machine-checked boot test: boot the ISO headless and require each
 /// milestone's serial marker in order — `BOOT_OK` (Multiboot2 parse),
 /// `MEM_OK` (frame-allocator selftest), `PCI_OK` (config scan),
-/// `E1000_OK` (NIC probe + MMIO + MAC), `INT_OK` (IDT + PIC remap + PIT
-/// ticks + int3 resume) — within `SMOKE_TIMEOUT`. This is the test that
-/// fails on a broken boot path (header, trampoline, GDT, paging, mbi
-/// parse), memory path, PCI scan, e1000 driver, or interrupt path (IDT,
-/// stubs, EOI, timer), so it gates all five milestones.
+/// `E1000_OK` (NIC probe + MMIO + MAC), `NET_OK` (TX/RX rings + ARP
+/// roundtrip through slirp), `INT_OK` (IDT + PIC remap + PIT ticks +
+/// int3 resume) — within `SMOKE_TIMEOUT`. This is the test that fails on
+/// a broken boot path (header, trampoline, GDT, paging, mbi parse),
+/// memory path, PCI scan, e1000 driver, network path, or interrupt path
+/// (IDT, stubs, EOI, timer), so it gates all six milestones.
 fn smoke(root: &Path) -> bool {
-    const MARKERS: [&str; 5] = ["BOOT_OK", "MEM_OK", "PCI_OK", "E1000_OK", "INT_OK"];
+    const MARKERS: [&str; 6] = [
+        "BOOT_OK", "MEM_OK", "PCI_OK", "E1000_OK", "NET_OK", "INT_OK",
+    ];
     if !iso(root) {
         return false;
     }

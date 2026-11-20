@@ -11,8 +11,13 @@ name = "kernel"
 version = "0.1.0"
 dependencies = [
  "bootinfo",
+ "net",
  "pci",
 ]
+
+[[package]]
+name = "net"
+version = "0.1.0"
 
 [[package]]
 name = "pci"
