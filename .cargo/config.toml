@@ -4,5 +4,14 @@ xtask = "run -p xtask --"
 # Hard constraint from AGENTS.md: the target CPU (Core2 Duo T7400) tops out at
 # SSSE3. Never use target-cpu=native here — the build host is a different CPU.
 # `x86-64` == x86-64-v1 baseline (SSE2 only), which is what we want.
+#
+# relocation-model=static: the kernel is linked at a fixed physical address
+# (linker.ld) and entry.S uses absolute addressing; the default PIC model
+# emits R_X86_64_32 relocs rust-lld rejects for local symbols.
 [target.x86_64-unknown-none]
-rustflags = ["-C", "target-cpu=x86-64"]
+rustflags = [
+    "-C",
+    "target-cpu=x86-64",
+    "-C",
+    "relocation-model=static",
+]

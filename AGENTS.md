@@ -30,6 +30,11 @@
 
 ## Workflow
 
-- Git: fresh repo, branch `main`, remote `git@github.com:LuisErnestoZamb/reemplazo.git`.
-- No build/test/lint commands exist yet. Once added, record the exact commands (including how to run a single test and how to produce a bootable image) in this file.
+- Git: branch `main`, remote `git@github.com:LuisErnestoZamb/reemplazo.git`. Commits: conventional (`feat:`, `fix:`, `docs:`, `build:`), one milestone per commit, message records what was actually verified.
+- **Before every commit:** `cargo xtask check` (fmt + clippy for host crates *and* kernel target + host tests + kernel cross-build). Kernel is never linted/tested for the host — it is `x86_64-unknown-none` only.
+- **Boot smoke test:** `cargo xtask smoke` — builds the ISO, boots it headless, asserts the serial `BOOT_OK` marker within 30s. This is the test that catches broken header/trampoline/GDT/paging/mbi code.
+- Interactive boot: `cargo xtask run` (Ctrl-C quits; stale VM containers are force-cleaned on next run).
+- Single test: `cargo test -p bootinfo <name>`.
+- Toolchain quirk (macOS 13, verified): no native `grub-mkrescue`, and Homebrew **cannot** build QEMU (Tier 3 → source build fails). Everything runs in the `reemplazo-tools` image (`tools/Dockerfile`: grub + xorriso + qemu); xtask prefers a host `qemu-system-x86_64` if one ever exists. Docker daemon must be running.
+- `kernel` never builds with bare `cargo build` (excluded via `default-members`); it is built via `cargo xtask build` with `--target x86_64-unknown-none`.
 - Verify against QEMU first; validate on real hardware via Option/C DVD or USB boot.

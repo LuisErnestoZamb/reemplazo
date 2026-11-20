@@ -3,11 +3,26 @@
 //! Usage (from repo root): `cargo xtask <command>`
 //!   check   fmt --check + clippy + host tests + kernel cross-build
 //!   build   cross-compile the kernel (x86_64-unknown-none, release)
-//!   iso     package target image as bootable ISO (GRUB i386-pc via Docker)
-//!   run     build + iso + boot in QEMU (serial on stdio)
+//!   iso     package target image as bootable ISO (GRUB i386-pc)
+//!   smoke   boot the ISO headless; assert serial prints BOOT_OK (the test)
+//!   run     build + iso + boot interactively (serial on stdio)
+//!
+//! Backends: grub-mkrescue always runs in the `reemplazo-tools` container
+//! (no native macOS build). QEMU prefers a host `qemu-system-x86_64` and
+//! falls back to the same container (Homebrew can't build QEMU on macOS 13).
 
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Command, exit};
+use std::process::{Child, Command, Stdio, exit};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
+/// Containerized grub-mkrescue + qemu-system-x86_64 (tools/Dockerfile).
+const TOOLS_IMAGE: &str = "reemplazo-tools";
+/// Fixed container names so stale VMs can be force-removed between runs.
+const RUN_CONTAINER: &str = "reemplazo-run";
+const SMOKE_CONTAINER: &str = "reemplazo-smoke";
+const SMOKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn main() {
     let cmd = std::env::args().nth(1).unwrap_or_default();
@@ -16,9 +31,10 @@ fn main() {
         "check" => check(&root),
         "build" => build_kernel(&root),
         "iso" => iso(&root),
+        "smoke" => smoke(&root),
         "run" => run(&root),
         _ => {
-            eprintln!("usage: cargo xtask <check|build|iso|run>");
+            eprintln!("usage: cargo xtask <check|build|iso|smoke|run>");
             false
         }
     };
@@ -51,8 +67,8 @@ fn sh(root: &Path, program: &str, args: &[&str]) -> bool {
 }
 
 fn check(root: &Path) -> bool {
-    // Host crates (xtask) and kernel are linted separately: the kernel is
-    // no_std and only valid for x86_64-unknown-none, never for the host.
+    // Host crates (xtask, bootinfo) and kernel are linted separately: the
+    // kernel is no_std and only valid for x86_64-unknown-none, never host.
     sh(root, "cargo", &["fmt", "--all", "--check"])
         && sh(
             root,
@@ -61,6 +77,8 @@ fn check(root: &Path) -> bool {
                 "clippy",
                 "-p",
                 "xtask",
+                "-p",
+                "bootinfo",
                 "--all-targets",
                 "--",
                 "-D",
@@ -82,7 +100,7 @@ fn check(root: &Path) -> bool {
                 "warnings",
             ],
         )
-        && sh(root, "cargo", &["test", "-p", "xtask"])
+        && sh(root, "cargo", &["test", "-p", "xtask", "-p", "bootinfo"])
         && build_kernel(root)
 }
 
@@ -125,11 +143,7 @@ fn iso(root: &Path) -> bool {
         return false;
     }
     // Image tag is cheap to rebuild; Docker layer cache makes re-runs fast.
-    if !sh(
-        root,
-        "docker",
-        &["build", "-t", "reemplazo-grub", "tools/grub"],
-    ) {
+    if !sh(root, "docker", &["build", "-t", TOOLS_IMAGE, "tools"]) {
         return false;
     }
     sh(
@@ -140,7 +154,7 @@ fn iso(root: &Path) -> bool {
             "--rm",
             "-v",
             &format!("{}:/work", iso_root.display()),
-            "reemplazo-grub",
+            TOOLS_IMAGE,
             "grub-mkrescue",
             "-o",
             "/work/os.iso",
@@ -149,24 +163,173 @@ fn iso(root: &Path) -> bool {
     )
 }
 
+/// Standard QEMU arguments for booting `iso` headless with serial on stdio.
+fn qemu_std_args(iso: &str) -> Vec<String> {
+    vec![
+        "-m".into(),
+        "256M".into(),
+        "-cdrom".into(),
+        iso.into(),
+        "-serial".into(),
+        "stdio".into(),
+        "-display".into(),
+        "none".into(),
+        "-no-reboot".into(),
+    ]
+}
+
+fn host_qemu() -> bool {
+    matches!(
+        Command::new("qemu-system-x86_64").arg("--version").output(),
+        Ok(o) if o.status.success()
+    )
+}
+
+/// `(program, args, container_name)` to boot `iso_path`.
+/// Host QEMU first; otherwise build the toolchain image and run in Docker.
+/// `container` is the fixed name used for force-cleanup of stale VMs.
+fn qemu_invocation(
+    root: &Path,
+    iso_path: &Path,
+    container: &str,
+) -> Option<(String, Vec<String>, Option<String>)> {
+    if host_qemu() {
+        let iso = iso_path.display().to_string();
+        return Some(("qemu-system-x86_64".into(), qemu_std_args(&iso), None));
+    }
+    if !sh(root, "docker", &["build", "-t", TOOLS_IMAGE, "tools"]) {
+        return None;
+    }
+    let iso_dir = iso_path.parent()?.display().to_string();
+    let mut args: Vec<String> = vec![
+        "run".into(),
+        "--rm".into(),
+        "-i".into(),
+        "--name".into(),
+        container.into(),
+        "-v".into(),
+        format!("{iso_dir}:/iso"),
+        TOOLS_IMAGE.into(),
+        "qemu-system-x86_64".into(),
+    ];
+    args.extend(qemu_std_args("/iso/os.iso"));
+    Some(("docker".into(), args, Some(container.into())))
+}
+
+/// Remove a container by name if present (stale VM from a killed session).
+fn rm_container(name: &str) {
+    let _ = Command::new("docker")
+        .args(["rm", "-f", name])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+fn stop_vm(child: &mut Child, container: Option<&str>) {
+    let _ = child.kill();
+    let _ = child.wait();
+    if let Some(name) = container {
+        rm_container(name);
+    }
+}
+
 fn run(root: &Path) -> bool {
     if !iso(root) {
         return false;
     }
     let iso_path = root.join("target/iso-root/os.iso");
-    sh(
-        root,
-        "qemu-system-x86_64",
-        &[
-            "-m",
-            "256M",
-            "-cdrom",
-            iso_path.to_str().expect("iso path is valid utf-8"),
-            "-serial",
-            "stdio",
-            "-display",
-            "none",
-            "-no-reboot",
-        ],
-    )
+    let Some((prog, args, container)) = qemu_invocation(root, &iso_path, RUN_CONTAINER) else {
+        return false;
+    };
+    if container.is_some() {
+        rm_container(RUN_CONTAINER); // stale VM from a previous Ctrl-C
+    }
+    let status = Command::new(&prog).args(&args).current_dir(root).status();
+    if container.is_some() {
+        rm_container(RUN_CONTAINER);
+    }
+    match status {
+        Ok(s) if s.success() => true,
+        Ok(s) => {
+            eprintln!("xtask: qemu exited with {s}");
+            false
+        }
+        Err(e) => {
+            eprintln!("xtask: cannot start {prog}: {e}");
+            false
+        }
+    }
+}
+
+/// Machine-checked boot test: boot the ISO headless and require the kernel
+/// to print the `BOOT_OK` marker on serial within `SMOKE_TIMEOUT`. This is
+/// the test that fails on a broken boot path (bad header, trampoline, GDT,
+/// paging, or mbi parse), so it gates the boot milestone.
+fn smoke(root: &Path) -> bool {
+    if !iso(root) {
+        return false;
+    }
+    let iso_path = root.join("target/iso-root/os.iso");
+    let Some((prog, args, container)) = qemu_invocation(root, &iso_path, SMOKE_CONTAINER) else {
+        return false;
+    };
+    if let Some(name) = &container {
+        rm_container(name);
+    }
+
+    let mut child = match Command::new(&prog)
+        .args(&args)
+        .current_dir(root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("xtask: cannot start {prog}: {e}");
+            return false;
+        }
+    };
+
+    // Drain stdout+stderr in threads; serial (stdout) is where the marker lands.
+    let (tx, rx) = mpsc::channel::<String>();
+    let mut pipes: Vec<Box<dyn std::io::Read + Send>> = Vec::new();
+    if let Some(out) = child.stdout.take() {
+        pipes.push(Box::new(out));
+    }
+    if let Some(err) = child.stderr.take() {
+        pipes.push(Box::new(err));
+    }
+    for pipe in pipes {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(pipe).lines().map_while(Result::ok) {
+                let _ = tx.send(line);
+            }
+        });
+    }
+    drop(tx); // channels close when both readers hit EOF → recv errs end the loop
+
+    let deadline = Instant::now() + SMOKE_TIMEOUT;
+    let mut passed = false;
+    let mut collected: Vec<String> = Vec::new();
+    while let Ok(line) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        println!("smoke| {line}");
+        if line.contains("BOOT_OK") {
+            passed = true;
+            break;
+        }
+        collected.push(line);
+    }
+    stop_vm(&mut child, container.as_deref());
+
+    if passed {
+        println!("smoke: PASS — kernel reached BOOT_OK");
+    } else {
+        eprintln!("smoke: FAIL — no BOOT_OK within {SMOKE_TIMEOUT:?}");
+        for line in &collected {
+            eprintln!("smoke| {line}");
+        }
+    }
+    passed
 }
