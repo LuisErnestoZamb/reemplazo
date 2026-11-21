@@ -403,7 +403,9 @@ fn run(root: &Path) -> bool {
 /// `DNS_OK` (RFC 1035 A lookup for github.com through the leased
 /// server), `TCP_OK` (RFC 9293 connect + HTTP GET + FIN close against
 /// github.com:80), `INT_OK` (IDT + PIC remap + PIT ticks + int3
-/// resume) — within [`SMOKE_TIMEOUT`]. Then the keyboard milestone:
+/// resume), `TUI_OK` (A1 screen layer: the demo frame rendered into
+/// the VGA text buffer and read back from `0xb8000`) — within
+/// [`SMOKE_TIMEOUT`]. Then the keyboard milestone:
 /// once `SHELL_OK` matches, connect to QEMU's HMP monitor
 /// ([`monitor_port`]) and type `echo KEYBOARD_OK` key by key with
 /// `sendkey`, requiring the `KEYBOARD_OK` line the **shell's echo
@@ -416,14 +418,16 @@ fn run(root: &Path) -> bool {
 /// GDT, paging, mbi parse), the VGA text mirror, memory path, heap path
 /// (carve + global allocator), PCI scan, e1000 driver, network path,
 /// DHCP/DNS/TCP clients, TLS and HTTP clients, interrupt path (IDT,
-/// stubs, EOI, timer), the serial shell coming up, or the keyboard path
-/// (i8042 bring-up, scancode decode, input multiplexing) — so it gates
-/// all eighteen milestones.
+/// stubs, EOI, timer), the A1 screen layer (cell diff flush into the
+/// text buffer, ratatui backend, full-screen frame readback), the serial
+/// shell coming up, or the keyboard path (i8042 bring-up, scancode
+/// decode, input multiplexing) — so it gates every milestone in the
+/// chain.
 ///
 /// It runs **without a disk**, so the `ata::probe` that sits between
 /// `PCI_OK` and `E1000_OK` stays silent here.
 fn smoke(root: &Path) -> bool {
-    const MARKERS: [&str; 19] = [
+    const MARKERS: [&str; 20] = [
         "BOOT_OK",
         "VGA_OK",
         "MEM_OK",
@@ -441,6 +445,7 @@ fn smoke(root: &Path) -> bool {
         "GIT_LSREMOTE_OK",
         "SSH_KEXINIT_OK",
         "INT_OK",
+        "TUI_OK",
         "SHELL_OK",
         "KEYBOARD_OK",
     ];

@@ -19,6 +19,7 @@ extern crate alloc;
 #[macro_use]
 mod serial;
 
+mod apps;
 mod ata;
 mod e1000;
 mod entropy;
@@ -124,6 +125,11 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
     }
 
     test_interrupts();
+
+    // A1 screen layer: render + read back the first full-screen frame
+    // (TUI_OK — between INT_OK and SHELL_OK), then hand a clean text
+    // screen to the shell. Serial output is untouched.
+    apps::tui::boot_proof();
 
     // The shell is the kernel's idle state until a scheduler exists;
     // without a NIC there is nothing to drive, so just park.

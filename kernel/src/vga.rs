@@ -206,6 +206,128 @@ pub fn verify(expected: &str) -> bool {
         .is_some_and(|console| console.holds(expected))
 }
 
+/// Geometry of the live text console for full-screen apps:
+/// `(cols, rows)` when the mirror is enabled, `None` when it is off.
+///
+/// This is what `kernel/src/apps/screen.rs` sizes its off-screen cell
+/// buffer from — never a hardcoded 80×25 (GRUB's framebuffer tag is
+/// reconciled by [`sync`]).
+pub fn dims() -> Option<(usize, usize)> {
+    // SAFETY: read-only peek; `CONSOLE` is written only by
+    // init/sync/disable during early boot (single core, and IRQ
+    // handlers never print — see serial.rs), so no aliasing writer.
+    unsafe { &*core::ptr::addr_of!(CONSOLE) }
+        .as_ref()
+        .map(|console| (console.cols, console.rows))
+}
+
+/// Write one raw text cell (glyph byte + attribute byte) at `(x, y)`,
+/// **bypassing the console cursor** — the full-screen path the apps
+/// layer flushes its cell buffer through (`apps::screen::flush_diff`).
+///
+/// Returns `false` and writes nothing when the mirror is disabled or
+/// the coordinates fall outside the console: never write to unknown
+/// memory, never panic. The serial mirror and the ANSI-swallowing log
+/// path are untouched — this is an *additional* entry point.
+pub fn put_cell(x: usize, y: usize, glyph: u8, attr: u8) -> bool {
+    // SAFETY: `CONSOLE` is single-writer (init/sync/disable, boot
+    // time) and every address below is checked before the volatile
+    // stores — the same validated buffer range `TextConsole::put`
+    // relies on (`base..base+cols*rows*CELL`, identity-mapped).
+    let console = unsafe { &mut *core::ptr::addr_of_mut!(CONSOLE) };
+    let Some(console) = console else {
+        return false;
+    };
+    let Some(offset) = cell_offset(console.cols, console.rows, x, y) else {
+        return false;
+    };
+    let Some(attr_at) = offset.checked_add(CELL - 1) else {
+        return false;
+    };
+    // SAFETY: `cell_offset` proved the index is inside cols*rows and
+    // that `offset + CELL - 1` does not overflow, so both bytes land
+    // on the cell `init` validated.
+    unsafe {
+        core::ptr::write_volatile(console.base.add(offset), glyph);
+        core::ptr::write_volatile(console.base.add(attr_at), attr);
+    }
+    true
+}
+
+/// Read one raw text cell back from the buffer — the apps layer's
+/// diff ([`crate::apps::screen::flush_diff`]) and the boot proof's
+/// `TUI_OK` readback both go through here. `None` when the mirror is
+/// disabled or the coordinates are out of range.
+pub fn peek_cell(x: usize, y: usize) -> Option<(u8, u8)> {
+    // SAFETY: read-only peek of the single-writer console (see
+    // [`dims`]); the address arithmetic is checked before the reads.
+    let console = unsafe { &*core::ptr::addr_of!(CONSOLE) }.as_ref()?;
+    let offset = cell_offset(console.cols, console.rows, x, y)?;
+    let attr_at = offset.checked_add(CELL - 1)?;
+    // SAFETY: as [`put_cell`] — offset addresses a validated cell.
+    unsafe {
+        let glyph = core::ptr::read_volatile(console.base.add(offset));
+        let attr = core::ptr::read_volatile(console.base.add(attr_at));
+        Some((glyph, attr))
+    }
+}
+
+/// Clear the whole text screen and reset the console cursor and escape
+/// state to their boot defaults — how a full-screen app hands a clean
+/// screen back to the shell (`apps::tui`). The serial side is
+/// untouched: the boot log lives there, and nothing already printed is
+/// reordered or suppressed.
+pub fn clear_screen() {
+    // SAFETY: single writer; the loop below walks the same validated
+    // cell range as [`put_cell`] with overflow-checked offsets.
+    let console = unsafe { &mut *core::ptr::addr_of_mut!(CONSOLE) };
+    let Some(console) = console else {
+        return;
+    };
+    let Some(last) = last_attr_offset(console.cols, console.rows) else {
+        return;
+    };
+    let mut offset = 0usize;
+    while offset <= last {
+        // `offset + CELL - 1` cannot overflow for u32-derived
+        // geometry (see `last_attr_offset`), but it is checked like
+        // every other address in this module — fail soft, never wrap.
+        let Some(attr_at) = offset.checked_add(CELL - 1) else {
+            return;
+        };
+        // SAFETY: offset addresses the first byte of a cell inside the
+        // buffer `init` validated, `attr_at` its attribute byte.
+        unsafe {
+            core::ptr::write_volatile(console.base.add(offset), b' ');
+            core::ptr::write_volatile(console.base.add(attr_at), ATTR);
+        }
+        offset += CELL;
+    }
+    console.cursor = 0; // next mirrored print starts top-left
+    console.esc = 0; // no half-consumed escape sequence survives
+}
+
+/// Byte offset of cell `(x, y)` — `None` when out of range or on
+/// overflow. Shared by the cell read/write paths so their bounds
+/// arithmetic cannot drift apart.
+fn cell_offset(cols: usize, rows: usize, x: usize, y: usize) -> Option<usize> {
+    if cols == 0 || rows == 0 || x >= cols || y >= rows {
+        return None;
+    }
+    let index = y.checked_mul(cols)?.checked_add(x)?;
+    index.checked_mul(CELL)
+}
+
+/// Attribute-byte offset of the *last* cell — `None` when the
+/// geometry itself cannot address a buffer (zero or overflowing).
+fn last_attr_offset(cols: usize, rows: usize) -> Option<usize> {
+    let cells = cols.checked_mul(rows)?;
+    cells
+        .checked_sub(1)?
+        .checked_mul(CELL)?
+        .checked_add(CELL - 1)
+}
+
 /// One formatted write to the text buffer, if present. Called by
 /// `serial_print!` next to the UART write; never fails.
 pub fn mirror(args: fmt::Arguments<'_>) {

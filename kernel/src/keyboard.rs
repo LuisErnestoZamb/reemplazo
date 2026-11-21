@@ -30,8 +30,11 @@
 //! - Decoding — make/break, sticky `E0` prefixes, Shift (both keys) and
 //!   CapsLock state, US layout — is the `pc-keyboard` crate
 //!   (`ScancodeSet1` + `Us104Key`), evaluated in
-//!   `docs/pc-keyboard-eval.md`. Keys with no ASCII mapping (F-keys,
-//!   arrows, Win/Menu, media keys) decode to `RawKey` and are ignored.
+//!   `docs/pc-keyboard-eval.md`. [`next_char`] (the shell) keeps the
+//!   historical filter: keys with no ASCII mapping (F-keys, arrows,
+//!   Win/Menu, media keys) decode to `RawKey` and are ignored.
+//!   [`next_event`] (full-screen apps) maps the navigation/editing
+//!   subset of those `RawKey`s on top — see its docs.
 
 use crate::port::{inb, outb};
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -105,7 +108,91 @@ pub fn init() {
 /// "nothing this iteration" — no controller, output buffer empty, a
 /// mouse byte (discarded), an `E0`/`E1` prefix byte, a modifier-only
 /// event, or a key with no ASCII mapping. Called from the shell loop.
+///
+/// Semantics are frozen: the shell's line discipline is built on this
+/// exact filter (ASCII only, `RawKey` dropped). Apps that need arrows
+/// and Esc use [`next_event`] instead — the two never run at the same
+/// time (see [`poll_decoded`]).
 pub fn next_char() -> Option<char> {
+    match poll_decoded()? {
+        DecodedKey::Unicode(c) if c.is_ascii() => Some(c),
+        _ => None, // RawKey: modifiers, F-keys, arrows, media keys — ignore
+    }
+}
+
+/// One decoded keystroke for full-screen apps (`kernel/src/apps`):
+/// the characters plus the navigation/editing keys the shell's
+/// [`next_char`] deliberately throws away.
+///
+/// Mapped only from what pc-keyboard actually decodes: `Escape`,
+/// `Return`/`NumpadEnter`, `Tab`, `Backspace` and `Delete` arrive as
+/// [`DecodedKey::Unicode`] control characters (us104 layout), the
+/// inverted-T arrows and the extended-block keys as
+/// [`DecodedKey::RawKey`]. Everything else (F-keys, media keys,
+/// modifiers, unknown scancodes) is `None` — no event is invented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Key {
+    Char(char),
+    Esc,
+    Enter,
+    Backspace,
+    Tab,
+    Delete,
+    Up,
+    Down,
+    Left,
+    Right,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+}
+
+/// Poll one decoded [`Key`], if a keystroke is waiting.
+///
+/// Shares the decoder with [`next_char`] under the same single-consumer
+/// contract: exactly one of the two is called at a time — the shell's
+/// idle loop feeds [`next_char`], and it stops polling for the whole
+/// duration a builtin like `tui` runs (the builtin *is* the call stack
+/// under `shell::run`), so [`next_event`] is the only consumer inside
+/// that window. No IRQ handler touches the decoder (IRQ1 is masked,
+/// polled milestone), so preemption cannot alias it either.
+pub fn next_event() -> Option<Key> {
+    match poll_decoded()? {
+        DecodedKey::Unicode(c) => match c {
+            '\n' | '\r' => Some(Key::Enter),
+            '\u{1b}' => Some(Key::Esc),
+            '\u{8}' => Some(Key::Backspace),
+            '\u{7f}' => Some(Key::Delete), // us104: the Delete key
+            '\t' => Some(Key::Tab),
+            c if !c.is_control() => Some(Key::Char(c)),
+            _ => None, // other control bytes: no event
+        },
+        DecodedKey::RawKey(code) => match code {
+            pc_keyboard::KeyCode::ArrowUp => Some(Key::Up),
+            pc_keyboard::KeyCode::ArrowDown => Some(Key::Down),
+            pc_keyboard::KeyCode::ArrowLeft => Some(Key::Left),
+            pc_keyboard::KeyCode::ArrowRight => Some(Key::Right),
+            pc_keyboard::KeyCode::Home => Some(Key::Home),
+            pc_keyboard::KeyCode::End => Some(Key::End),
+            pc_keyboard::KeyCode::PageUp => Some(Key::PageUp),
+            pc_keyboard::KeyCode::PageDown => Some(Key::PageDown),
+            pc_keyboard::KeyCode::Delete => Some(Key::Delete),
+            _ => None, // F-keys, modifiers, media keys, Unknown
+        },
+    }
+}
+
+/// One shared poll→decode step for [`next_char`] and [`next_event`]:
+/// controller check, aux byte drop, one scancode byte in, one
+/// [`DecodedKey`] out (`None` = nothing usable this iteration).
+///
+/// SAFETY contract: the decoder has exactly **one** consumer at a
+/// time — the shell's idle loop (`next_char`), or a builtin that
+/// borrowed the loop's stack for its whole run (`next_event`); no IRQ
+/// handler reads the controller (IRQ1 stays masked, polled
+/// milestone), so no re-entry or aliasing is possible.
+fn poll_decoded() -> Option<DecodedKey> {
     if !AVAILABLE.load(Ordering::Relaxed) {
         return None;
     }
@@ -119,17 +206,13 @@ pub fn next_char() -> Option<char> {
     }
     let byte = read_data(); // reading 0x60 also clears OBF (§2.2)
 
-    // SAFETY: the decoder has exactly one consumer — the shell's idle
-    // loop — and no IRQ handler touches it (polled milestone; IRQ1 is
-    // still masked in the PIC), so no re-entry or aliasing is possible.
+    // SAFETY: see the function docs — single consumer, polled, no IRQ
+    // handler touches DECODER.
     let decoder = unsafe { &mut *core::ptr::addr_of_mut!(DECODER) };
     // Err = unknown scancode (ignored, decoder state already reset),
     // None = E0/E1 prefix byte consumed.
     let event = decoder.add_byte(byte).ok().flatten()?;
-    match decoder.process_keyevent(event)? {
-        DecodedKey::Unicode(c) if c.is_ascii() => Some(c),
-        _ => None, // RawKey: modifiers, F-keys, arrows, media keys — ignore
-    }
+    decoder.process_keyevent(event)
 }
 
 /// The full §2.3 sequence, with every wait bounded.

@@ -136,9 +136,12 @@ the mock makes the whole chain smoke-testable **without credentials**, keeping t
 
 ## 8. Risks / open questions
 
-- **ratatui no_std probe is unverified** — the official docs claim it; we have not
-  run `cargo check --target x86_64-unknown-none` on it yet. Fallback (hand-rolled
-  cell widgets) is costed in A1.
+- **ratatui no_std probe — resolved in A1 (2026-11-21):** cross check
+  of `ratatui 0.30.2` for `x86_64-unknown-none` with
+  `default-features = false` passes clean (see the appendix); the
+  hand-rolled widget fallback was not needed. Residual risk is runtime,
+  not build: `Terminal`'s two internal buffers are heap (`alloc`),
+  bounded at 2 × cols × rows ratatui cells per session.
 - **Boot-smoke budget**: A3 adds a host-side mock server to xtask (must be killed
   on failure — the existing `stop_vm`/orphan-watch discipline applies to it too).
 - **Bounded memory**: response bodies and editor buffers get explicit byte caps
@@ -157,5 +160,11 @@ the mock makes the whole chain smoke-testable **without credentials**, keeping t
 - 2026-11-21 — ratatui no_std confirmed from the official
   `ratatui.rs/concepts/no-std/` page (0.30, `default-features = false`, custom
   `Backend`, `ratatui-core` alternative).
+- 2026-11-21 — **A1 build probe run:** `ratatui 0.30.2` (+ `ratatui-core
+  0.1.2`, `ratatui-widgets 0.3.2`) cross-checks clean for
+  `x86_64-unknown-none` as a kernel dependency with `default-features =
+  false`; all three crates are `#![no_std]` + `alloc`, no `crossterm`/`std`/
+  `serde` feature is compiled, `cargo audit` clean (0 advisories, 129
+  crates). Adopted: `VgaBackend` + widgets are the A1 rendering path.
 - 2026-11-21 — no_std SSE crate search: only futures/std-based options found
   (`eventsource-stream`, `reqwest-eventsource`).
