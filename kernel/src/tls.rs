@@ -99,7 +99,7 @@ impl TlsClock for RtcClock {
 /// loop iteration and honors a per-operation deadline. smoltcp owns
 /// retransmission, reassembly, windows and Reno congestion control —
 /// no stash, no ACK-wait, no retransmit bookkeeping here.
-struct Stream<'a> {
+pub(crate) struct Stream<'a> {
     iface: &'a mut Interface,
     dev: &'a mut E1000Phy,
     socks: &'a mut SocketSet<'static>,
@@ -176,26 +176,31 @@ impl Write for Stream<'_> {
     }
 }
 
-/// Prove the whole HTTPS client path on the smoltcp stack: connect
-/// the second TCP socket to `ip:443`, complete a TLS 1.3 handshake
-/// against the pinned root, GET `/robots.txt` with `Connection:
-/// close`, parse and frame the response with `net::http` (httparse
-/// head + RFC 9112 body framer), validate the body, close both
-/// layers cleanly, print `TLS_OK` then `HTTP_OK`.
-pub fn https_smoke(stack: &mut Stack, ip: Ipv4Address, host: &str) {
-    // Connect the dedicated TLS socket (the plain-HTTP proof owns the
-    // first one — TIME-WAIT would block reuse for10 s).
+/// Open a TLS 1.3 connection to `ip:443` from `local_port` on socket
+/// `handle` and complete the handshake against the pinned root —
+/// shared by [`https_smoke`] and the `git ls-remote` fetch. The
+/// returned connection borrows the stack and the static record
+/// buffers until [`tls_fetch`] consumes it (sequential connections:
+/// TIME-WAIT forbids reusing a socket for10 s, so each caller owns a
+/// different handle and local port).
+pub(crate) fn tls_open<'a>(
+    stack: &'a mut Stack,
+    handle: SocketHandle,
+    ip: Ipv4Address,
+    host: &str,
+    local_port: u16,
+) -> TlsConnection<'a, Stream<'a>, Aes128GcmSha256> {
     let deadline = clock::now_ms() + OP_DEADLINE_MS;
     {
-        let sock = stack.sockets.get_mut::<tcp::Socket>(stack.tcp2_handle);
-        if let Err(e) = sock.connect(stack.iface.context(), (ip, 443u16), LOCAL_PORT) {
+        let sock = stack.sockets.get_mut::<tcp::Socket>(handle);
+        if let Err(e) = sock.connect(stack.iface.context(), (ip, 443u16), local_port) {
             serial_println!("tls: connect rejected: {e:?}");
             crate::halt();
         }
     }
     loop {
         stack.poll();
-        if stack.sockets.get::<tcp::Socket>(stack.tcp2_handle).state() == tcp::State::Established {
+        if stack.sockets.get::<tcp::Socket>(handle).state() == tcp::State::Established {
             break;
         }
         if clock::now_ms() > deadline {
@@ -209,21 +214,20 @@ pub fn https_smoke(stack: &mut Stack, ip: Ipv4Address, host: &str) {
         iface,
         dev,
         sockets,
-        tcp2_handle,
         ..
     } = stack;
     let stream = Stream {
         iface,
         dev,
         socks: sockets,
-        handle: *tcp2_handle,
+        handle,
     };
 
     // SAFETY: single-use buffers (see `READ_STORAGE`); taken as `&mut`
     // through raw pointers to avoid `static_mut_refs` on a shared name.
     let read_buf = unsafe { &mut *addr_of_mut!(READ_STORAGE) };
     let write_buf = unsafe { &mut *addr_of_mut!(WRITE_STORAGE) };
-    let mut tls: TlsConnection<_, Aes128GcmSha256> =
+    let mut tls: TlsConnection<'a, Stream<'a>, Aes128GcmSha256> =
         TlsConnection::new(stream, read_buf, write_buf);
 
     let verifier: CertVerifier<'_, Aes128GcmSha256, RtcClock, CERT_SIZE> =
@@ -234,12 +238,30 @@ pub fn https_smoke(stack: &mut Stack, ip: Ipv4Address, host: &str) {
         crate::halt();
     }
     serial_println!("tls: handshake ok (TLS 1.3, pinned USERTrust ECC root)");
-    serial_println!("TLS_OK"); // machine-checked by `cargo xtask smoke`
+    tls
+}
 
+/// One full HTTPS exchange over an open connection: send the GET
+/// (with `headers` inserted before the terminating blank line), frame
+/// the whole response into `body` — bytes past `body.len()` are
+/// validated and counted, not stored — assert `expect_ct` against the
+/// `Content-Type` when given, then close both layers cleanly.
+/// Returns `(status, total_body_bytes)`; a non-200 status, a missing
+/// or mismatched `Content-Type`, a truncated body or a shutdown that
+/// never settles is `fatal`, never a partial result.
+pub(crate) fn tls_fetch(
+    tls: TlsConnection<'_, Stream<'_>, Aes128GcmSha256>,
+    host: &str,
+    path: &str,
+    headers: &[&str],
+    expect_ct: Option<&[u8]>,
+    body: &mut [u8],
+) -> (u16, usize) {
+    let mut tls = tls;
     // HTTP/1.1 GET over the established channel; `Connection: close`
     // makes the server finish with close_notify + FIN.
-    let mut req = [0u8; 256];
-    let Some(req_len) = http::build_get(&mut req, host, "/robots.txt") else {
+    let mut req = [0u8; 512];
+    let Some(req_len) = http::build_request(&mut req, host, path, headers) else {
         fatal("GET request does not fit the buffer");
     };
     if let Err(e) = tls.write_all(&req[..req_len]) {
@@ -254,13 +276,18 @@ pub fn https_smoke(stack: &mut Stack, ip: Ipv4Address, host: &str) {
     // Read the decrypted stream through the HTTP response parser:
     // httparse parses the head, the RFC 9112 framer the body
     // (content-length / chunked / close-delimited).
-    // SAFETY: single-use statics (see `READ_STORAGE`).
+    // SAFETY: single-use statics (see `READ_STORAGE`). The parser is
+    // shared by every connection in sequence, so it must start each
+    // response fresh — otherwise the previous response's completed
+    // head (status, Content-Type) would leak into this one's checks.
     let parser = unsafe { &mut *addr_of_mut!(PARSER) };
+    parser.reset();
     let staging = unsafe { &mut *addr_of_mut!(STAGING) };
-    let body_head = unsafe { &mut *addr_of_mut!(BODY_HEAD) };
-    let mut body_head_len = 0usize;
-    let mut body_total = 0usize;
+    let mut status = 0u16;
     let mut status_checked = false;
+    let mut ct_checked = expect_ct.is_none();
+    let mut body_total = 0usize;
+    let mut body_stored = 0usize;
     let mut scratch = [0u8; SCRATCH];
     loop {
         match tls.read(&mut scratch) {
@@ -273,22 +300,30 @@ pub fn https_smoke(stack: &mut Stack, ip: Ipv4Address, host: &str) {
                         crate::halt();
                     }
                 };
-                if !status_checked && let Some(status) = parser.status() {
+                if !status_checked && let Some(s) = parser.status() {
                     status_checked = true;
+                    status = s;
                     // A parsed u16 — inherently safe to log (no
                     // log-injection surface like raw text lines).
-                    serial_println!("http: status {status}");
-                    if status != 200 {
+                    serial_println!("http: status {s}");
+                    if s != 200 {
                         fatal("unexpected HTTP status (expected 200)");
+                    }
+                    if let Some(expected) = expect_ct {
+                        // Header values come off the wire: compared,
+                        // never logged.
+                        match http::header_value(parser.head(), b"content-type") {
+                            Some(value) if ct_matches(value, expected) => {}
+                            Some(_) => fatal("unexpected Content-Type"),
+                            None => fatal("response has no Content-Type"),
+                        }
+                        ct_checked = true;
                     }
                 }
                 if progress.body > 0 {
-                    if body_head_len < body_head.len() {
-                        let take = min(body_head.len() - body_head_len, progress.body);
-                        body_head[body_head_len..body_head_len + take]
-                            .copy_from_slice(&staging[..take]);
-                        body_head_len += take;
-                    }
+                    let take = min(body.len() - body_stored, progress.body);
+                    body[body_stored..body_stored + take].copy_from_slice(&staging[..take]);
+                    body_stored += take;
                     body_total += progress.body;
                     if body_total > READ_CAP {
                         fatal("response body exceeds the byte bound");
@@ -314,20 +349,9 @@ pub fn https_smoke(stack: &mut Stack, ip: Ipv4Address, host: &str) {
             }
         }
     }
-
-    // A real, fully-framed body with real content: any valid
-    // robots.txt declares its user agent.
-    if body_total == 0 {
-        fatal("empty response body");
+    if !ct_checked {
+        fatal("response head never parsed (Content-Type unchecked)");
     }
-    if !body_head[..body_head_len]
-        .windows(b"User-agent:".len())
-        .any(|window| window == b"User-agent:")
-    {
-        fatal("body does not look like robots.txt (no User-agent)");
-    }
-    serial_println!("http: {body_total} bytes framed");
-    serial_println!("HTTP_OK"); // machine-checked by `cargo xtask smoke`
 
     // Orderly shutdown: close_notify (best-effort — the server's own
     // close_notify already authenticated everything we read; a failure
@@ -346,10 +370,50 @@ pub fn https_smoke(stack: &mut Stack, ip: Ipv4Address, host: &str) {
         let state = stream.tcp().state();
         if state == tcp::State::TimeWait || state == tcp::State::Closed {
             serial_println!("tls: connection closed cleanly ({state})");
-            return;
+            return (status, body_total);
         }
         if clock::now_ms() > deadline {
             fatal("timeout closing connection (never reached TimeWait/Closed)");
         }
     }
+}
+
+/// Content-Type match with parameters allowed: the value must start
+/// with `expected` (ASCII case-insensitive) and continue with `;` /
+/// whitespace, or end there.
+fn ct_matches(value: &[u8], expected: &[u8]) -> bool {
+    value.len() >= expected.len()
+        && value[..expected.len()].eq_ignore_ascii_case(expected)
+        && matches!(
+            value.get(expected.len()),
+            None | Some(&b';') | Some(&b' ') | Some(&b'\t')
+        )
+}
+
+/// Prove the whole HTTPS client path on the smoltcp stack: connect
+/// the second TCP socket to `ip:443` and handshake ([`tls_open`]),
+/// GET `/robots.txt` and frame the response ([`tls_fetch`]), validate
+/// the body, print `TLS_OK` then `HTTP_OK`.
+pub fn https_smoke(stack: &mut Stack, ip: Ipv4Address, host: &str) {
+    let handle = stack.tcp2_handle;
+    let tls = tls_open(stack, handle, ip, host, LOCAL_PORT);
+    serial_println!("TLS_OK"); // machine-checked by `cargo xtask smoke`
+
+    // A real, fully-framed body with real content: any valid
+    // robots.txt declares its user agent inside the first few lines
+    // (bytes past `BODY_HEAD` are counted by tls_fetch, not stored).
+    // SAFETY: single-use static (see `BODY_HEAD`).
+    let body_head = unsafe { &mut *addr_of_mut!(BODY_HEAD) };
+    let (_status, body_total) = tls_fetch(tls, host, "/robots.txt", &[], None, body_head);
+    if body_total == 0 {
+        fatal("empty response body");
+    }
+    if !body_head
+        .windows(b"User-agent:".len())
+        .any(|window| window == b"User-agent:")
+    {
+        fatal("body does not look like robots.txt (no User-agent)");
+    }
+    serial_println!("http: {body_total} bytes framed");
+    serial_println!("HTTP_OK"); // machine-checked by `cargo xtask smoke`
 }

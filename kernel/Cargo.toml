@@ -6,6 +6,11 @@ publish.workspace = true
 
 [dependencies]
 mbi = { path = "../mbi" }
+# pkt-line codec + upload-pack advertisement parser (G1 of
+# docs/git-ssh-deps.md): from-scratch under dependency-policy
+# exception (a) — `gix-packetline` is std-only; rationale and the
+# adversarial test suite live in the crate's docs.
+git-pktline = { path = "../git-pktline" }
 multiboot2 = { version = "0.28", default-features = false }
 net = { path = "../net" }
 pci = { path = "../pci" }

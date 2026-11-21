@@ -419,7 +419,7 @@ fn run(root: &Path) -> bool {
 /// It runs **without a disk**, so the `ata::probe` that sits between
 /// `PCI_OK` and `E1000_OK` stays silent here.
 fn smoke(root: &Path) -> bool {
-    const MARKERS: [&str; 17] = [
+    const MARKERS: [&str; 18] = [
         "BOOT_OK",
         "VGA_OK",
         "MEM_OK",
@@ -434,6 +434,7 @@ fn smoke(root: &Path) -> bool {
         "TCP_OK",
         "TLS_OK",
         "HTTP_OK",
+        "GIT_LSREMOTE_OK",
         "INT_OK",
         "SHELL_OK",
         "KEYBOARD_OK",

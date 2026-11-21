@@ -111,6 +111,9 @@ pub struct ResponseParser {
     /// Accumulated head until httparse completes it.
     head: [u8; HEAD_CAP],
     head_len: usize,
+    /// Length of the completed head (status line + headers); set when
+    /// the head parses — `head_len` may already include body bytes.
+    head_end: usize,
     phase: Phase,
     status: Option<u16>,
     framing: Framing,
@@ -133,6 +136,7 @@ impl ResponseParser {
         ResponseParser {
             head: [0; HEAD_CAP],
             head_len: 0,
+            head_end: 0,
             phase: Phase::Head,
             status: None,
             framing: Framing::CloseDelimited,
@@ -145,9 +149,35 @@ impl ResponseParser {
         }
     }
 
+    /// Reset for a new response: the kernel keeps one parser `static`
+    /// and runs sequential exchanges through it, so each must start
+    /// fresh instead of inheriting the previous head/framing state
+    /// (a leaked `status`/`Content-Type` would validate the wrong
+    /// response). Field-by-field — no whole-struct temporary, the
+    /// kernel boot stack is 16 KiB and `head` alone is 8 KiB.
+    pub fn reset(&mut self) {
+        self.head_len = 0;
+        self.head_end = 0;
+        self.phase = Phase::Head;
+        self.status = None;
+        self.framing = Framing::CloseDelimited;
+        self.remaining = 0;
+        self.chunk = Chunk::Size;
+        self.line_len = 0;
+        self.pending_cr = false;
+        self.line_dirty = false;
+    }
+
     /// The response status code, once the head has been parsed.
     pub fn status(&self) -> Option<u16> {
         self.status
+    }
+
+    /// The complete response head (status line + headers) — valid
+    /// once [`ResponseParser::status`] is `Some`; feed it to
+    /// [`header_value`] for header assertions.
+    pub fn head(&self) -> &[u8] {
+        &self.head[..self.head_end]
     }
 
     /// The declared body length for `Content-Length` responses (the
@@ -189,6 +219,7 @@ impl ResponseParser {
                         // is really head — anything appended past it
                         // is body and must go to the framer below.
                         offset = input_start + (head_bytes - head_before);
+                        self.head_end = head_bytes;
                         self.status = Some(status);
                         self.framing = framing;
                         self.phase = match framing {
@@ -519,27 +550,66 @@ fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
     bytes
 }
 
-/// Assemble `GET <path> HTTP/1.1` with the `Host` header and
+/// Assemble `GET <path> HTTP/1.1` with the `Host` header, `headers`
+/// (each a complete `Name: value` line, no CRLF), and
 /// `Connection: close` into `buf`, returning its length — `None` when
 /// `buf` is too small (the caller decides whether that is a bug).
-/// Shared by the plain-HTTP and TLS smoke paths.
-pub fn build_get(buf: &mut [u8], host: &str, path: &str) -> Option<usize> {
+/// Shared by the plain-HTTP, TLS-smoke and git paths.
+pub fn build_request(buf: &mut [u8], host: &str, path: &str, headers: &[&str]) -> Option<usize> {
     const MIDDLE: &[u8] = b" HTTP/1.1\r\nHost: ";
-    const SUFFIX: &[u8] = b"\r\nConnection: close\r\n\r\n";
-    let total = b"GET ".len() + path.len() + MIDDLE.len() + host.len() + SUFFIX.len();
+    const CONN: &[u8] = b"\r\nConnection: close";
+    const END: &[u8] = b"\r\n\r\n";
+    let mut total = b"GET ".len() + path.len() + MIDDLE.len() + host.len() + CONN.len() + END.len();
+    for h in headers {
+        total = total.checked_add(2 + h.len())?; // CRLF + line
+    }
     let out = buf.get_mut(..total)?;
-    let mut off = 0;
+    let mut off = 0usize;
     for part in [
         b"GET ".as_slice(),
         path.as_bytes(),
         MIDDLE,
         host.as_bytes(),
-        SUFFIX,
+        CONN,
     ] {
         out[off..off + part.len()].copy_from_slice(part);
         off += part.len();
     }
+    for h in headers {
+        out[off..off + 2].copy_from_slice(b"\r\n");
+        out[off + 2..off + 2 + h.len()].copy_from_slice(h.as_bytes());
+        off += 2 + h.len();
+    }
+    out[off..off + END.len()].copy_from_slice(END);
     Some(total)
+}
+
+/// [`build_request`] without extra headers — the plain-HTTP and
+/// TLS-smoke paths.
+pub fn build_get(buf: &mut [u8], host: &str, path: &str) -> Option<usize> {
+    build_request(buf, host, path, &[])
+}
+
+/// Value of `name` (ASCII case-insensitive) in a **complete** raw
+/// response head (status line … blank line), with surrounding OWS
+/// trimmed — `None` when absent or the head is malformed. Used to
+/// assert the git advertisement's `Content-Type`.
+pub fn header_value<'a>(head: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+    // Skip the status line.
+    let mut rest = &head[head.iter().position(|&b| b == b'\n')? + 1..];
+    loop {
+        let nl = rest.iter().position(|&b| b == b'\n')?;
+        let line = rest[..nl].strip_suffix(b"\r").unwrap_or(&rest[..nl]);
+        if line.is_empty() {
+            return None; // end of headers, name not found
+        }
+        let colon = line.iter().position(|&b| b == b':')?;
+        let key = &line[..colon];
+        if key.len() == name.len() && key.eq_ignore_ascii_case(name) {
+            return Some(trim_ascii(&line[colon + 1..]));
+        }
+        rest = &rest[nl + 1..];
+    }
 }
 
 /// True once the head-terminating empty line (`\r\n\r\n`) is present
@@ -574,6 +644,39 @@ mod tests {
         let mut out = [0u8; 4096];
         let progress = parser.feed(input, &mut out[..]).expect("feed");
         (out[..progress.body].to_vec(), progress)
+    }
+
+    #[test]
+    fn reset_between_responses_does_not_leak_the_previous_head() {
+        // Regression: the kernel keeps ONE parser static and runs
+        // sequential exchanges through it — without reset, the second
+        // response inherited the first one's status/Content-Type and
+        // validated the wrong head (caught in the git smoke).
+        let mut parser = ResponseParser::new();
+        let first =
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello";
+        let (body, progress) = feed_bytewise(&mut parser, first);
+        assert!(progress.complete);
+        assert_eq!(&body[..], b"hello");
+        assert_eq!(parser.status(), Some(200));
+        assert_eq!(
+            header_value(parser.head(), b"content-type"),
+            Some(&b"text/plain"[..])
+        );
+
+        parser.reset();
+        assert_eq!(parser.status(), None);
+        assert_eq!(parser.head(), b"");
+
+        let second = b"HTTP/1.1 200 OK\r\nContent-Type: application/x-git-upload-pack-advertisement\r\nContent-Length: 2\r\n\r\nok";
+        let (body, progress) = feed_whole(&mut parser, second);
+        assert!(progress.complete);
+        assert_eq!(&body[..], b"ok");
+        assert_eq!(parser.status(), Some(200));
+        assert_eq!(
+            header_value(parser.head(), b"content-type"),
+            Some(&b"application/x-git-upload-pack-advertisement"[..])
+        );
     }
 
     #[test]
@@ -887,6 +990,49 @@ mod tests {
         // Too-small buffer: `None`, never a partial request.
         let mut tiny = [0u8; 8];
         assert_eq!(build_get(&mut tiny, "github.com", "/"), None);
+    }
+
+    #[test]
+    fn build_request_appends_extra_headers_before_the_terminator() {
+        let mut buf = [0u8; 512];
+        let n = build_request(
+            &mut buf,
+            "github.com",
+            "/repo.git/info/refs?service=git-upload-pack",
+            &["User-Agent: reemplazo-git/0.1", "X-Test: yes"],
+        )
+        .expect("fits");
+        let req = &buf[..n];
+        assert!(req.starts_with(
+            b"GET /repo.git/info/refs?service=git-upload-pack HTTP/1.1\r\nHost: github.com\r\n"
+        ));
+        assert!(req.ends_with(b"User-Agent: reemplazo-git/0.1\r\nX-Test: yes\r\n\r\n"));
+        // Every header line is CRLF-terminated and the blank line closes.
+        assert!(headers_complete(req));
+        // Overflow: `None`, never truncated.
+        let mut tiny = [0u8; 32];
+        assert_eq!(
+            build_request(&mut tiny, "github.com", "/", &["X-Long: 1234567890"]),
+            None
+        );
+    }
+
+    #[test]
+    fn header_value_finds_case_insensitively_with_ows_trimmed() {
+        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\ncontent-type:  Application/x-Git-Upload-Pack-Advertisement ; charset=utf-8\r\nX-A: 1\r\n\r\n";
+        assert_eq!(
+            header_value(head, b"content-type"),
+            Some(&b"Application/x-Git-Upload-Pack-Advertisement ; charset=utf-8"[..])
+        );
+        assert_eq!(header_value(head, b"Content-Length"), Some(&b"5"[..]));
+        assert_eq!(header_value(head, b"CONTENT-LENGTH"), Some(&b"5"[..]));
+        assert_eq!(header_value(head, b"x-a"), Some(&b"1"[..]));
+        assert_eq!(header_value(head, b"missing"), None);
+        // Header that never appears before the blank line.
+        assert_eq!(header_value(head, b"transfer-encoding"), None);
+        // Malformed head: no status line / no terminator → None.
+        assert_eq!(header_value(b"", b"content-type"), None);
+        assert_eq!(header_value(b"HTTP/1.1 200 OK\r\n", b"content-type"), None);
     }
 
     #[test]

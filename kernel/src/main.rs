@@ -22,6 +22,7 @@ mod serial;
 mod ata;
 mod e1000;
 mod entropy;
+mod git;
 mod heap;
 mod idt;
 mod keyboard;
@@ -117,6 +118,7 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
         serial_println!("DNS_OK"); // machine-checked by `cargo xtask smoke`
         stack.plain_get_smoke(github_ip, "github.com"); // TCP_OK
         tls::https_smoke(stack, github_ip, "github.com"); // TLS_OK + HTTP_OK
+        git::ls_remote(stack, github_ip); // GIT_LSREMOTE_OK
     }
 
     test_interrupts();
