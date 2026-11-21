@@ -10,6 +10,13 @@ net = { path = "../net" }
 pci = { path = "../pci" }
 rtc = { path = "../rtc" }
 
+# Kernel heap (reviewed in docs/dependencies.md §4): `default-features =
+# false` drops `use_spin` (which would pull spinning_top → lock_api →
+# scopeguard) — we wrap the plain `Heap` in our own IRQ-aware lock
+# instead (kernel/src/heap.rs). RUSTSEC-2022-0063 (out-of-bounds write
+# on tiny/unaligned heaps) is patched in >= 0.10.2; 0.10.6 is clean.
+linked_list_allocator = { version = "0.10.6", default-features = false }
+
 # TLS stack (reviewed in the TLS milestone commit): `embedded-tls` is
 # pinned by git rev for a reproducible Cargo.lock; its crypto comes from
 # RustCrypto through `embassy-crypto` (same pinned embassy rev), and

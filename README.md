@@ -82,10 +82,15 @@ cargo test -p bootinfo <name>   # single test
 The smoke test asserts each milestone's serial marker within 30 s:
 
 ```
-BOOT_OK → MEM_OK → RTC_OK → PCI_OK → E1000_OK → NET_OK → PING_OK → DHCP_OK → DNS_OK → TCP_OK → TLS_OK → HTTP_OK → INT_OK → SHELL_OK
+BOOT_OK → MEM_OK → ALLOC_OK → RTC_OK → PCI_OK → E1000_OK → NET_OK → PING_OK → DHCP_OK → DNS_OK → TCP_OK → TLS_OK → HTTP_OK → INT_OK → SHELL_OK
 ```
 
 **Notes:**
+
+- The kernel heap (`ALLOC_OK`) is a 16 MiB contiguous run carved from the
+  frame allocator at boot (`linked_list_allocator` behind an IRQ-aware
+  lock — see `kernel/src/heap.rs`). Interrupt handlers must never
+  allocate; a failed allocation panics and halts (no OOM recovery).
 
 - `kernel` never builds with bare `cargo build` (excluded via `default-members`);
   it is built via `cargo xtask build --target x86_64-unknown-none`.
@@ -106,6 +111,7 @@ Milestones landed so far (see `git log` for details):
 - [x] Multiboot2 boot milestone — GRUB → long mode, serial console
 - [x] Interrupt milestone — IDT, PIC remap, PIT timer, exception dispatch
 - [x] Frame allocator + PCI enumeration
+- [x] Kernel heap — `linked_list_allocator` (16 MiB contiguous carve), global `alloc` (`Vec` proof → `ALLOC_OK`)
 - [x] e1000 driver — PCI probe, BAR decode, MMIO, MAC from EEPROM
 - [x] e1000 TX/RX rings + ARP roundtrip
 - [x] IPv4 + ICMP echo — ping roundtrip with checksum validation

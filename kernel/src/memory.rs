@@ -138,6 +138,93 @@ pub fn free_count() -> u64 {
         .sum()
 }
 
+/// Carve a **contiguous** run of frames for the kernel heap.
+///
+/// [`alloc`] hands out the *lowest free* frame, so addresses arrive in
+/// increasing order, but they are not guaranteed contiguous: the kernel
+/// image, the mbi and reserved E820 regions punch holes in the free
+/// pool. We therefore allocate frames and verify contiguity as we go
+/// (a run only extends when `next == run_start + run_len * FRAME_SIZE`;
+/// any other address closes the run and starts a new one), remember
+/// every run, and keep the **longest** one — the longest contiguous
+/// prefix of the allocation sequence. Allocation stops early as soon as
+/// one run reaches `target` frames; the search budget is twice that, so
+/// a couple of holes cannot starve the carve.
+///
+/// Frames in the runs that lose are returned to the pool (they were all
+/// allocated by this call, so no other owner exists), and the winning
+/// run stays marked used — that is what makes the region safe for the
+/// heap: exclusive, never handed out twice, identity-mapped RAM
+/// (`entry.S` maps the first 4 GiB) that the E820 map lists as
+/// available.
+///
+/// Returns `(start_phys, frames)` of the chosen run, or `None` if the
+/// pool has no frames at all.
+pub fn carve_contiguous(target: u64) -> Option<(u64, u64)> {
+    /// Room for a handful of holes (kernel, mbi, ACPI/E820 reservations).
+    const MAX_RUNS: usize = 128;
+    // Search budget: twice the target, so holes cost us nothing.
+    let budget = target.saturating_mul(2);
+
+    let mut runs = [(0u64, 0u64); MAX_RUNS]; // (start, len) of every run seen
+    let mut n_runs = 0usize;
+    let mut cur = (0u64, 0u64); // run currently being extended
+    let mut taken = 0u64;
+
+    while taken < budget {
+        let Some(f) = alloc() else { break };
+        taken += 1;
+        let phys = f.start_phys();
+        if cur.1 != 0 && phys == cur.0 + cur.1 * FRAME_SIZE {
+            cur.1 += 1; // contiguous: extend the run
+        } else {
+            // Not contiguous (or first frame): record the run being closed.
+            if n_runs == MAX_RUNS {
+                fatal("heap carve: free pool too fragmented");
+            }
+            runs[n_runs] = cur;
+            n_runs += 1;
+            cur = (phys, 1);
+        }
+        if cur.1 >= target {
+            break; // long enough — stop allocating
+        }
+    }
+    if n_runs == MAX_RUNS {
+        fatal("heap carve: free pool too fragmented");
+    }
+    runs[n_runs] = cur;
+    n_runs += 1;
+
+    // The winning run: the longest recorded (first wins on a tie; a
+    // run that reached `target` is necessarily the longest, since every
+    // earlier run closed before reaching it).
+    let mut best = (0u64, 0u64);
+    for &run in &runs[..n_runs] {
+        if run.1 > best.1 {
+            best = run;
+        }
+    }
+    if best.1 == 0 {
+        return None; // pool was empty
+    }
+
+    // Give back every frame outside the winning run (all of them were
+    // allocated by this call — the runs are disjoint by construction).
+    for &(start, len) in &runs[..n_runs] {
+        if (start, len) == best || len == 0 {
+            continue;
+        }
+        let mut n = start / FRAME_SIZE;
+        let end = (start + len * FRAME_SIZE) / FRAME_SIZE;
+        while n < end {
+            set_frame(n, false);
+            n += 1;
+        }
+    }
+    Some(best)
+}
+
 /// (start, end) of the kernel image, from symbols defined in `linker.ld`.
 fn kernel_range() -> (u64, u64) {
     unsafe extern "C" {
