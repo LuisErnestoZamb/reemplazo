@@ -76,6 +76,34 @@ impl RawClock {
     }
 }
 
+/// Format flags decoded from CMOS status register B.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StatusFlags {
+    /// Status B bit 2 (DM): `false` = BCD digits (CMOS default),
+    /// `true` = binary.
+    pub binary: bool,
+    /// Status B bit 1 (24HR): `false` = 24-hour mode, `true` =
+    /// 12-hour mode (the hours register's bit 7 is then the PM flag).
+    pub hour12: bool,
+}
+
+/// Decode the format flags of a raw status register B byte.
+///
+/// MC146818 register B bit 1 is `24HR` and reads **1 = 24-hour
+/// mode**, 0 = 12-hour mode — the sense is the opposite of what the
+/// field name suggests. QEMU powers up with `0x02` (BCD, 24-hour) and
+/// SeaBIOS forces `24HR` on, so [`StatusFlags::default`] is the
+/// typical reading. Reading the bit backwards made hours 13..=23 and
+/// 00 fail to decode: the clock worked in the morning and reported
+/// "unavailable" every afternoon (that regression is the
+/// `afternoon_decodes_in_24_hour_mode` test).
+pub fn status_flags(status_b: u8) -> StatusFlags {
+    StatusFlags {
+        binary: status_b & 0x04 != 0, // DM
+        hour12: status_b & 0x02 == 0, // 24HR (inverted sense)
+    }
+}
+
 /// Decode and validate a raw reading.
 ///
 /// The full year must land in 2000..=2099: the century register is
@@ -424,6 +452,51 @@ mod tests {
         raw.year = 0x26;
         raw.day = 0x31;
         assert_eq!(decode(&raw), Err(Error::BadDay)); // Feb 31
+    }
+
+    #[test]
+    fn status_b_24hr_bit_has_inverted_sense() {
+        // MC146818 register B bit 1 (24HR): 1 = 24-hour mode. QEMU
+        // powers up with 0x02 and SeaBIOS forces the bit on, so a
+        // typical reading must decode as 24-hour, not 12-hour.
+        assert!(!status_flags(0x02).hour12, "QEMU default is 24-hour");
+        assert!(!status_flags(0x06).hour12, "DM | 24HR");
+        assert!(status_flags(0x00).hour12, "bit clear = 12-hour");
+        // DM (bit 2) is not inverted: 1 = binary.
+        assert!(status_flags(0x04).binary);
+        assert!(!status_flags(0x02).binary);
+    }
+
+    #[test]
+    fn afternoon_decodes_in_24_hour_mode() {
+        // Regression: reading 24HR backwards made hour 15 (BCD 0x15)
+        // fail the 1..=12 12-hour check, so `now_epoch` returned None
+        // every afternoon and the smoke test lost RTC_OK.
+        let flags = status_flags(0x02); // QEMU/SeaBIOS status B
+        let raw = RawClock {
+            second: 0x46,
+            minute: 0x20,
+            hour: 0x15, // BCD 15
+            day: 0x21,
+            month: 0x11,
+            year: 0x26,
+            century: 0x20,
+            binary: flags.binary,
+            hour12: flags.hour12,
+        };
+        let c = decode(&raw).expect("afternoon reading must decode");
+        assert_eq!(c.hour, 15);
+        assert_eq!(
+            c,
+            Clock {
+                year: 2026,
+                month: 11,
+                day: 21,
+                hour: 15,
+                minute: 20,
+                second: 46
+            }
+        );
     }
 
     #[test]

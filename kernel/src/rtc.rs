@@ -58,10 +58,10 @@ pub fn now_epoch() -> Option<u64> {
     }
 
     let status_b = cmos_read(REG_B);
-    // Status B bit 2 (DM): 0 = BCD digits (default), 1 = binary.
-    let binary = status_b & 0x04 != 0;
-    // Status B bit 1: 1 = 12-hour mode (hour bit 7 is then PM).
-    let hour12 = status_b & 0x02 != 0;
+    // DM (bit 2): 0 = BCD digits (default), 1 = binary. 24HR (bit 1):
+    // 1 = 24-hour mode — inverted sense, decoded and host-tested by
+    // `rtc::status_flags`.
+    let flags = rtc::status_flags(status_b);
     let hour = cmos_read(REG_HOUR);
 
     let common = |century: u8| rtc::RawClock {
@@ -72,8 +72,8 @@ pub fn now_epoch() -> Option<u64> {
         month: cmos_read(REG_MONTH),
         year: cmos_read(REG_YEAR),
         century,
-        binary,
-        hour12,
+        binary: flags.binary,
+        hour12: flags.hour12,
     };
 
     for reg in REG_CENTURY_CANDIDATES {
