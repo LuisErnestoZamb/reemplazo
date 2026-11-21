@@ -19,10 +19,19 @@ use std::time::{Duration, Instant};
 
 /// Containerized grub-mkrescue + qemu-system-x86_64 (tools/Dockerfile).
 const TOOLS_IMAGE: &str = "reemplazo-tools";
-/// Fixed container names so stale VMs can be force-removed between runs.
-const RUN_CONTAINER: &str = "reemplazo-run";
-const SMOKE_CONTAINER: &str = "reemplazo-smoke";
 const SMOKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Container name unique to this checkout: `rm_container` works by
+/// name, so parallel git worktrees (one per milestone) must not
+/// force-remove each other's VMs. `DefaultHasher::new()` uses fixed
+/// keys, so the same directory always maps to the same name.
+fn vm_container(root: &Path, kind: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    root.hash(&mut hasher);
+    format!("reemplazo-{kind}-{:016x}", hasher.finish())
+}
 
 fn main() {
     let cmd = std::env::args().nth(1).unwrap_or_default();
@@ -257,15 +266,17 @@ fn run(root: &Path) -> bool {
         return false;
     }
     let iso_path = root.join("target/iso-root/os.iso");
-    let Some((prog, args, container)) = qemu_invocation(root, &iso_path, RUN_CONTAINER) else {
+    let Some((prog, args, container)) =
+        qemu_invocation(root, &iso_path, &vm_container(root, "run"))
+    else {
         return false;
     };
-    if container.is_some() {
-        rm_container(RUN_CONTAINER); // stale VM from a previous Ctrl-C
+    if let Some(name) = &container {
+        rm_container(name); // stale VM from a previous Ctrl-C
     }
     let status = Command::new(&prog).args(&args).current_dir(root).status();
-    if container.is_some() {
-        rm_container(RUN_CONTAINER);
+    if let Some(name) = &container {
+        rm_container(name);
     }
     match status {
         Ok(s) if s.success() => true,
@@ -304,7 +315,9 @@ fn smoke(root: &Path) -> bool {
         return false;
     }
     let iso_path = root.join("target/iso-root/os.iso");
-    let Some((prog, args, container)) = qemu_invocation(root, &iso_path, SMOKE_CONTAINER) else {
+    let Some((prog, args, container)) =
+        qemu_invocation(root, &iso_path, &vm_container(root, "smoke"))
+    else {
         return false;
     };
     if let Some(name) = &container {
