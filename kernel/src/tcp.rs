@@ -27,8 +27,9 @@ use net::on_subnet;
 use net::tcp::{self, FLAG_ACK, FLAG_FIN, FLAG_PSH, FLAG_RST, FLAG_SYN, TcpHeader};
 
 /// Retransmission attempts per phase (SYN, request, FIN) before giving
-/// up loudly.
-const ATTEMPTS: u32 = 3;
+/// up loudly. The TLS transport adapter reuses this budget for its
+/// read/write stalls.
+pub(crate) const ATTEMPTS: u32 = 3;
 /// Spin budget per wait: a slice of the driver-wide `RX_POLLS` picked
 /// so that [`ATTEMPTS`] retransmissions still finish inside the smoke
 /// test's window (a dead path must print its FATAL before the harness
@@ -37,7 +38,7 @@ const ATTEMPTS: u32 = 3;
 const POLLS: u32 = RX_POLLS / 8;
 /// Largest single-segment send, one MSS: segmentation of bulk data
 /// belongs to the git milestone.
-const MAX_SEND: usize = 1460;
+pub(crate) const MAX_SEND: usize = 1460;
 /// Largest frame we transmit: eth + IPv4 + TCP + MSS option + MSS.
 const MAX_FRAME: usize = 14 + 20 + 20 + 4 + MAX_SEND;
 /// Receive buffer for the whole response. The smoke test reads the
@@ -61,7 +62,7 @@ pub fn http_smoke(nic: &mut E1000, cfg: &NetConfig, remote_ip: [u8; 4], host: &s
     // server FIN after the response, which gives us a full
     // bidirectional close to prove.
     let mut req = [0u8; 256];
-    let req_len = build_get(&mut req, host);
+    let req_len = build_get(&mut req, host, "/");
     conn.send(nic, &req[..req_len]);
 
     // Read until the server's FIN; retransmit the request while it is
@@ -112,24 +113,33 @@ pub fn http_smoke(nic: &mut E1000, cfg: &NetConfig, remote_ip: [u8; 4], host: &s
     serial_println!("TCP_OK"); // machine-checked by `cargo xtask smoke`
 }
 
-/// Assemble `GET / HTTP/1.1` with the `Host` header and
-/// `Connection: close` into `buf`, returning its length.
-fn build_get(buf: &mut [u8], host: &str) -> usize {
-    const PREFIX: &[u8] = b"GET / HTTP/1.1\r\nHost: ";
+/// Assemble `GET <path> HTTP/1.1` with the `Host` header and
+/// `Connection: close` into `buf`, returning its length. Shared by the
+/// plain-HTTP and TLS smoke tests.
+pub(crate) fn build_get(buf: &mut [u8], host: &str, path: &str) -> usize {
+    const MIDDLE: &[u8] = b" HTTP/1.1\r\nHost: ";
     const SUFFIX: &[u8] = b"\r\nConnection: close\r\n\r\n";
-    let total = PREFIX.len() + host.len() + SUFFIX.len();
+    let total = b"GET ".len() + path.len() + MIDDLE.len() + host.len() + SUFFIX.len();
     let b = match buf.get_mut(..total) {
         Some(b) => b,
         None => fatal("GET request does not fit the buffer"),
     };
-    b[..PREFIX.len()].copy_from_slice(PREFIX);
-    b[PREFIX.len()..PREFIX.len() + host.len()].copy_from_slice(host.as_bytes());
-    b[PREFIX.len() + host.len()..].copy_from_slice(SUFFIX);
+    let mut off = 0;
+    for part in [
+        b"GET ".as_slice(),
+        path.as_bytes(),
+        MIDDLE,
+        host.as_bytes(),
+        SUFFIX,
+    ] {
+        b[off..off + part.len()].copy_from_slice(part);
+        off += part.len();
+    }
     total
 }
 
 /// True once the header-terminating empty line (`\r\n\r\n`) is present.
-fn headers_complete(resp: &[u8]) -> bool {
+pub(crate) fn headers_complete(resp: &[u8]) -> bool {
     resp.windows(4).any(|w| w == b"\r\n\r\n")
 }
 
@@ -137,7 +147,7 @@ fn headers_complete(resp: &[u8]) -> bool {
 /// `snd_una` (oldest unacked) … `snd_nxt` (next to send), and
 /// `rcv_nxt` (next expected from the peer) — all compared with the
 /// wrapping helpers in `net::tcp`, because they wrap past 2^32.
-struct Conn {
+pub(crate) struct Conn {
     src: Endpoint, // our MAC + leased IP
     dst: Endpoint, // next-hop MAC + remote IP (MAC is the *router*
     //                  when the server is off-subnet)
@@ -148,8 +158,10 @@ struct Conn {
     rcv_nxt: u32,
     /// The peer's last advertised receive window (for send bounds).
     peer_window: u16,
-    /// Response bytes stored so far: our advertised window is
-    /// `RESP_CAP - rx_used` and never grows back (one response).
+    /// Bytes delivered but not yet given back with [`Conn::release`]:
+    /// the advertised window is `RESP_CAP - rx_used`. The plain-HTTP
+    /// smoke never releases (one response fills the buffer once); the
+    /// TLS adapter releases as it copies out, so its window slides.
     rx_used: usize,
     /// The peer's FIN has been received and acknowledged.
     fin_seen: bool,
@@ -163,9 +175,15 @@ impl Conn {
     /// [`ATTEMPTS`] times; a brand-new connection's first segment must
     /// be *exactly* SYN — no ACK bit (slirp drops anything else,
     /// verified in its `tcp_input.c`). The ISN and local port come
-    /// from [`boot_entropy`](crate::entropy::boot_entropy): weak but
-    /// non-constant, which defeats off-path injection (RFC 6528 §3).
-    fn open(nic: &mut E1000, cfg: &NetConfig, remote_ip: [u8; 4], remote_port: u16) -> Conn {
+    /// from [`boot_entropy`](crate::entropy::boot_entropy) — CSPRNG
+    /// output over the boot jitter pool (see that module's entropy
+    /// caveats) — which defeats off-path injection (RFC 6528 §3).
+    pub(crate) fn open(
+        nic: &mut E1000,
+        cfg: &NetConfig,
+        remote_ip: [u8; 4],
+        remote_port: u16,
+    ) -> Conn {
         let hop_ip = if on_subnet(cfg.ip, cfg.netmask, remote_ip) {
             remote_ip
         } else {
@@ -235,7 +253,7 @@ impl Conn {
     /// caller bug (caught loudly), and [`Conn::resend`] retransmits the
     /// unacked bytes from `snd_una`. Data larger than one MSS is
     /// rejected — bulk segmentation belongs to the git milestone.
-    fn send(&mut self, nic: &mut E1000, data: &[u8]) {
+    pub(crate) fn send(&mut self, nic: &mut E1000, data: &[u8]) {
         if data.is_empty() || data.len() > MAX_SEND {
             fatal("send must be 1..=MSS bytes (no segmentation yet)");
         }
@@ -255,7 +273,7 @@ impl Conn {
     /// the caller decides whether to retransmit or give up. Pure ACKs,
     /// duplicates, and gaps are consumed internally (re-ACKed where
     /// useful) and never returned; the spin counter bounds them all.
-    fn recv(&mut self, nic: &mut E1000, out: &mut [u8]) -> Option<usize> {
+    pub(crate) fn recv(&mut self, nic: &mut E1000, out: &mut [u8]) -> Option<usize> {
         let mut rx = [0u8; 2048];
         let mut spins = 0;
         loop {
@@ -279,7 +297,7 @@ impl Conn {
     /// what the last [`Conn::send`] transmitted (single outstanding
     /// segment by design) — starting at `snd_una`, its first
     /// unacknowledged byte. A fully acknowledged send is a no-op.
-    fn resend(&mut self, nic: &mut E1000, data: &[u8]) {
+    pub(crate) fn resend(&mut self, nic: &mut E1000, data: &[u8]) {
         if !self.has_unacked() {
             return;
         }
@@ -295,7 +313,7 @@ impl Conn {
     /// whatever the peer still sends — their FIN when it arrives,
     /// duplicate FINs re-ACKed, stray payload discarded (the module
     /// docs scope that) — and finish when they acknowledge our FIN.
-    fn close(&mut self, nic: &mut E1000) {
+    pub(crate) fn close(&mut self, nic: &mut E1000) {
         let fin_seq = self.snd_nxt;
         self.send_at(nic, fin_seq, FLAG_FIN | FLAG_ACK, &[], &[]);
         self.snd_nxt = self.snd_nxt.wrapping_add(1);
@@ -332,8 +350,16 @@ impl Conn {
     }
 
     /// True while bytes we sent are not yet acknowledged.
-    fn has_unacked(&self) -> bool {
+    pub(crate) fn has_unacked(&self) -> bool {
         self.snd_una != self.snd_nxt
+    }
+
+    /// Give back `n` bytes previously delivered by [`Conn::recv`]: the
+    /// advertised receive window reopens, which lets the TLS transport
+    /// stream a response of any length through the fixed buffer (the
+    /// plain-HTTP smoke never releases — one response fills it once).
+    pub(crate) fn release(&mut self, n: usize) {
+        self.rx_used = self.rx_used.saturating_sub(n);
     }
 
     /// What we may still send: the peer's window minus what is in

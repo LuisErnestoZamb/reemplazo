@@ -3,7 +3,17 @@ xtask = "run -p xtask --"
 
 # Hard constraint from AGENTS.md: the target CPU (Core2 Duo T7400) tops out at
 # SSSE3. Never use target-cpu=native here — the build host is a different CPU.
-# `x86-64` == x86-64-v1 baseline (SSE2 only), which is what we want.
+# `x86-64` is the original x86-64 baseline: no SSE3+, well under the SSSE3
+# ceiling.
+#
+# Note (verified with `rustc --print cfg --target x86_64-unknown-none`): this
+# target's spec leaves SSE/SSE2 *disabled*, and target-cpu=x86-64 does not
+# re-enable them — so kernel code is compiled without SSE. The crypto
+# dependencies still build because their SIMD paths are `#[target_feature]`-
+# gated behind runtime cpuid checks with soft fallbacks (never taken on the
+# T7400 or QEMU's qemu64). Turning SSE2 on for the kernel proper also means
+# saving/restoring XMM in the ISR stubs — that belongs to the userland
+# milestone, where ABI-mandated SSE state must be switched anyway.
 #
 # relocation-model=static: the kernel is linked at a fixed physical address
 # (linker.ld) and entry.S uses absolute addressing; the default PIC model

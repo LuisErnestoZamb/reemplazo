@@ -465,6 +465,8 @@ impl E1000 {
         fence(Ordering::SeqCst);
         mmio_write32(self.mmio, RDT, idx as u32);
         self.rx_next = (idx + 1) % N_DESC;
+        // Arrival jitter for the entropy pool (module docs in `entropy`).
+        crate::entropy::note_rx();
         Some(n)
     }
 

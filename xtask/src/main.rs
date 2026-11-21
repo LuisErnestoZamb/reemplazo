@@ -291,11 +291,11 @@ fn run(root: &Path) -> bool {
 /// broken boot path (header, trampoline, GDT, paging, mbi parse),
 /// memory path, PCI scan, e1000 driver, network path, DHCP/DNS/TCP
 /// clients, or interrupt path (IDT, stubs, EOI, timer), so it gates
-/// all ten milestones.
+/// all eleven milestones.
 fn smoke(root: &Path) -> bool {
-    const MARKERS: [&str; 10] = [
+    const MARKERS: [&str; 11] = [
         "BOOT_OK", "MEM_OK", "PCI_OK", "E1000_OK", "NET_OK", "PING_OK", "DHCP_OK", "DNS_OK",
-        "TCP_OK", "INT_OK",
+        "TCP_OK", "TLS_OK", "INT_OK",
     ];
     if !iso(root) {
         return false;

@@ -82,7 +82,7 @@ cargo test -p bootinfo <name>   # single test
 The smoke test asserts each milestone's serial marker within 30 s:
 
 ```
-BOOT_OK → MEM_OK → PCI_OK → E1000_OK → NET_OK → PING_OK → DHCP_OK → DNS_OK → TCP_OK → INT_OK
+BOOT_OK → MEM_OK → PCI_OK → E1000_OK → NET_OK → PING_OK → DHCP_OK → DNS_OK → TCP_OK → TLS_OK → INT_OK
 ```
 
 **Notes:**
@@ -106,7 +106,8 @@ Milestones landed so far (see `git log` for details):
 - [x] e1000 driver — PCI probe, BAR decode, MMIO, MAC from EEPROM
 - [x] e1000 TX/RX rings + ARP roundtrip
 - [x] IPv4 + ICMP echo — ping roundtrip with checksum validation
-- [ ] DHCP client, DNS, TCP/TLS
+- [x] DHCP client, DNS resolver, TCP client — github.com over port 80
+- [x] TLS 1.3 client — HTTPS against github.com:443, pinned root certificate
 - [ ] sky2 driver (real hardware only)
 - [ ] Shell, git, ssh, browser, AI client + editor
 - [ ] ISO installer + network installer

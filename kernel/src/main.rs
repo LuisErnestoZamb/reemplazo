@@ -24,6 +24,7 @@ mod pic;
 mod pit;
 mod port;
 mod tcp;
+mod tls;
 
 use bootinfo::{BootInfo, ParseError};
 use core::panic::PanicInfo;
@@ -45,6 +46,7 @@ const MBI_MAX_BYTES: usize = 1 << 20;
 pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
     serial::SerialPort::COM1.init();
     serial_println!("reemplazo kernel: long mode, multiboot2 handoff");
+    init_logger();
 
     if magic != 0x36d76289 {
         serial_println!("FATAL: bad multiboot2 magic {:#010x}", magic);
@@ -71,12 +73,38 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
         let net = dhcp::configure(&mut nic);
         let github_ip = dns::resolve(&mut nic, &net, "github.com"); // git's host, per AGENTS.md
         tcp::http_smoke(&mut nic, &net, github_ip, "github.com");
+        tls::https_smoke(&mut nic, &net, github_ip, "github.com");
     }
 
     arm_and_test_interrupts();
 
     serial_println!("kernel_main: idle (no scheduler yet)");
     halt()
+}
+
+/// Route `log` records to the serial console — embedded-tls's handshake
+/// diagnostics, most usefully *why* a certificate was refused. Info and
+/// above only: the Trace stream (every state transition) stays off.
+fn init_logger() {
+    struct SerialLogger;
+
+    impl log::Log for SerialLogger {
+        fn enabled(&self, metadata: &log::Metadata) -> bool {
+            metadata.level() <= log::Level::Info
+        }
+
+        fn log(&self, record: &log::Record) {
+            if self.enabled(record.metadata()) {
+                serial_println!("[{}] {}", record.level(), record.args());
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    static LOGGER: SerialLogger = SerialLogger;
+    let _ = log::set_logger(&LOGGER); // only the first call wins
+    log::set_max_level(log::LevelFilter::Info);
 }
 
 /// Read and validate the Multiboot2 information structure.
