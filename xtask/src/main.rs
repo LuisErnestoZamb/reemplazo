@@ -120,6 +120,8 @@ fn check(root: &Path) -> bool {
                 "-p",
                 "git-pktline",
                 "-p",
+                "ssh-wire",
+                "-p",
                 "mbi",
                 "-p",
                 "html",
@@ -159,6 +161,8 @@ fn check(root: &Path) -> bool {
                 "xtask",
                 "-p",
                 "git-pktline",
+                "-p",
+                "ssh-wire",
                 "-p",
                 "html",
                 "-p",
@@ -414,12 +418,12 @@ fn run(root: &Path) -> bool {
 /// DHCP/DNS/TCP clients, TLS and HTTP clients, interrupt path (IDT,
 /// stubs, EOI, timer), the serial shell coming up, or the keyboard path
 /// (i8042 bring-up, scancode decode, input multiplexing) — so it gates
-/// all seventeen milestones.
+/// all eighteen milestones.
 ///
 /// It runs **without a disk**, so the `ata::probe` that sits between
 /// `PCI_OK` and `E1000_OK` stays silent here.
 fn smoke(root: &Path) -> bool {
-    const MARKERS: [&str; 18] = [
+    const MARKERS: [&str; 19] = [
         "BOOT_OK",
         "VGA_OK",
         "MEM_OK",
@@ -435,6 +439,7 @@ fn smoke(root: &Path) -> bool {
         "TLS_OK",
         "HTTP_OK",
         "GIT_LSREMOTE_OK",
+        "SSH_KEXINIT_OK",
         "INT_OK",
         "SHELL_OK",
         "KEYBOARD_OK",
