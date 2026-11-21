@@ -519,6 +519,35 @@ fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
     bytes
 }
 
+/// Assemble `GET <path> HTTP/1.1` with the `Host` header and
+/// `Connection: close` into `buf`, returning its length — `None` when
+/// `buf` is too small (the caller decides whether that is a bug).
+/// Shared by the plain-HTTP and TLS smoke paths.
+pub fn build_get(buf: &mut [u8], host: &str, path: &str) -> Option<usize> {
+    const MIDDLE: &[u8] = b" HTTP/1.1\r\nHost: ";
+    const SUFFIX: &[u8] = b"\r\nConnection: close\r\n\r\n";
+    let total = b"GET ".len() + path.len() + MIDDLE.len() + host.len() + SUFFIX.len();
+    let out = buf.get_mut(..total)?;
+    let mut off = 0;
+    for part in [
+        b"GET ".as_slice(),
+        path.as_bytes(),
+        MIDDLE,
+        host.as_bytes(),
+        SUFFIX,
+    ] {
+        out[off..off + part.len()].copy_from_slice(part);
+        off += part.len();
+    }
+    Some(total)
+}
+
+/// True once the head-terminating empty line (`\r\n\r\n`) is present
+/// (requests and responses alike).
+pub fn headers_complete(head: &[u8]) -> bool {
+    head.windows(4).any(|w| w == b"\r\n\r\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -843,5 +872,27 @@ mod tests {
         let progress = parser.feed(b"HTTP/1.1 204\r\n\r\n", &mut out[..]).unwrap();
         assert_eq!(parser.status(), Some(204));
         assert!(progress.complete);
+    }
+
+    #[test]
+    fn build_get_produces_a_complete_request() {
+        let mut buf = [0u8; 256];
+        let n = build_get(&mut buf, "github.com", "/robots.txt")
+            .expect("256 bytes must fit a small GET");
+        let req = &buf[..n];
+        assert!(req.starts_with(b"GET /robots.txt HTTP/1.1\r\nHost: github.com\r\n"));
+        assert!(req.ends_with(b"Connection: close\r\n\r\n"));
+        // The head terminator check is generic (request or response).
+        assert!(headers_complete(req));
+        // Too-small buffer: `None`, never a partial request.
+        let mut tiny = [0u8; 8];
+        assert_eq!(build_get(&mut tiny, "github.com", "/"), None);
+    }
+
+    #[test]
+    fn headers_complete_needs_the_full_terminator() {
+        assert!(!headers_complete(b"HTTP/1.1 200 OK\r\n\r"));
+        assert!(!headers_complete(b"HTTP/1.1 200 OK\r\n"));
+        assert!(headers_complete(b"HTTP/1.1 200 OK\r\n\r\n"));
     }
 }

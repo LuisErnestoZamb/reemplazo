@@ -22,9 +22,9 @@
 //! unreachable host prints a line and returns to the prompt; only an
 //! explicit `halt` stops the machine.
 
-use crate::dhcp::NetConfig;
-use crate::e1000::E1000;
-use crate::{dns, keyboard, memory, pit, serial};
+use crate::netstack::Stack;
+use crate::{keyboard, memory, pit, serial};
+use smoltcp::wire::Ipv4Address;
 
 /// Bytes accepted per input line; the rest is refused with a bell.
 const LINE_CAP: usize = 128;
@@ -64,7 +64,7 @@ impl LineDiscipline {
     /// echo, edit, or execute. This is the single byte-handling path —
     /// serial and keyboard behave identically apart from the CRLF rule
     /// in [`Source`].
-    fn feed(&mut self, byte: u8, src: Source, nic: &mut E1000, cfg: &NetConfig) {
+    fn feed(&mut self, byte: u8, src: Source, stack: &mut Stack) {
         let from_serial = src == Source::Serial;
         match byte {
             b'\r' => {
@@ -73,13 +73,13 @@ impl LineDiscipline {
                 if from_serial {
                     self.skip_lf = true;
                 }
-                self.submit(nic, cfg);
+                self.submit(stack);
             }
             b'\n' => {
                 if from_serial && self.skip_lf {
                     self.skip_lf = false; // the LF half of a CRLF pair
                 } else {
-                    self.submit(nic, cfg);
+                    self.submit(stack);
                 }
             }
             0x08 | 0x7F => {
@@ -109,11 +109,10 @@ impl LineDiscipline {
     }
 
     /// Run the current line as a command, then re-prompt.
-    fn submit(&mut self, nic: &mut E1000, cfg: &NetConfig) {
+    fn submit(&mut self, stack: &mut Stack) {
         serial_print!("\n");
         execute(
-            nic,
-            cfg,
+            stack,
             core::str::from_utf8(&self.line[..self.len]).unwrap_or(""),
         );
         self.len = 0;
@@ -126,7 +125,7 @@ impl LineDiscipline {
 /// fails soft where there is no i8042 — the MacBook), prints
 /// `SHELL_OK` (the smoke test's fifteenth marker) and then serves
 /// prompts from **both** input sources until `halt`.
-pub fn run(nic: &mut E1000, cfg: &NetConfig) -> ! {
+pub fn run(stack: &mut Stack) -> ! {
     keyboard::init();
     serial_println!("SHELL_OK"); // machine-checked by `cargo xtask smoke`
     serial_print!("{PROMPT}");
@@ -147,14 +146,14 @@ pub fn run(nic: &mut E1000, cfg: &NetConfig) -> ! {
             core::hint::spin_loop();
             continue;
         };
-        disc.feed(byte, src, nic, cfg);
+        disc.feed(byte, src, stack);
     }
 }
 
 /// Split one input line into a command and its argument text and run
 /// the builtin. Never panics: unknown commands and bad arguments only
 /// print a hint.
-fn execute(nic: &mut E1000, cfg: &NetConfig, line: &str) {
+fn execute(stack: &mut Stack, line: &str) {
     let line = line.trim();
     if line.is_empty() {
         return;
@@ -196,33 +195,35 @@ fn execute(nic: &mut E1000, cfg: &NetConfig, line: &str) {
             serial_println!("meminfo: {free} frames free ({} KiB)", free * 4);
         }
         "netinfo" => {
-            serial_println!(
-                "netinfo: ip {}.{}.{}.{}/{}.{}.{}.{}",
-                cfg.ip[0],
-                cfg.ip[1],
-                cfg.ip[2],
-                cfg.ip[3],
-                cfg.netmask[0],
-                cfg.netmask[1],
-                cfg.netmask[2],
-                cfg.netmask[3]
-            );
-            serial_println!(
-                "          router {}.{}.{}.{} dns {}.{}.{}.{} lease {}s",
-                cfg.router[0],
-                cfg.router[1],
-                cfg.router[2],
-                cfg.router[3],
-                cfg.dns[0],
-                cfg.dns[1],
-                cfg.dns[2],
-                cfg.dns[3],
-                cfg.lease_secs
-            );
+            match stack.iface.ip_addrs().first() {
+                Some(addr) => serial_println!("netinfo: {addr}"),
+                None => serial_println!("netinfo: no address configured"),
+            }
+            match stack.lease {
+                Some(lease) => {
+                    let dns0 = lease.dns.first().copied();
+                    match (lease.router, dns0) {
+                        (Some(router), Some(dns)) => serial_println!(
+                            "          router {router} dns {dns} ({} server(s))",
+                            lease.dns_count
+                        ),
+                        (Some(router), None) => {
+                            serial_println!("          router {router} (no dns servers)")
+                        }
+                        (None, Some(dns)) => serial_println!(
+                            "          no router, dns {dns} ({} server(s))",
+                            lease.dns_count
+                        ),
+                        (None, None) => serial_println!("          no router, no dns servers"),
+                    }
+                }
+                None => serial_println!("          (static addressing, no lease)"),
+            }
         }
         "ping" => match net::parse_ipv4(rest) {
-            Some(ip) => {
-                nic.ping(cfg, ip);
+            Some(octets) => {
+                let ip = Ipv4Address::new(octets[0], octets[1], octets[2], octets[3]);
+                stack.ping(ip);
             }
             None => serial_println!("usage: ping <a.b.c.d>"),
         },
@@ -230,9 +231,9 @@ fn execute(nic: &mut E1000, cfg: &NetConfig, line: &str) {
             if rest.is_empty() {
                 serial_println!("usage: resolve <host>");
             } else {
-                match dns::try_resolve(nic, cfg, rest) {
+                match stack.resolve(rest) {
                     Some(ip) => {
-                        serial_println!("{} -> {}.{}.{}.{}", rest, ip[0], ip[1], ip[2], ip[3])
+                        serial_println!("{rest} -> {ip}")
                     }
                     None => serial_println!("resolve: no answer for {rest}"),
                 }

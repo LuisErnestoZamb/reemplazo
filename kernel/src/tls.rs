@@ -1,12 +1,12 @@
-//! TLS 1.3 client (`embedded-tls`, blocking mode) over the e1000/TCP
-//! stack: prove a full HTTPS exchange against `github.com:443` —
+//! TLS 1.3 client (`embedded-tls`, blocking mode) over the smoltcp
+//! TCP stack: prove a full HTTPS exchange against `github.com:443` —
 //! handshake with certificate validation, HTTP GET, `close_notify`
-//! shutdown — the smoke test's `TLS_OK`.
+//! shutdown — the smoke test's `TLS_OK` + `HTTP_OK`.
 //!
 //! Crypto is never hand-rolled here (skill rule): `embedded-tls` at a
 //! pinned git rev provides the protocol, `rustls-webpki` builds the
 //! certificate path, and the primitives are RustCrypto crates via
-//! `embassy-crypto` (AES-128-GCM, SHA-256, HMAC-SHA256, P-256
+//! `embassy-crypto` (AES-128-GCM, SHA-256, HMAC-SHA256, P-256/P-384
 //! ECDH/ECDSA), each audited — the review is recorded in the commit.
 //!
 //! Trust model: the chain must terminate at the pinned
@@ -19,25 +19,27 @@
 //! itself keeps working. Hostname, chain, signatures and EKU are always
 //! checked.
 //!
-//! Scope of this milestone (documented limits, not hidden bugs):
-//! `Conn`'s one-outstanding-segment rule is upheld by `Socket`, which
-//! waits for each segment's ACK before sending the next and stashes
-//! any payload that arrives meanwhile (a stall that exhausts the stash
-//! aborts loudly rather than dropping bytes); the response body is
-//! bounded by `READ_CAP` for the smoke (the framer itself trusts the
-//! declared `Content-Length`).
+//! Transport: a thin [`Stream`] over one smoltcp `TcpSocket`
+//! (docs/smoltcp-eval.md §11) — every call pumps the stack and honors
+//! a per-operation deadline; smoltcp owns retransmission, reassembly,
+//! windows and Reno congestion control, so the old stash/wait_ack
+//! machinery is gone. The response body is bounded by [`READ_CAP`] for
+//! the smoke (the framer itself trusts the declared `Content-Length`).
 
-use crate::dhcp::NetConfig;
-use crate::e1000::E1000;
-use crate::tcp::{ATTEMPTS, Conn, MAX_SEND, build_get};
+use crate::clock;
+use crate::netstack::{E1000Phy, OP_DEADLINE_MS, Stack};
 use core::cmp::min;
+use core::ptr::addr_of_mut;
 use embedded_io::{ErrorKind, Read, Write};
 use embedded_tls::TlsError;
 use embedded_tls::blocking::{
     Aes128GcmSha256, Certificate, TlsClock, TlsConfig, TlsConnection, TlsContext,
 };
 use embedded_tls::webpki::CertVerifier;
-use net::http::ResponseParser;
+use net::http::{self, ResponseParser};
+use smoltcp::iface::{Interface, SocketHandle, SocketSet};
+use smoltcp::socket::tcp;
+use smoltcp::wire::Ipv4Address;
 
 /// Pinned trust anchor: USERTrust ECC Certification Authority (DER).
 /// sha256 = 4ff460d54b9c86dabfbcfc5712e0400d2bed3fbc4d4fbdaa86e06adcd2a9ad7a
@@ -57,29 +59,22 @@ const BODY_HEAD_CAP: usize = 512;
 /// stuck or hostile server cannot keep us reading forever (the smoke
 /// test has a 30 s budget).
 const READ_CAP: usize = 64 * 1024;
-/// Held bytes a stalled write may accumulate: the residue of the last
-/// read (≤ one MSS) plus payload pumped while waiting for an ACK.
-/// Overflow aborts loudly — never silently drops.
-const STASH_CAP: usize = 8192;
+/// One read/parse chunk: decrypted bytes in, body staging out (the
+/// framer never expands, so this size fits both).
+const SCRATCH: usize = 1460;
+/// Local port of the TLS connection (the plain-HTTP proof owns49152;
+/// a socket in TIME-WAIT cannot be reused for10 s, so TLS gets its
+/// own port and its own socket).
+const LOCAL_PORT: u16 = 49160;
 
-/// Record buffers live in `static`s: 21 KiB would not fit the 64 KiB
-/// stack alongside the handshake frames. Both are written only from
-/// `https_smoke`, which runs once on a single core — the only handler
-/// in play (IRQ0) does not touch these statics.
+/// Record buffers and parser state live in `static`s: 21+ KiB would
+/// not fit the stack alongside the handshake frames. Written only
+/// from `https_smoke`, which runs once on a single core — the only
+/// handler in play (IRQ0) does not touch these statics.
 static mut READ_STORAGE: [u8; READ_BUF] = [0; READ_BUF];
 static mut WRITE_STORAGE: [u8; WRITE_BUF] = [0; WRITE_BUF];
-/// The receive stash and last-sent segment are static for the same
-/// reason: `Socket` lives inside `TlsConnection` on `https_smoke`'s
-/// stack, and the handshake is the deepest call chain in the kernel
-/// (see `crate::guard` for what an overflow used to hit).
-static mut STASH: [u8; STASH_CAP] = [0; STASH_CAP];
-static mut LAST: [u8; MAX_SEND] = [0; MAX_SEND];
-/// HTTP parser state (head accumulation + framer), the body staging
-/// area for one feed (≤ one MSS of decrypted bytes) and the body
-/// prefix kept for content checks — static for the same stack-headroom
-/// reason as above; `ResponseParser::new` is `const`.
 static mut PARSER: ResponseParser = ResponseParser::new();
-static mut STAGING: [u8; MAX_SEND] = [0; MAX_SEND];
+static mut STAGING: [u8; SCRATCH] = [0; SCRATCH];
 static mut BODY_HEAD: [u8; BODY_HEAD_CAP] = [0; BODY_HEAD_CAP];
 
 fn fatal(msg: &str) -> ! {
@@ -99,22 +94,137 @@ impl TlsClock for RtcClock {
     }
 }
 
-/// Prove the whole HTTPS client path: open TCP to `remote_ip:443`,
-/// complete a TLS 1.3 handshake against the pinned root, GET
-/// `/robots.txt` with `Connection: close`, parse and frame the
-/// response with `net::http` (httparse head + RFC 9112 body framer),
-/// validate the body, close both layers, print `TLS_OK` then
-/// `HTTP_OK`.
-pub fn https_smoke(nic: &mut E1000, cfg: &NetConfig, remote_ip: [u8; 4], host: &str) {
-    let mut conn = Conn::open(nic, cfg, remote_ip, 443);
+/// `embedded_io` transport over one smoltcp `TcpSocket`
+/// (docs/smoltcp-eval.md §11): every call pumps the stack once per
+/// loop iteration and honors a per-operation deadline. smoltcp owns
+/// retransmission, reassembly, windows and Reno congestion control —
+/// no stash, no ACK-wait, no retransmit bookkeeping here.
+struct Stream<'a> {
+    iface: &'a mut Interface,
+    dev: &'a mut E1000Phy,
+    socks: &'a mut SocketSet<'static>,
+    handle: SocketHandle,
+}
+
+impl Stream<'_> {
+    fn pump(&mut self) {
+        self.iface.poll(clock::now(), self.dev, self.socks);
+    }
+
+    fn tcp(&mut self) -> &mut tcp::Socket<'static> {
+        self.socks.get_mut(self.handle)
+    }
+}
+
+impl embedded_io::ErrorType for Stream<'_> {
+    type Error = TlsError;
+}
+
+impl Read for Stream<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, TlsError> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let deadline = clock::now_ms() + OP_DEADLINE_MS;
+        loop {
+            self.pump();
+            let tcp = self.tcp();
+            if tcp.can_recv() {
+                return tcp
+                    .recv_slice(buf)
+                    .map_err(|_| TlsError::Io(ErrorKind::Other));
+            }
+            if !tcp.may_recv() && tcp.recv_queue() == 0 {
+                return Ok(0); // peer FIN → transport EOF
+            }
+            if clock::now_ms() > deadline {
+                return Err(TlsError::Io(ErrorKind::TimedOut));
+            }
+        }
+    }
+}
+
+impl Write for Stream<'_> {
+    fn write(&mut self, data: &[u8]) -> Result<usize, TlsError> {
+        let deadline = clock::now_ms() + OP_DEADLINE_MS;
+        let mut sent = 0;
+        while sent < data.len() {
+            self.pump();
+            // A full socket buffer comes back as a short/zero write
+            // (only `InvalidState` is an error), so polling continues
+            // until the deadline.
+            match self.tcp().send_slice(&data[sent..]) {
+                Ok(n) => sent += n,
+                Err(_) => return Err(TlsError::Io(ErrorKind::Other)), // not connected/finished
+            }
+            if clock::now_ms() > deadline {
+                return Err(TlsError::Io(ErrorKind::TimedOut));
+            }
+        }
+        Ok(sent)
+    }
+
+    fn flush(&mut self) -> Result<(), TlsError> {
+        let deadline = clock::now_ms() + OP_DEADLINE_MS;
+        while self.tcp().send_queue() > 0 {
+            self.pump();
+            if clock::now_ms() > deadline {
+                return Err(TlsError::Io(ErrorKind::TimedOut));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Prove the whole HTTPS client path on the smoltcp stack: connect
+/// the second TCP socket to `ip:443`, complete a TLS 1.3 handshake
+/// against the pinned root, GET `/robots.txt` with `Connection:
+/// close`, parse and frame the response with `net::http` (httparse
+/// head + RFC 9112 body framer), validate the body, close both
+/// layers cleanly, print `TLS_OK` then `HTTP_OK`.
+pub fn https_smoke(stack: &mut Stack, ip: Ipv4Address, host: &str) {
+    // Connect the dedicated TLS socket (the plain-HTTP proof owns the
+    // first one — TIME-WAIT would block reuse for10 s).
+    let deadline = clock::now_ms() + OP_DEADLINE_MS;
+    {
+        let sock = stack.sockets.get_mut::<tcp::Socket>(stack.tcp2_handle);
+        if let Err(e) = sock.connect(stack.iface.context(), (ip, 443u16), LOCAL_PORT) {
+            serial_println!("tls: connect rejected: {e:?}");
+            crate::halt();
+        }
+    }
+    loop {
+        stack.poll();
+        if stack.sockets.get::<tcp::Socket>(stack.tcp2_handle).state() == tcp::State::Established {
+            break;
+        }
+        if clock::now_ms() > deadline {
+            fatal("tcp connect timeout");
+        }
+    }
+    serial_println!("tls: connected to {ip}:443");
+
+    // Split the stack into the three fields the Stream needs.
+    let Stack {
+        iface,
+        dev,
+        sockets,
+        tcp2_handle,
+        ..
+    } = stack;
+    let stream = Stream {
+        iface,
+        dev,
+        socks: sockets,
+        handle: *tcp2_handle,
+    };
 
     // SAFETY: single-use buffers (see `READ_STORAGE`); taken as `&mut`
     // through raw pointers to avoid `static_mut_refs` on a shared name.
-    let socket = Socket::new(&mut conn, nic);
-    let read_buf = unsafe { &mut *core::ptr::addr_of_mut!(READ_STORAGE) };
-    let write_buf = unsafe { &mut *core::ptr::addr_of_mut!(WRITE_STORAGE) };
+    let read_buf = unsafe { &mut *addr_of_mut!(READ_STORAGE) };
+    let write_buf = unsafe { &mut *addr_of_mut!(WRITE_STORAGE) };
     let mut tls: TlsConnection<_, Aes128GcmSha256> =
-        TlsConnection::new(socket, read_buf, write_buf);
+        TlsConnection::new(stream, read_buf, write_buf);
 
     let verifier: CertVerifier<'_, Aes128GcmSha256, RtcClock, CERT_SIZE> =
         CertVerifier::new(Certificate::X509(ROOT_CA));
@@ -129,7 +239,9 @@ pub fn https_smoke(nic: &mut E1000, cfg: &NetConfig, remote_ip: [u8; 4], host: &
     // HTTP/1.1 GET over the established channel; `Connection: close`
     // makes the server finish with close_notify + FIN.
     let mut req = [0u8; 256];
-    let req_len = build_get(&mut req, host, "/robots.txt");
+    let Some(req_len) = http::build_get(&mut req, host, "/robots.txt") else {
+        fatal("GET request does not fit the buffer");
+    };
     if let Err(e) = tls.write_all(&req[..req_len]) {
         serial_println!("FATAL: tls: write failed: {e:?}");
         crate::halt();
@@ -143,13 +255,13 @@ pub fn https_smoke(nic: &mut E1000, cfg: &NetConfig, remote_ip: [u8; 4], host: &
     // httparse parses the head, the RFC 9112 framer the body
     // (content-length / chunked / close-delimited).
     // SAFETY: single-use statics (see `READ_STORAGE`).
-    let parser = unsafe { &mut *core::ptr::addr_of_mut!(PARSER) };
-    let staging = unsafe { &mut *core::ptr::addr_of_mut!(STAGING) };
-    let body_head = unsafe { &mut *core::ptr::addr_of_mut!(BODY_HEAD) };
+    let parser = unsafe { &mut *addr_of_mut!(PARSER) };
+    let staging = unsafe { &mut *addr_of_mut!(STAGING) };
+    let body_head = unsafe { &mut *addr_of_mut!(BODY_HEAD) };
     let mut body_head_len = 0usize;
     let mut body_total = 0usize;
     let mut status_checked = false;
-    let mut scratch = [0u8; MAX_SEND];
+    let mut scratch = [0u8; SCRATCH];
     loop {
         match tls.read(&mut scratch) {
             Ok(0) => fatal("transport EOF without close_notify (truncated response)"),
@@ -219,181 +331,25 @@ pub fn https_smoke(nic: &mut E1000, cfg: &NetConfig, remote_ip: [u8; 4], host: &
 
     // Orderly shutdown: close_notify (best-effort — the server's own
     // close_notify already authenticated everything we read; a failure
-    // here cannot retroactively corrupt it) then TCP FIN.
-    let socket = match tls.close() {
-        Ok(socket) => socket,
-        Err((socket, e)) => {
+    // here cannot retroactively corrupt it), then the TCP close.
+    let mut stream = match tls.close() {
+        Ok(stream) => stream,
+        Err((stream, e)) => {
             serial_println!("tls: close_notify not sent: {e:?}");
-            socket
+            stream
         }
     };
-    let Socket {
-        conn: conn_ref,
-        nic: nic_ref,
-        ..
-    } = socket;
-    conn_ref.close(nic_ref);
-}
-
-/// `embedded_io` transport over one TCP connection.
-///
-/// - `read` drains a small stash first, then blocks on `Conn::recv`
-///   with the same stall/retransmit budget the plain-HTTP smoke uses;
-///   payload that arrives while TLS asks for a shorter slice (record
-///   headers are 5 bytes; segments are up to one MSS) is stashed, not
-///   dropped.
-/// - `write` sends at most one MSS per segment and waits for the
-///   previous segment's ACK first (`Conn` allows one outstanding
-///   segment); payload received while waiting lands in the stash.
-struct Socket<'a> {
-    conn: &'a mut Conn,
-    nic: &'a mut E1000,
-    /// Received bytes not yet handed to the TLS reader (static: see
-    /// `STASH`).
-    stash: &'a mut [u8; STASH_CAP],
-    stash_len: usize,
-    stash_pos: usize,
-    /// Last transmitted segment, for retransmission on stall (static:
-    /// see `LAST`).
-    last: &'a mut [u8; MAX_SEND],
-    last_len: usize,
-}
-
-impl<'a> Socket<'a> {
-    fn new(conn: &'a mut Conn, nic: &'a mut E1000) -> Self {
-        // SAFETY: the stash/last statics are single-use, taken once by
-        // `https_smoke` on a single core; the only handler in play
-        // (IRQ0) never touches them.
-        let stash = unsafe { &mut *core::ptr::addr_of_mut!(STASH) };
-        let last = unsafe { &mut *core::ptr::addr_of_mut!(LAST) };
-        Socket {
-            conn,
-            nic,
-            stash,
-            stash_len: 0,
-            stash_pos: 0,
-            last,
-            last_len: 0,
+    stream.tcp().close();
+    let deadline = clock::now_ms() + OP_DEADLINE_MS;
+    loop {
+        stream.pump();
+        let state = stream.tcp().state();
+        if state == tcp::State::TimeWait || state == tcp::State::Closed {
+            serial_println!("tls: connection closed cleanly ({state})");
+            return;
         }
-    }
-
-    /// Append received bytes to the stash, aborting loudly if it would
-    /// overflow (a bounded, documented failure — never a silent drop).
-    fn stash_push(&mut self, data: &[u8]) {
-        let free = STASH_CAP - self.stash_len;
-        if data.len() > free {
-            fatal("receive stash overflow while waiting for an ACK");
+        if clock::now_ms() > deadline {
+            fatal("timeout closing connection (never reached TimeWait/Closed)");
         }
-        self.stash[self.stash_len..self.stash_len + data.len()].copy_from_slice(data);
-        self.stash_len += data.len();
-    }
-
-    /// Serve from the stash first (bytes are already released from the
-    /// connection's window); `None` when the stash is empty.
-    fn stash_take(&mut self, buf: &mut [u8]) -> Option<usize> {
-        if self.stash_pos == self.stash_len {
-            self.stash_len = 0;
-            self.stash_pos = 0;
-            return None;
-        }
-        let n = min(buf.len(), self.stash_len - self.stash_pos);
-        buf[..n].copy_from_slice(&self.stash[self.stash_pos..self.stash_pos + n]);
-        self.stash_pos += n;
-        Some(n)
-    }
-
-    /// Retransmit the outstanding segment while nothing new arrives.
-    fn resend_stalled(&mut self, stalls: u32) -> Result<(), TlsError> {
-        if stalls > ATTEMPTS {
-            return Err(TlsError::Io(ErrorKind::TimedOut));
-        }
-        if self.conn.has_unacked() {
-            if self.last_len == 0 {
-                return Err(TlsError::Io(ErrorKind::TimedOut));
-            }
-            let last_len = self.last_len;
-            self.conn.resend(self.nic, &self.last[..last_len]);
-        }
-        Ok(())
-    }
-
-    /// Pump the connection until everything we sent is acknowledged,
-    /// retransmitting on stall; any payload received on the way is
-    /// stashed. This is what keeps `Conn`'s one-outstanding-segment
-    /// invariant true across back-to-back writes (e.g. the
-    /// middlebox-compat CCS + Finished pair).
-    fn wait_ack(&mut self) -> Result<(), TlsError> {
-        let mut scratch = [0u8; MAX_SEND];
-        let mut stalls: u32 = 0;
-        while self.conn.has_unacked() {
-            match self.conn.recv(self.nic, &mut scratch) {
-                Some(0) => stalls = stalls.saturating_add(1), // FIN: keep waiting for the ACK
-                Some(n) => {
-                    self.conn.release(n);
-                    self.stash_push(&scratch[..n]);
-                    stalls = 0;
-                }
-                None => {
-                    stalls += 1;
-                    self.resend_stalled(stalls)?;
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-impl embedded_io::ErrorType for Socket<'_> {
-    type Error = TlsError;
-}
-
-impl Read for Socket<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        if let Some(n) = self.stash_take(buf) {
-            return Ok(n);
-        }
-        let mut scratch = [0u8; MAX_SEND];
-        let mut stalls: u32 = 0;
-        loop {
-            match self.conn.recv(self.nic, &mut scratch) {
-                Some(0) => return Ok(0), // peer FIN: transport EOF
-                Some(n) => {
-                    self.conn.release(n);
-                    self.stash_push(&scratch[..n]);
-                    // Invariant: stash was empty above and holds ≤ MSS
-                    // now, so this always yields ≥ 1 byte.
-                    return Ok(self.stash_take(buf).unwrap_or(0));
-                }
-                None => {
-                    stalls += 1;
-                    self.resend_stalled(stalls)?;
-                }
-            }
-        }
-    }
-}
-
-impl Write for Socket<'_> {
-    fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        let mut sent = 0;
-        while sent < buf.len() {
-            self.wait_ack()?;
-            let n = min(MAX_SEND, buf.len() - sent);
-            self.conn.send(self.nic, &buf[sent..sent + n]);
-            self.last[..n].copy_from_slice(&buf[sent..sent + n]);
-            self.last_len = n;
-            sent += n;
-        }
-        Ok(sent)
-    }
-
-    fn flush(&mut self) -> Result<(), Self::Error> {
-        self.wait_ack()
     }
 }

@@ -65,7 +65,7 @@ All in Rust, all in this workspace:
 |---|---|
 | `kernel/` | The OS kernel — `no_std`, built only for `x86_64-unknown-none` |
 | `mbi/` | Multiboot2 handoff range contract + hostile-input host tests |
-| `net/` | Wire-protocol logic (Ethernet→TCP frames, DNS, DHCP) + HTTP/1.1 responses on `httparse` — host-tested |
+| `net/` | HTTP/1.1 responses (`httparse` + RFC 9112 framing), SLIRP smoke constants, `parse_ipv4` — host-tested (the TCP/IP stack itself is smoltcp, see `docs/smoltcp-eval.md`) |
 | `rtc/` | CMOS clock decoding (BCD, 12/24 h, leap years, century plausibility) — host-tested |
 | `pci/` | PCI enumeration and device IDs (e1000, sky2, …) |
 | `xtask/` | Build/test orchestration (`cargo xtask …`) |
@@ -139,6 +139,7 @@ Milestones landed so far (see `git log` for details):
 - [x] e1000 TX/RX rings + ARP roundtrip
 - [x] IPv4 + ICMP echo — ping roundtrip with checksum validation
 - [x] DHCP client, DNS resolver, TCP client — github.com over port 80
+- [x] TCP/IP stack migrated to **smoltcp** — hand-rolled frame/DHCP/DNS/TCP code replaced, ~2300 lines removed (docs/smoltcp-eval.md)
 - [x] TLS 1.3 client — HTTPS against github.com:443, pinned root certificate
 - [x] HTTP/1.1 client — `httparse` head + RFC 9112 body framing (HTTP_OK)
 - [x] Shell — serial-console REPL with minimal builtins (ping, resolve, netinfo, …)

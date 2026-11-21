@@ -40,9 +40,11 @@ static mut LEN: usize = 0;
 static mut SEEDED: bool = false;
 static mut CSPRNG: core::mem::MaybeUninit<ChaCha12Rng> = core::mem::MaybeUninit::uninit();
 
-/// Non-constant identifier for protocol state (DNS ids/ports, TCP ISNs
-/// and ports): four bytes from the seeded CSPRNG. See the module docs
-/// for the entropy caveats.
+/// Four bytes from the seeded CSPRNG: the boot chain feeds these into
+/// smoltcp's `Config::random_seed` (its sPCG32 then draws TCP ISNs,
+/// source ports and DHCP transaction ids — docs/smoltcp-eval.md §5,
+/// condition R1), and TLS randomness flows through [`rng_fill`]
+/// directly. See the module docs for the entropy caveats.
 pub(crate) fn boot_entropy() -> u32 {
     let mut b = [0u8; 4];
     rng_fill(&mut b);

@@ -15,5 +15,11 @@ use smoltcp::time::Instant;
 /// The stack's idea of "now". `Instant` is an i64 of microseconds;
 /// we have10 ms ticks, so whole milliseconds is all we can claim.
 pub fn now() -> Instant {
-    Instant::from_millis((pit::ticks() * 1000 / pit::HZ) as i64)
+    Instant::from_millis(now_ms() as i64)
+}
+
+/// Whole milliseconds since boot — operation deadlines (DHCP/DNS/TCP
+/// waits) use this instead of the old spin-count budgets.
+pub fn now_ms() -> u64 {
+    pit::ticks() * 1000 / pit::HZ
 }

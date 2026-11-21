@@ -19,8 +19,6 @@ extern crate alloc;
 #[macro_use]
 mod serial;
 
-mod dhcp;
-mod dns;
 mod e1000;
 mod entropy;
 mod heap;
@@ -33,11 +31,10 @@ mod pit;
 mod port;
 mod rtc;
 mod shell;
-mod tcp;
 mod tls;
 
-// smoltcp migration (docs/smoltcp-eval.md): M1 links the stack
-// scaffolding before the boot chain swaps onto it in M2.
+// The network chain runs on smoltcp (docs/smoltcp-eval.md — M2):
+// e1000 is the phy::Device, the old per-protocol drivers are gone.
 mod clock;
 mod netstack;
 
@@ -85,25 +82,38 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
     let scan = crate::pci::scan();
     crate::pci::selftest(&scan);
 
-    let mut nic = crate::e1000::init(&scan);
-    let mut lease = None;
-    if let Some(nic) = nic.as_mut() {
-        let peer = nic.selftest();
-        nic.ping_test(peer);
-        let net = dhcp::configure(nic);
-        let github_ip = dns::resolve(nic, &net, "github.com"); // git's host, per AGENTS.md
-        tcp::http_smoke(nic, &net, github_ip, "github.com");
-        tls::https_smoke(nic, &net, github_ip, "github.com");
-        lease = Some(net);
+    let mut stack = crate::e1000::init(&scan).map(|dev| {
+        // Two draws: smoltcp's random_seed feeds its sPCG32 (TCP ISNs,
+        // source ports, DHCP xids) — R1, non-negotiable
+        // (docs/smoltcp-eval.md §5).
+        let seed = (u64::from(crate::entropy::boot_entropy()) << 32)
+            | u64::from(crate::entropy::boot_entropy());
+        netstack::Stack::new(dev, seed)
+    });
+
+    if let Some(stack) = stack.as_mut() {
+        stack.set_static_ipv4();
+        stack.prove_ping(); // NET_OK (ARP sniff) + PING_OK
+        stack.wait_lease(); // DHCP_OK — slirp values asserted
+        // git's host, per AGENTS.md.
+        let Some(github_ip) = stack.resolve("github.com") else {
+            serial_println!(
+                "FATAL: dns: no answer for github.com (internet up? server reachable?)"
+            );
+            halt();
+        };
+        serial_println!("DNS_OK"); // machine-checked by `cargo xtask smoke`
+        stack.plain_get_smoke(github_ip, "github.com"); // TCP_OK
+        tls::https_smoke(stack, github_ip, "github.com"); // TLS_OK + HTTP_OK
     }
 
     test_interrupts();
 
     // The shell is the kernel's idle state until a scheduler exists;
     // without a NIC there is nothing to drive, so just park.
-    match (nic.as_mut(), lease) {
-        (Some(nic), Some(net)) => shell::run(nic, &net),
-        _ => {
+    match stack.as_mut() {
+        Some(stack) => shell::run(stack),
+        None => {
             serial_println!("kernel_main: idle (no scheduler yet)");
             halt()
         }

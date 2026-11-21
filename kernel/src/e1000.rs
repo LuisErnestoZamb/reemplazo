@@ -13,7 +13,6 @@
 //! (ring bring-up order + RDT-reclaim pattern), charmOS docs (legacy
 //! descriptor layouts).
 
-use crate::dhcp::NetConfig;
 use crate::pci::{Scan, read32, write32};
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{Ordering, fence};
@@ -82,14 +81,12 @@ const N_DESC: usize = 16;
 /// Bytes usable per TX/RX buffer (RX capped by RCTL.BSIZE = 2048; we
 /// allocate full 4 KiB frames anyway).
 const BUF_BYTES: usize = 4096;
-/// Poll budgets (spins). TCG answers in microseconds; these bound the
-/// smoke test's failure path to ≈1–2 s instead of hanging forever.
-/// `RX_POLLS` is also the DHCP client's reply timeout.
+/// Spin budget for one transmit (waiting on the DD bit). TCG answers
+/// in microseconds; this bounds the failure path instead of hanging.
 pub(crate) const TX_POLLS: u32 = 10_000_000;
-pub(crate) const RX_POLLS: u32 = 100_000_000;
 
 /// Poll attempts for an EEPROM read (QEMU answers immediately; real
-/// silicon takes microseconds — spin, never sleep: interrupts are off).
+/// silicon takes microseconds — spin, never sleep).
 const EEPROM_POLLS: u32 = 100_000;
 
 // --- Descriptor layouts (Linux `struct e1000_{tx,rx}_desc`, charmOS) --
@@ -469,207 +466,5 @@ impl E1000 {
         // Arrival jitter for the entropy pool (module docs in `entropy`).
         crate::entropy::note_rx();
         Some(n)
-    }
-
-    /// ARP-resolve `target_ip` as seen from `src_ip`: transmit a
-    /// request, wait for the reply on the RX ring, and return the
-    /// sender's MAC. Frames that are not *the* reply to this exact
-    /// request are skipped (post-DHCP the ring may carry strays), and
-    /// the reply's sender protocol address must equal the IP we asked
-    /// about — a reply from anyone else is not an answer. Fatal on
-    /// timeout: boot-time policy has no error channel yet.
-    pub fn arp_resolve(&mut self, src_ip: [u8; 4], target_ip: [u8; 4]) -> [u8; 6] {
-        self.try_arp_resolve(src_ip, target_ip).unwrap_or_else(|| {
-            fatal("timeout waiting for ARP reply (is the user-mode netdev attached?)")
-        })
-    }
-
-    /// Non-fatal [`E1000::arp_resolve`] for interactive callers (the
-    /// shell's `ping`): `None` on timeout instead of halting the
-    /// kernel — pinging an address that answers must not be required
-    /// to reach the prompt again. Build/transmit failures still fatal:
-    /// those are bugs, not the network being unreachable.
-    pub fn try_arp_resolve(&mut self, src_ip: [u8; 4], target_ip: [u8; 4]) -> Option<[u8; 6]> {
-        let mut req = [0u8; 64];
-        let len = match net::build_arp_request(&mut req, self.mac, src_ip, target_ip) {
-            Some(n) => n,
-            None => fatal("cannot build ARP request (buffer bug?)"),
-        };
-        if let Err(e) = self.transmit(&req[..len]) {
-            fatal(e);
-        }
-        serial_println!(
-            "e1000: TX {len} bytes ARP request ->{}.{}.{}.{}, descriptor DD set",
-            target_ip[0],
-            target_ip[1],
-            target_ip[2],
-            target_ip[3]
-        );
-
-        let mut rx = [0u8; 2048];
-        let mut spins = 0u32;
-        loop {
-            if spins >= RX_POLLS {
-                return None;
-            }
-            let Some(n) = self.receive(&mut rx) else {
-                spins += 1;
-                core::hint::spin_loop();
-                continue;
-            };
-            let frame = &rx[..n];
-            if net::ethertype(frame) != Some(net::ETHERTYPE_ARP)
-                || net::arp_opcode(frame) != Some(net::ARP_REPLY)
-                || net::dst_mac(frame) != Some(self.mac)
-                || net::arp_sender_ip(frame) != Some(target_ip)
-            {
-                continue; // stray or someone else's reply — not ours
-            }
-            let Some(peer) = net::arp_sender_mac(frame) else {
-                continue;
-            };
-            if peer == self.mac {
-                continue; // never resolve to ourselves
-            }
-            serial_println!("e1000: RX {n} bytes ARP reply from slirp");
-            return Some(peer);
-        }
-    }
-
-    /// End-to-end proof of the TX/RX path: ARP-resolve slirp's
-    /// gateway, require slirp's ARP reply back on the RX ring,
-    /// print `NET_OK`, and return the peer's MAC (addressed by the ICMP
-    /// test that follows).
-    pub fn selftest(&mut self) -> [u8; 6] {
-        let peer = self.arp_resolve(net::SLIRP_GUEST_IP, net::SLIRP_GATEWAY);
-        serial_println!("NET_OK"); // machine-checked by `cargo xtask smoke`
-        peer
-    }
-
-    /// ICMP echo roundtrip to the ARP-resolved peer: proves the IPv4
-    /// path end-to-end (both internet checksums are validated on the
-    /// reply). Prints `PING_OK`.
-    pub fn ping_test(&mut self, peer_mac: [u8; 6]) {
-        const PING_ID: u16 = 0x5252;
-        const PING_SEQ: u16 = 7;
-        const PING_PAYLOAD: [u8; 8] = *b"pingtest";
-
-        let mut req = [0u8; 128];
-        let src = net::Endpoint::new(self.mac, net::SLIRP_GUEST_IP);
-        let dst = net::Endpoint::new(peer_mac, net::SLIRP_GATEWAY);
-        let len = match net::build_icmp_echo(&mut req, src, dst, PING_ID, PING_SEQ, &PING_PAYLOAD) {
-            Some(n) => n,
-            None => fatal("cannot build ICMP echo (buffer bug?)"),
-        };
-        if let Err(e) = self.transmit(&req[..len]) {
-            fatal(e);
-        }
-        serial_println!("e1000: TX {len} bytes ICMP echo ->10.0.2.2");
-
-        // Poll until a *matching* reply arrives (skip stray frames).
-        let mut rx = [0u8; 2048];
-        let mut spins = 0u32;
-        let reply = loop {
-            if spins >= RX_POLLS {
-                fatal("timeout waiting for ICMP echo reply");
-            }
-            spins += 1;
-            if let Some(n) = self.receive(&mut rx) {
-                if let Some(reply) = net::parse_icmp_echo_reply(&rx[..n]) {
-                    break reply;
-                }
-            } else {
-                core::hint::spin_loop();
-            }
-        };
-        if reply.src_ip != net::SLIRP_GATEWAY || reply.dst_ip != net::SLIRP_GUEST_IP {
-            fatal("echo reply addressed to the wrong hosts");
-        }
-        if (reply.id, reply.seq) != (PING_ID, PING_SEQ) {
-            fatal("echo reply id/seq mismatch");
-        }
-        if reply.payload != PING_PAYLOAD {
-            fatal("echo reply payload corrupted");
-        }
-        serial_println!(
-            "e1000: ICMP echo reply from 10.0.2.2 (id={:#06x} seq={}, payload intact)",
-            reply.id,
-            reply.seq
-        );
-        serial_println!("PING_OK"); // machine-checked by `cargo xtask smoke`
-    }
-
-    /// ICMP echo to an arbitrary `ip` — the shell's `ping` builtin.
-    /// Resolves the next hop (the router when `ip` is off-subnet),
-    /// sends one echo and waits for the matching reply (id, seq,
-    /// payload and both addresses are checked; other traffic on the
-    /// ring is skipped). Unlike the boot selftests this never panics:
-    /// ARP failure, timeout or a wrong reply print a line and return
-    /// `false`, because a typo at the shell must not kill the kernel.
-    pub fn ping(&mut self, cfg: &NetConfig, ip: [u8; 4]) -> bool {
-        const PING_ID: u16 = 0x504E; // "PN"
-        const PING_SEQ: u16 = 1;
-        const PING_PAYLOAD: [u8; 8] = *b"pingping";
-
-        let hop_ip = if net::on_subnet(cfg.ip, cfg.netmask, ip) {
-            ip
-        } else {
-            cfg.router
-        };
-        let Some(hop_mac) = self.try_arp_resolve(cfg.ip, hop_ip) else {
-            serial_println!(
-                "ping: no ARP answer from {}.{}.{}.{}",
-                hop_ip[0],
-                hop_ip[1],
-                hop_ip[2],
-                hop_ip[3]
-            );
-            return false;
-        };
-
-        let mut req = [0u8; 128];
-        let src = net::Endpoint::new(self.mac, cfg.ip);
-        let dst = net::Endpoint::new(hop_mac, ip);
-        let len = match net::build_icmp_echo(&mut req, src, dst, PING_ID, PING_SEQ, &PING_PAYLOAD) {
-            Some(n) => n,
-            None => fatal("cannot build ICMP echo (buffer bug?)"),
-        };
-        if let Err(e) = self.transmit(&req[..len]) {
-            fatal(e);
-        }
-        serial_println!("ping: ICMP echo -> {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
-
-        let mut rx = [0u8; 2048];
-        let mut spins = 0u32;
-        loop {
-            if spins >= RX_POLLS {
-                serial_println!("ping: no reply (timeout)");
-                return false;
-            }
-            spins += 1;
-            let Some(n) = self.receive(&mut rx) else {
-                core::hint::spin_loop();
-                continue;
-            };
-            let Some(reply) = net::parse_icmp_echo_reply(&rx[..n]) else {
-                continue; // not an echo reply, or the checksum failed
-            };
-            if reply.src_ip != ip
-                || reply.dst_ip != cfg.ip
-                || (reply.id, reply.seq) != (PING_ID, PING_SEQ)
-                || reply.payload != PING_PAYLOAD
-            {
-                continue; // not the answer to this exact echo
-            }
-            serial_println!(
-                "ping: reply from {}.{}.{}.{} ({} bytes)",
-                reply.src_ip[0],
-                reply.src_ip[1],
-                reply.src_ip[2],
-                reply.src_ip[3],
-                reply.payload.len()
-            );
-            return true;
-        }
     }
 }
