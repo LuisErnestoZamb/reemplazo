@@ -49,6 +49,22 @@ impl SerialPort {
             outb(COM1_BASE, byte);
         }
     }
+
+    /// Poll for one received byte: `None` when the receiver holding
+    /// register is empty. This is the shell console's input path —
+    /// polled like the TX side; interrupt-driven RX arrives with the
+    /// keyboard/IRQ milestone.
+    pub fn read_byte(self) -> Option<u8> {
+        // SAFETY: standard COM1 register range; polled port I/O,
+        // single-core (the caller owns the only reader slot).
+        unsafe {
+            if inb(COM1_BASE + 5) & 0x01 == 0 {
+                None
+            } else {
+                Some(inb(COM1_BASE))
+            }
+        }
+    }
 }
 
 impl fmt::Write for SerialPort {

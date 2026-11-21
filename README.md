@@ -82,7 +82,7 @@ cargo test -p bootinfo <name>   # single test
 The smoke test asserts each milestone's serial marker within 30 s:
 
 ```
-BOOT_OK → MEM_OK → RTC_OK → PCI_OK → E1000_OK → NET_OK → PING_OK → DHCP_OK → DNS_OK → TCP_OK → TLS_OK → INT_OK
+BOOT_OK → MEM_OK → RTC_OK → PCI_OK → E1000_OK → NET_OK → PING_OK → DHCP_OK → DNS_OK → TCP_OK → TLS_OK → INT_OK → SHELL_OK
 ```
 
 **Notes:**
@@ -94,6 +94,9 @@ BOOT_OK → MEM_OK → RTC_OK → PCI_OK → E1000_OK → NET_OK → PING_OK →
 - Never build with `-C target-cpu=native`: the host is modern, the target is a
   T7400 — native code would emit SSE4+/AVX and die with SIGILL on the MacBook.
 - Verify against QEMU first; validate on real hardware via Option/C DVD or USB.
+- `cargo xtask run` boots into the serial shell (`reemplazo>` prompt — type
+  `help`). For live echo, run `stty raw -echo` first: the local terminal
+  otherwise line-buffers input and echoes it in addition to the shell.
 
 ## Status
 
@@ -109,7 +112,8 @@ Milestones landed so far (see `git log` for details):
 - [x] DHCP client, DNS resolver, TCP client — github.com over port 80
 - [x] TLS 1.3 client — HTTPS against github.com:443, pinned root certificate
 - [ ] sky2 driver (real hardware only)
-- [ ] Shell, git, ssh, browser, AI client + editor
+- [x] Shell — serial-console REPL with minimal builtins (ping, resolve, netinfo, …)
+- [ ] git, ssh, browser, AI client + editor
 - [ ] ISO installer + network installer
 
 ## License

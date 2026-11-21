@@ -32,6 +32,19 @@ fn fatal(msg: &str) -> ! {
 /// (`net::dns::parse_a_response`). A stray, late, or forged frame
 /// satisfies none of that and is skipped like any other noise.
 pub fn resolve(nic: &mut E1000, cfg: &NetConfig, qname: &str) -> [u8; 4] {
+    let Some(ip) = try_resolve(nic, cfg, qname) else {
+        fatal("timeout waiting for DNS answer (internet up? server reachable?)");
+    };
+    serial_println!("DNS_OK"); // machine-checked by `cargo xtask smoke`
+    ip
+}
+
+/// Non-fatal [`resolve`] for the shell: `None` when no answer arrives
+/// instead of halting the kernel. Prints the same `dns: host -> ip`
+/// line on success; the `DNS_OK` marker belongs to the boot path
+/// (printed by [`resolve`]). All the validation rules documented
+/// there apply here unchanged.
+pub fn try_resolve(nic: &mut E1000, cfg: &NetConfig, qname: &str) -> Option<[u8; 4]> {
     // Next hop (RFC 911 §3.3): on-subnet → ARP the server itself,
     // off-subnet → ARP the router; either way the reply's *source IP*
     // is still cfg.dns, which is what the filters below check.
@@ -99,9 +112,8 @@ pub fn resolve(nic: &mut E1000, cfg: &NetConfig, qname: &str) -> [u8; 4] {
                 continue; // wrong txid, wrong question, or an error response
             };
             serial_println!("dns: {qname} -> {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
-            serial_println!("DNS_OK"); // machine-checked by `cargo xtask smoke`
-            return ip;
+            return Some(ip);
         }
     }
-    fatal("timeout waiting for DNS answer (internet up? server reachable?)");
+    None // no answer within the attempt budget
 }

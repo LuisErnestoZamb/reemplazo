@@ -130,8 +130,8 @@ pub fn free(frame: Frame) {
 }
 
 /// Number of frames currently free (cross-checked against [`alloc`] in
-/// [`selftest`]).
-fn free_count() -> u64 {
+/// [`selftest`]). The shell's `meminfo` builtin reports it.
+pub fn free_count() -> u64 {
     BITMAP
         .iter()
         .map(|w| u64::from((!w.load(Ordering::Relaxed)).count_ones()))

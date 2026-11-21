@@ -24,6 +24,7 @@ mod pic;
 mod pit;
 mod port;
 mod rtc;
+mod shell;
 mod tcp;
 mod tls;
 
@@ -70,19 +71,30 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
     report_rtc(); // pure port I/O: no PCI needed, and RTC_OK precedes PCI_OK
     let scan = crate::pci::scan();
     crate::pci::selftest(&scan);
-    if let Some(mut nic) = crate::e1000::init(&scan) {
+
+    let mut nic = crate::e1000::init(&scan);
+    let mut lease = None;
+    if let Some(nic) = nic.as_mut() {
         let peer = nic.selftest();
         nic.ping_test(peer);
-        let net = dhcp::configure(&mut nic);
-        let github_ip = dns::resolve(&mut nic, &net, "github.com"); // git's host, per AGENTS.md
-        tcp::http_smoke(&mut nic, &net, github_ip, "github.com");
-        tls::https_smoke(&mut nic, &net, github_ip, "github.com");
+        let net = dhcp::configure(nic);
+        let github_ip = dns::resolve(nic, &net, "github.com"); // git's host, per AGENTS.md
+        tcp::http_smoke(nic, &net, github_ip, "github.com");
+        tls::https_smoke(nic, &net, github_ip, "github.com");
+        lease = Some(net);
     }
 
     arm_and_test_interrupts();
 
-    serial_println!("kernel_main: idle (no scheduler yet)");
-    halt()
+    // The shell is the kernel's idle state until a scheduler exists;
+    // without a NIC there is nothing to drive, so just park.
+    match (nic.as_mut(), lease) {
+        (Some(nic), Some(net)) => shell::run(nic, &net),
+        _ => {
+            serial_println!("kernel_main: idle (no scheduler yet)");
+            halt()
+        }
+    }
 }
 
 /// Route `log` records to the serial console — embedded-tls's handshake
