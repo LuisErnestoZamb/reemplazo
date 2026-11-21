@@ -32,6 +32,7 @@ mod port;
 mod rtc;
 mod shell;
 mod tls;
+mod vga;
 
 // The network chain runs on smoltcp (docs/smoltcp-eval.md — M2):
 // e1000 is the phy::Device, the old per-protocol drivers are gone.
@@ -55,6 +56,11 @@ core::arch::global_asm!(include_str!("entry.S"), options(att_syntax));
 pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
     serial::SerialPort::COM1.init();
     guard::arm();
+    // GRUB i386-pc leaves text mode at 0xb8000 (80×25, pitch 160):
+    // mirror every console line there from the very first print — the
+    // MacBook exposes no serial port. The multiboot tag re-checks this
+    // (`vga::sync`) as soon as the boot information is parsed.
+    vga::init(0xB8000, 80, 25, 160);
     serial_println!("reemplazo kernel: long mode, multiboot2 handoff");
     init_logger();
 
@@ -66,6 +72,7 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
     match read_mbi(mbi_addr) {
         Ok(info) => {
             report_boot_info(&info);
+            sync_vga(&info);
             memory::init(&info, mbi_addr);
             memory::selftest(&info, mbi_addr); // MEM_OK
             heap::init(); // carve a contiguous run, init the global heap
@@ -215,6 +222,41 @@ enum MbiError {
     /// The `multiboot2` crate rejected the structure itself (null,
     /// alignment, malformed tag walk, missing end tag).
     Load(LoadError),
+}
+
+/// Reconcile the early VGA mirror with the bootloader's real framebuffer
+/// tag and prove the pipeline: the boot banner must be readable back in
+/// the text buffer — the smoke's `VGA_OK`.
+fn sync_vga(info: &BootInformation) {
+    let text = match info.framebuffer_tag() {
+        Some(Ok(fb)) => {
+            let text = matches!(fb.buffer_type(), Ok(FramebufferType::Text));
+            vga::sync(
+                fb.address() as usize,
+                fb.width() as usize,
+                fb.height() as usize,
+                fb.pitch() as usize,
+                text,
+            );
+            text
+        }
+        // A tag we cannot parse: refuse to write (fail-safe).
+        Some(Err(_)) => {
+            vga::disable();
+            false
+        }
+        // No tag at all: keep the documented GRUB text-mode defaults
+        // and verify them below.
+        None => true,
+    };
+    if !text {
+        return; // no text console to prove — never on our chain
+    }
+    if !vga::verify("reemplazo kernel: long mode") {
+        serial_println!("FATAL: vga: text buffer does not hold the boot banner");
+        halt();
+    }
+    serial_println!("VGA_OK"); // machine-checked by `cargo xtask smoke`
 }
 
 /// Read and validate the Multiboot2 information structure.

@@ -101,12 +101,20 @@ impl fmt::Write for SerialPort {
     }
 }
 
-/// Print to COM1. `write_str` is infallible, so formatting errors cannot
-/// occur; `let _` documents that choice instead of panicking mid-print.
+/// Print to the console — the COM1 UART **and** the VGA text buffer
+/// (real hardware exposes no serial port; see `crate::vga`).
+/// `write_str` is infallible, so formatting errors cannot occur;
+/// `let _` documents that choice instead of panicking mid-print.
+///
+/// Both sinks format the arguments independently (each keeps its own
+/// temporaries valid — a single bound `format_args!` cannot), so the
+/// argument expressions are evaluated **twice**: keep them
+/// side-effect free (field reads and arithmetic, as everywhere here).
 #[macro_export]
 macro_rules! serial_print {
     ($($arg:tt)*) => {{
         $crate::guard::check();
+        $crate::vga::mirror(format_args!($($arg)*));
         let mut port = $crate::serial::SerialPort::COM1;
         let _ = core::fmt::Write::write_fmt(&mut port, format_args!($($arg)*));
     }};

@@ -381,15 +381,16 @@ fn run(root: &Path) -> bool {
 /// decode → line discipline → builtin end to end.
 ///
 /// This is the test that fails on a broken boot path (header, trampoline,
-/// GDT, paging, mbi parse), memory path, heap path (carve + global
-/// allocator), PCI scan, e1000 driver, network path, DHCP/DNS/TCP
-/// clients, TLS and HTTP clients, interrupt path (IDT, stubs, EOI,
-/// timer), the serial shell coming up, or the keyboard path (i8042
-/// bring-up, scancode decode, input multiplexing) — so it gates all
-/// sixteen milestones.
+/// GDT, paging, mbi parse), the VGA text mirror, memory path, heap path
+/// (carve + global allocator), PCI scan, e1000 driver, network path,
+/// DHCP/DNS/TCP clients, TLS and HTTP clients, interrupt path (IDT,
+/// stubs, EOI, timer), the serial shell coming up, or the keyboard path
+/// (i8042 bring-up, scancode decode, input multiplexing) — so it gates
+/// all seventeen milestones.
 fn smoke(root: &Path) -> bool {
-    const MARKERS: [&str; 16] = [
+    const MARKERS: [&str; 17] = [
         "BOOT_OK",
+        "VGA_OK",
         "MEM_OK",
         "ALLOC_OK",
         "RTC_OK",
