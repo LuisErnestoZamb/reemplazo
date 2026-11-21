@@ -48,8 +48,9 @@ All in Rust, all in this workspace:
 
 - **Kernel + low-level services** — boot (multiboot2 → long mode), memory
   management, interrupts (IDT/PIC/PIT), PCI enumeration, drivers.
-- **Networking** — sky2/e1000 drivers → DHCP → DNS → TCP/IP → ICMP, with TLS 1.2+
-  and modern ssh (GitHub rejects legacy sha1 `ssh-rsa`).
+- **Networking** — sky2/e1000 drivers → DHCP → DNS → TCP/IP → ICMP → TLS 1.3
+  (certificate validation against a pinned root) → HTTP/1.1, and modern ssh
+  (GitHub rejects legacy sha1 `ssh-rsa`).
 - **Shell** — minimal builtins only; grows on demand (not BusyBox/GNU parity).
 - **opencode-like AI client** with a VSCode-like editor.
 - **Browser.**
@@ -64,9 +65,11 @@ All in Rust, all in this workspace:
 |---|---|
 | `kernel/` | The OS kernel — `no_std`, built only for `x86_64-unknown-none` |
 | `bootinfo/` | Boot information parsing (multiboot2) |
-| `net/` | TCP/IP stack, DHCP, DNS, ICMP, ARP constants |
+| `net/` | Wire-protocol logic (Ethernet→TCP frames, DNS, DHCP) + HTTP/1.1 responses on `httparse` — host-tested |
+| `rtc/` | CMOS clock decoding (BCD, 12/24 h, leap years, century plausibility) — host-tested |
 | `pci/` | PCI enumeration and device IDs (e1000, sky2, …) |
 | `xtask/` | Build/test orchestration (`cargo xtask …`) |
+| `docs/` | Milestone research: hardware probes, crate evaluations, smoltcp/installer designs |
 | `iso/` | Bootable ISO assembly |
 | `tools/` | Docker image with grub + xorriso + qemu |
 
@@ -97,6 +100,10 @@ BOOT_OK → MEM_OK → RTC_OK → PCI_OK → E1000_OK → NET_OK → PING_OK →
 - `cargo xtask run` boots into the serial shell (`reemplazo>` prompt — type
   `help`). For live echo, run `stty raw -echo` first: the local terminal
   otherwise line-buffers input and echoes it in addition to the shell.
+- Dependencies follow the project policy: known, audited crates first
+  (`embedded-tls`, `httparse`, `rand_chacha`, …), from-scratch only under the
+  documented exceptions — see `.opencode/skills/rust-os-dev/SKILL.md` and the
+  evaluations in `docs/`.
 
 ## Status
 
@@ -106,13 +113,15 @@ Milestones landed so far (see `git log` for details):
 - [x] Multiboot2 boot milestone — GRUB → long mode, serial console
 - [x] Interrupt milestone — IDT, PIC remap, PIT timer, exception dispatch
 - [x] Frame allocator + PCI enumeration
+- [x] CMOS RTC — boot clock, certificate dates validated against it (RTC_OK)
 - [x] e1000 driver — PCI probe, BAR decode, MMIO, MAC from EEPROM
 - [x] e1000 TX/RX rings + ARP roundtrip
 - [x] IPv4 + ICMP echo — ping roundtrip with checksum validation
 - [x] DHCP client, DNS resolver, TCP client — github.com over port 80
 - [x] TLS 1.3 client — HTTPS against github.com:443, pinned root certificate
-- [ ] sky2 driver (real hardware only)
+- [x] HTTP/1.1 client — `httparse` head + RFC 9112 body framing (HTTP_OK)
 - [x] Shell — serial-console REPL with minimal builtins (ping, resolve, netinfo, …)
+- [ ] sky2 driver (real hardware only)
 - [ ] git, ssh, browser, AI client + editor
 - [ ] ISO installer + network installer
 
