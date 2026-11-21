@@ -183,10 +183,11 @@ pub struct LeaseInfo {
 
 /// Everything the stack lives in, `const`-constructible for a
 /// `static mut` (the same idiom as the TLS record buffers; measured
-/// sizes in docs/smoltcp-eval.md §1.6 — ~11 KiB, plus the second and
-/// third TCP pairs the sequential smoke connections need ≈ +16 KiB).
+/// sizes in docs/smoltcp-eval.md §1.6 — ~11 KiB, plus the second,
+/// third and fourth TCP pairs the sequential smoke connections need
+/// ≈ +24 KiB).
 pub struct Storage {
-    pub slots: [SocketStorage<'static>; 6],
+    pub slots: [SocketStorage<'static>; 7],
     /// First connection (the plain-HTTP proof).
     pub tcp_rx: [u8; 4096],
     pub tcp_tx: [u8; 4096],
@@ -198,6 +199,10 @@ pub struct Storage {
     /// reason — each sequential connection needs its own socket.
     pub tcp3_rx: [u8; 4096],
     pub tcp3_tx: [u8; 4096],
+    /// Fourth connection (SSH banner + KEXINIT, milestone S1): same
+    /// TIME-WAIT reason — each sequential connection needs its own.
+    pub tcp4_rx: [u8; 4096],
+    pub tcp4_tx: [u8; 4096],
     pub icmp_rx_pkts: [icmp::PacketMetadata; 1],
     pub icmp_rx: [u8; 256],
     pub icmp_tx_pkts: [icmp::PacketMetadata; 1],
@@ -209,13 +214,15 @@ pub struct Storage {
 impl Storage {
     pub const fn new() -> Self {
         Storage {
-            slots: [SocketStorage::EMPTY; 6],
+            slots: [SocketStorage::EMPTY; 7],
             tcp_rx: [0; 4096],
             tcp_tx: [0; 4096],
             tcp2_rx: [0; 4096],
             tcp2_tx: [0; 4096],
             tcp3_rx: [0; 4096],
             tcp3_tx: [0; 4096],
+            tcp4_rx: [0; 4096],
+            tcp4_tx: [0; 4096],
             icmp_rx_pkts: [icmp::PacketMetadata::EMPTY; 1],
             icmp_rx: [0; 256],
             icmp_tx_pkts: [icmp::PacketMetadata::EMPTY; 1],
@@ -240,6 +247,7 @@ pub struct Stack {
     pub tcp_handle: SocketHandle,
     pub tcp2_handle: SocketHandle,
     pub tcp3_handle: SocketHandle,
+    pub tcp4_handle: SocketHandle,
     pub icmp_handle: SocketHandle,
     pub dns_handle: SocketHandle,
     /// Added only after PING_OK (R7 — see module docs).
@@ -266,6 +274,8 @@ impl Stack {
             tcp2_tx,
             tcp3_rx,
             tcp3_tx,
+            tcp4_rx,
+            tcp4_tx,
             icmp_rx_pkts,
             icmp_rx,
             icmp_tx_pkts,
@@ -298,12 +308,16 @@ impl Stack {
             tcp::SocketBuffer::new(&mut tcp3_rx[..]),
             tcp::SocketBuffer::new(&mut tcp3_tx[..]),
         ));
+        let tcp4_handle = sockets.add(tcp::Socket::new(
+            tcp::SocketBuffer::new(&mut tcp4_rx[..]),
+            tcp::SocketBuffer::new(&mut tcp4_tx[..]),
+        ));
         let icmp_handle = sockets.add(icmp::Socket::new(
             icmp::PacketBuffer::new(&mut icmp_rx_pkts[..], &mut icmp_rx[..]),
             icmp::PacketBuffer::new(&mut icmp_tx_pkts[..], &mut icmp_tx[..]),
         ));
         let dns_handle = sockets.add(dns::Socket::new(&dns_servers[..], &mut dns_queries[..]));
-        for handle in [tcp_handle, tcp2_handle, tcp3_handle] {
+        for handle in [tcp_handle, tcp2_handle, tcp3_handle, tcp4_handle] {
             // With `socket-tcp-reno` enabled Reno is already the
             // default; setting it documents the choice (cubic is f64
             // and deliberately off — docs/smoltcp-eval.md §1.2).
@@ -322,6 +336,7 @@ impl Stack {
             tcp_handle,
             tcp2_handle,
             tcp3_handle,
+            tcp4_handle,
             icmp_handle,
             dns_handle,
             dhcp_handle: None,

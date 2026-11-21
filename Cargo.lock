@@ -424,6 +424,7 @@ dependencies = [
  "rand_core 0.9.5",
  "rtc",
  "smoltcp",
+ "ssh-wire",
  "uart_16550",
 ]
 
@@ -725,6 +726,10 @@ dependencies = [
  "log",
  "managed",
 ]
+
+[[package]]
+name = "ssh-wire"
+version = "0.1.0"
 
 [[package]]
 name = "stable_deref_trait"
