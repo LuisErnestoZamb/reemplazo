@@ -75,6 +75,7 @@ All in Rust, all in this workspace:
 ```sh
 cargo xtask check   # fmt + clippy (host and kernel target) + tests + cross-build
 cargo xtask smoke   # build ISO, boot headless, assert serial markers in order
+cargo xtask smoke-install  # same + blank IDE disk attached; assert BLK_OK
 cargo xtask run     # interactive boot in QEMU (Ctrl-C quits)
 cargo test -p bootinfo <name>   # single test
 ```
@@ -84,6 +85,9 @@ The smoke test asserts each milestone's serial marker within 30 s:
 ```
 BOOT_OK → MEM_OK → RTC_OK → PCI_OK → E1000_OK → NET_OK → PING_OK → DHCP_OK → DNS_OK → TCP_OK → TLS_OK → HTTP_OK → INT_OK → SHELL_OK
 ```
+
+`cargo xtask smoke-install` boots the same ISO with a blank 64 MiB IDE
+disk attached and asserts `BLK_OK` (the ATA PIO probe) instead.
 
 **Notes:**
 
@@ -115,6 +119,7 @@ Milestones landed so far (see `git log` for details):
 - [x] Shell — serial-console REPL with minimal builtins (ping, resolve, netinfo, …)
 - [ ] git, ssh, browser, AI client + editor
 - [ ] ISO installer + network installer
+  - [x] Block layer: ATA PIO driver on the legacy IDE primary channel (`cargo xtask smoke-install` asserts `BLK_OK`)
 
 ## License
 
