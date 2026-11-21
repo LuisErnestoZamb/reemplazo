@@ -293,7 +293,8 @@ fn run(root: &Path) -> bool {
 
 /// Machine-checked boot test: boot the ISO headless and require each
 /// milestone's serial marker in order — `BOOT_OK` (Multiboot2 parse),
-/// `MEM_OK` (frame-allocator selftest), `PCI_OK` (config scan),
+/// `MEM_OK` (frame-allocator selftest), `ALLOC_OK` (kernel heap: `Vec`
+/// push/check/drop round-trip), `PCI_OK` (config scan),
 /// `E1000_OK` (NIC probe + MMIO + MAC), `NET_OK` (TX/RX rings + ARP
 /// roundtrip through slirp), `PING_OK` (IPv4/ICMP echo with validated
 /// checksums), `DHCP_OK` (full DISCOVER/OFFER/REQUEST/ACK lease),
@@ -302,14 +303,14 @@ fn run(root: &Path) -> bool {
 /// github.com:80), `INT_OK` (IDT + PIC remap + PIT ticks + int3
 /// resume) — within `SMOKE_TIMEOUT`. This is the test that fails on a
 /// broken boot path (header, trampoline, GDT, paging, mbi parse),
-/// memory path, PCI scan, e1000 driver, network path, DHCP/DNS/TCP
-/// clients, TLS and HTTP clients, interrupt path (IDT, stubs, EOI,
-/// timer), or the serial shell coming up, so it gates all fourteen
-/// milestones.
+/// memory path, heap path (carve + global allocator), PCI scan, e1000
+/// driver, network path, DHCP/DNS/TCP clients, TLS and HTTP clients,
+/// interrupt path (IDT, stubs, EOI, timer), or the serial shell coming
+/// up, so it gates all fifteen milestones.
 fn smoke(root: &Path) -> bool {
-    const MARKERS: [&str; 14] = [
-        "BOOT_OK", "MEM_OK", "RTC_OK", "PCI_OK", "E1000_OK", "NET_OK", "PING_OK", "DHCP_OK",
-        "DNS_OK", "TCP_OK", "TLS_OK", "HTTP_OK", "INT_OK", "SHELL_OK",
+    const MARKERS: [&str; 15] = [
+        "BOOT_OK", "MEM_OK", "ALLOC_OK", "RTC_OK", "PCI_OK", "E1000_OK", "NET_OK", "PING_OK",
+        "DHCP_OK", "DNS_OK", "TCP_OK", "TLS_OK", "HTTP_OK", "INT_OK", "SHELL_OK",
     ];
     if !iso(root) {
         return false;

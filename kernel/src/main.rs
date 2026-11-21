@@ -1,14 +1,19 @@
 //! Kernel entry point after the 32→64-bit trampoline in `entry.S`.
 //!
 //! Flow: init COM1 → validate Multiboot2 magic → parse+report the boot
-//! information → arm interrupts (IDT, PIC remap, PIT) → prove exception
-//! and timer paths → park the CPU. All user/hardware-provided data is
+//! information → carve/init the kernel heap and prove it (`ALLOC_OK`) →
+//! arm interrupts (IDT, PIC remap, PIT) → prove exception and timer
+//! paths → park the CPU. All user/hardware-provided data is
 //! treated as untrusted: bounds-checked by the `bootinfo` crate,
 //! `Result`-propagated, no `unwrap`.
 
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
+
+// The heap exists, so the `alloc` crate's collections are available
+// (kernel/src/heap.rs provides the `#[global_allocator]`).
+extern crate alloc;
 
 #[macro_use]
 mod serial;
@@ -17,6 +22,7 @@ mod dhcp;
 mod dns;
 mod e1000;
 mod entropy;
+mod heap;
 mod idt;
 mod memory;
 mod pci;
@@ -65,7 +71,9 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
         Ok(info) => {
             report_boot_info(&info);
             memory::init(&info, mbi_addr);
-            memory::selftest(&info, mbi_addr);
+            memory::selftest(&info, mbi_addr); // MEM_OK
+            heap::init(); // carve a contiguous run, init the global heap
+            heap::prove_alloc(); // ALLOC_OK — before the network chain
         }
         Err(e) => {
             serial_println!("FATAL: bad multiboot2 info: {:?}", e);
