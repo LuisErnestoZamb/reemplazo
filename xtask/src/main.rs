@@ -6,6 +6,7 @@
 //!   iso     package target image as bootable ISO (GRUB i386-pc)
 //!   smoke   boot the ISO headless; assert serial markers in order,
 //!           then type a command through QEMU's monitor (KEYBOARD_OK)
+//!   smoke-install  boot with a blank IDE disk; assert BLK_OK (installer m1)
 //!   run     build + iso + boot interactively (serial on stdio; keys
 //!           can also be injected via the printed monitor address)
 //!
@@ -70,9 +71,10 @@ fn main() {
         "build" => build_kernel(&root),
         "iso" => iso(&root),
         "smoke" => smoke(&root),
+        "smoke-install" => smoke_install(&root),
         "run" => run(&root),
         _ => {
-            eprintln!("usage: cargo xtask <check|build|iso|smoke|run>");
+            eprintln!("usage: cargo xtask <check|build|iso|smoke|smoke-install|run>");
             false
         }
     };
@@ -276,7 +278,9 @@ fn host_qemu() -> bool {
     )
 }
 
-/// `(program, args, container_name)` to boot `iso_path`.
+/// `(program, args, container_name)` to boot `iso_path`; `disk`, when
+/// set, is attached as a raw IDE drive (`smoke-install`'s blank image —
+/// it lives beside `os.iso`, so the container sees it at `/iso/<name>`).
 /// Host QEMU first; otherwise build the toolchain image and run in Docker.
 /// `container` is the fixed name used for force-cleanup of stale VMs.
 /// Both backends get an HMP monitor on this checkout's [`monitor_port`]:
@@ -286,16 +290,18 @@ fn qemu_invocation(
     root: &Path,
     iso_path: &Path,
     container: &str,
+    disk: Option<&Path>,
 ) -> Option<(String, Vec<String>, Option<String>)> {
     let port = monitor_port(root);
     if host_qemu() {
         let iso = iso_path.display().to_string();
         let monitor = format!("tcp:127.0.0.1:{port},server,nowait");
-        return Some((
-            "qemu-system-x86_64".into(),
-            qemu_std_args(&iso, &monitor),
-            None,
-        ));
+        let mut args = qemu_std_args(&iso, &monitor);
+        if let Some(d) = disk {
+            args.push("-drive".into());
+            args.push(format!("file={},if=ide,format=raw", d.display()));
+        }
+        return Some(("qemu-system-x86_64".into(), args, None));
     }
     if !sh(root, "docker", &["build", "-t", TOOLS_IMAGE, "tools"]) {
         return None;
@@ -318,6 +324,13 @@ fn qemu_invocation(
     ];
     let monitor = format!("tcp:0.0.0.0:{port},server,nowait");
     args.extend(qemu_std_args("/iso/os.iso", &monitor));
+    if let Some(d) = disk {
+        // The iso dir is bind-mounted at /iso and the image was created
+        // inside it (see `smoke_install`), so it's visible at /iso/<name>.
+        let name = d.file_name()?.to_str()?;
+        args.push("-drive".into());
+        args.push(format!("file=/iso/{name},if=ide,format=raw"));
+    }
     Some(("docker".into(), args, Some(container.into())))
 }
 
@@ -344,7 +357,7 @@ fn run(root: &Path) -> bool {
     }
     let iso_path = root.join("target/iso-root/os.iso");
     let Some((prog, args, container)) =
-        qemu_invocation(root, &iso_path, &vm_container(root, "run"))
+        qemu_invocation(root, &iso_path, &vm_container(root, "run"), None)
     else {
         return false;
     };
@@ -402,6 +415,9 @@ fn run(root: &Path) -> bool {
 /// stubs, EOI, timer), the serial shell coming up, or the keyboard path
 /// (i8042 bring-up, scancode decode, input multiplexing) — so it gates
 /// all seventeen milestones.
+///
+/// It runs **without a disk**, so the `ata::probe` that sits between
+/// `PCI_OK` and `E1000_OK` stays silent here.
 fn smoke(root: &Path) -> bool {
     const MARKERS: [&str; 17] = [
         "BOOT_OK",
@@ -422,15 +438,76 @@ fn smoke(root: &Path) -> bool {
         "SHELL_OK",
         "KEYBOARD_OK",
     ];
-    // Phase 1 stops once SHELL_OK (the marker before KEYBOARD_OK) matched;
-    // phase 2 then requires the keyboard-driven marker.
-    const KEYBOARD_MARKER: usize = MARKERS.len() - 1;
     if !iso(root) {
         return false;
     }
+    boot_assert(root, "smoke", &MARKERS, None, true)
+}
+
+/// Installer milestone 1 (`BLK_OK`): build the ISO, create a blank
+/// 64 MiB `target/iso-root/disk.img` carrying the magic pattern at
+/// LBA0 (see `write_disk_image`), boot with the image attached as an
+/// IDE drive, and require the kernel's `BLK_OK` marker — printed only
+/// when `ata::probe` IDENTIFYs a drive *and* LBA0 validates.
+///
+/// Note the image is created **after** `iso()` (which wipes
+/// `target/iso-root`) and lives inside it, so the container's `/iso`
+/// bind mount exposes it to QEMU at `/iso/disk.img`.
+fn smoke_install(root: &Path) -> bool {
+    if !iso(root) {
+        return false;
+    }
+    let disk = root.join("target/iso-root/disk.img");
+    if let Err(e) = write_disk_image(&disk) {
+        eprintln!("xtask: cannot create {}: {e}", disk.display());
+        return false;
+    }
+    boot_assert(root, "smoke-install", &["BLK_OK"], Some(&disk), false)
+}
+
+/// Fixed installer-smoke disk size: 64 MiB is plenty for the installer
+/// milestones (payload ≈1 MB) and cheap to (re)create every run.
+const DISK_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Magic pattern at LBA0 of the installer smoke's disk — byte-identical
+/// to `MAGIC` in `kernel/src/ata.rs` (xtask cannot depend on the
+/// `no_std` kernel crate, so the bytes are duplicated here).
+const DISK_MAGIC: &[u8] = b"reemplazo-disk-v1";
+
+/// Create a zero-filled raw disk image whose LBA0 starts with
+/// [`DISK_MAGIC`] followed by its wrapping-sum checksum byte — exactly
+/// the pattern `ata::probe` validates. The rest of the image is a
+/// sparse hole (reads back as zeros, which is what "blank" means here).
+fn write_disk_image(path: &Path) -> std::io::Result<()> {
+    let mut f = std::fs::File::create(path)?;
+    let mut sector = [0u8; 512];
+    sector[..DISK_MAGIC.len()].copy_from_slice(DISK_MAGIC);
+    sector[DISK_MAGIC.len()] = DISK_MAGIC.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
+    f.write_all(&sector)?;
+    f.set_len(DISK_IMAGE_BYTES)?;
+    f.sync_all()?;
+    Ok(())
+}
+
+/// Boot the ISO headless (optionally with `disk` attached as an IDE
+/// drive) and require `markers` in order, draining serial output for
+/// diagnosis. Shared by `smoke` and `smoke_install`; `label` prefixes
+/// every message (`smoke| …`, `smoke-install: PASS …`).
+///
+/// `keyboard`: after the boot phase (all markers but the last), type
+/// `echo <last marker>` through QEMU's HMP monitor and require that
+/// exact line — the keyboard milestone's end-to-end proof. The
+/// keyboard phase has its own [`KEYBOARD_PHASE_TIMEOUT`] budget.
+fn boot_assert(
+    root: &Path,
+    label: &str,
+    markers: &[&str],
+    disk: Option<&Path>,
+    keyboard: bool,
+) -> bool {
     let iso_path = root.join("target/iso-root/os.iso");
     let Some((prog, args, container)) =
-        qemu_invocation(root, &iso_path, &vm_container(root, "smoke"))
+        qemu_invocation(root, &iso_path, &vm_container(root, label), disk)
     else {
         return false;
     };
@@ -474,48 +551,56 @@ fn smoke(root: &Path) -> bool {
     let mut next_marker = 0usize;
     let mut collected: Vec<String> = Vec::new();
 
-    // Phase 1: boot markers up to and including SHELL_OK.
+    // Phase 1: boot markers (for the keyboard smoke: up to and
+    // including the marker before the keyboard one — SHELL_OK).
+    let boot_target = if keyboard {
+        markers.len() - 1
+    } else {
+        markers.len()
+    };
     let boot_deadline = Instant::now() + SMOKE_TIMEOUT;
     let boot_ok = wait_for_markers(
         &rx,
-        &MARKERS,
+        markers,
         &mut next_marker,
         &mut collected,
-        KEYBOARD_MARKER,
+        boot_target,
         boot_deadline,
         false,
     );
 
-    // Phase 2: type the command through QEMU's monitor, then require
-    // the exact KEYBOARD_OK line the shell's echo builtin printed.
+    // Phase 2 (keyboard smoke only): type the command through QEMU's
+    // monitor, then require the exact KEYBOARD_OK line the shell's
+    // echo builtin printed (exact match — the keystroke echo alone
+    // does not count).
     let phase_deadline = Instant::now() + KEYBOARD_PHASE_TIMEOUT;
-    if boot_ok && type_echo_command(root, phase_deadline) {
+    if keyboard && boot_ok && type_echo_command(root, phase_deadline) {
         wait_for_markers(
             &rx,
-            &MARKERS,
+            markers,
             &mut next_marker,
             &mut collected,
-            MARKERS.len(),
+            markers.len(),
             phase_deadline,
             true,
         );
     }
 
-    let passed = next_marker == MARKERS.len();
+    let passed = next_marker == markers.len();
     stop_vm(&mut child, container.as_deref());
 
     if passed {
-        println!("smoke: PASS — kernel reached {}", MARKERS.join(" + "));
+        println!("{label}: PASS — kernel reached {}", markers.join(" + "));
     } else {
-        let missing = MARKERS[next_marker..].join(" + ");
-        let budget = if next_marker == KEYBOARD_MARKER {
+        let missing = markers[next_marker..].join(" + ");
+        let budget = if keyboard && next_marker == markers.len() - 1 {
             format!("within {KEYBOARD_PHASE_TIMEOUT:?} of SHELL_OK")
         } else {
             format!("within {SMOKE_TIMEOUT:?}")
         };
-        eprintln!("smoke: FAIL — missing {missing} {budget}");
+        eprintln!("{label}: FAIL — missing {missing} {budget}");
         for line in &collected {
-            eprintln!("smoke| {line}");
+            eprintln!("{label}| {line}");
         }
     }
     passed

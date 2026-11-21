@@ -19,6 +19,7 @@ extern crate alloc;
 #[macro_use]
 mod serial;
 
+mod ata;
 mod e1000;
 mod entropy;
 mod heap;
@@ -88,6 +89,10 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
     report_rtc(); // pure port I/O: no PCI needed, and RTC_OK precedes PCI_OK
     let scan = crate::pci::scan();
     crate::pci::selftest(&scan);
+    // Installer milestone BLK_OK: prints only when a drive on the legacy
+    // primary channel answers IDENTIFY *and* LBA0 carries the installer
+    // magic — the main smoke has no disk, so its marker chain is untouched.
+    crate::ata::probe();
 
     let mut stack = crate::e1000::init(&scan).map(|dev| {
         // Two draws: smoltcp's random_seed feeds its sPCG32 (TCP ISNs,

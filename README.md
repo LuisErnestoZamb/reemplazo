@@ -78,6 +78,7 @@ All in Rust, all in this workspace:
 ```sh
 cargo xtask check   # fmt + clippy (host and kernel target) + tests + cross-build
 cargo xtask smoke   # build ISO, boot headless, assert serial markers in order
+cargo xtask smoke-install  # same + blank IDE disk attached; assert BLK_OK
 cargo xtask run     # interactive boot in QEMU (Ctrl-C quits)
 cargo test -p mbi <name>   # single test
 ```
@@ -95,6 +96,8 @@ BOOT_OK → VGA_OK → MEM_OK → ALLOC_OK → RTC_OK → PCI_OK → E1000_OK �
 shell's `echo` builtin printed (an exact match — the keystroke echo
 alone does not count), proving i8042 → scancode decode → line
 discipline → builtin.
+`cargo xtask smoke-install` boots the same ISO with a blank 64 MiB IDE
+disk attached and asserts `BLK_OK` (the ATA PIO probe) instead.
 
 **Notes:**
 
@@ -147,6 +150,7 @@ Milestones landed so far (see `git log` for details):
 - [ ] sky2 driver (real hardware only)
 - [ ] git, ssh, browser, AI client + editor
 - [ ] ISO installer + network installer
+  - [x] Block layer: ATA PIO driver on the legacy IDE primary channel (`cargo xtask smoke-install` asserts `BLK_OK`)
 
 ## License
 

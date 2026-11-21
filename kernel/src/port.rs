@@ -45,6 +45,28 @@ pub(crate) unsafe fn inb(port: u16) -> u8 {
     val
 }
 
+/// Read a word (16 bits) from I/O port `port` (x86 `in` instruction).
+/// Needed for the ATA data register (0x1F0): PIO sector transfers are
+/// 16 bits wide.
+///
+/// # Safety
+/// Same contract as [`inb`], for 16-bit access width.
+#[inline]
+pub(crate) unsafe fn inw(port: u16) -> u16 {
+    let val: u16;
+    // SAFETY: forwarded to the caller's contract above; `in` from a port
+    // touches I/O space only and the output operand is always initialized.
+    unsafe {
+        core::arch::asm!(
+            "in ax, dx",
+            out("ax") val,
+            in("dx") port,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    val
+}
+
 /// Output a dword to I/O port `port` (x86 `out` instruction).
 /// Needed for PCI configuration (CF8/CFC).
 ///
