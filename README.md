@@ -82,11 +82,19 @@ cargo xtask run     # interactive boot in QEMU (Ctrl-C quits)
 cargo test -p mbi <name>   # single test
 ```
 
-The smoke test asserts each milestone's serial marker within 30 s:
+The smoke test asserts each milestone's serial marker in order — boot
+markers within 30 s, then the keyboard phase within a further 15 s:
 
 ```
-BOOT_OK → MEM_OK → ALLOC_OK → RTC_OK → PCI_OK → E1000_OK → NET_OK → PING_OK → DHCP_OK → DNS_OK → TCP_OK → TLS_OK → HTTP_OK → INT_OK → SHELL_OK
+BOOT_OK → MEM_OK → ALLOC_OK → RTC_OK → PCI_OK → E1000_OK → NET_OK → PING_OK → DHCP_OK → DNS_OK → TCP_OK → TLS_OK → HTTP_OK → INT_OK → SHELL_OK → KEYBOARD_OK
 ```
+
+`KEYBOARD_OK` is the keyboard milestone's end-to-end proof: after
+`SHELL_OK`, xtask connects to QEMU's HMP monitor and *types*
+`echo KEYBOARD_OK` with `sendkey`; the marker must be the line the
+shell's `echo` builtin printed (an exact match — the keystroke echo
+alone does not count), proving i8042 → scancode decode → line
+discipline → builtin.
 
 **Notes:**
 
@@ -105,6 +113,13 @@ BOOT_OK → MEM_OK → ALLOC_OK → RTC_OK → PCI_OK → E1000_OK → NET_OK �
 - `cargo xtask run` boots into the serial shell (`reemplazo>` prompt — type
   `help`). For live echo, run `stty raw -echo` first: the local terminal
   otherwise line-buffers input and echoes it in addition to the shell.
+- **Keyboard input:** besides the serial console, the shell also reads QEMU's
+  PS/2 keyboard (polled i8042 → set-1 decode → same line discipline — the
+  MacBook's built-in keyboard is USB HID and needs the UHCI milestone).
+  `cargo xtask run` prints the QEMU monitor address for key injection, e.g.
+  `printf 'sendkey h\nsendkey i\nret\n' | nc 127.0.0.1 <port>` (letters are
+  key names as-is, `spc` = space, `ret` = Enter, `shift-k` = uppercase K;
+  `cargo xtask smoke` does the same automatically to assert `KEYBOARD_OK`).
 - Dependencies follow the project policy: known, audited crates first
   (`embedded-tls`, `httparse`, `rand_chacha`, …), from-scratch only under the
   documented exceptions — see `.opencode/skills/rust-os-dev/SKILL.md` and the
@@ -127,6 +142,7 @@ Milestones landed so far (see `git log` for details):
 - [x] TLS 1.3 client — HTTPS against github.com:443, pinned root certificate
 - [x] HTTP/1.1 client — `httparse` head + RFC 9112 body framing (HTTP_OK)
 - [x] Shell — serial-console REPL with minimal builtins (ping, resolve, netinfo, …)
+- [x] Keyboard — polled i8042 + set-1 decode feeding the shell's line discipline (QEMU `sendkey` → `KEYBOARD_OK`; MacBook needs UHCI/HID)
 - [ ] sky2 driver (real hardware only)
 - [ ] git, ssh, browser, AI client + editor
 - [ ] ISO installer + network installer

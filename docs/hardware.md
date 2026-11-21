@@ -592,11 +592,19 @@ the MacBook will need the same stack.
 - **Getting keys into a headless QEMU:** our runs use `-display none` with serial on stdio,
   so there is no GUI keyboard and stdio belongs to the serial console. Key injection must go
   through the HMP monitor (`sendkey a`, `sendkey shift-a`, `sendkey up` …) or QMP
-  `input-send-event`; `sendkey` works fine with `-display none`. **[unverified]** what
-  monitor, if any, QEMU creates by default under our exact arguments — the practical answer
-  is to add an explicit endpoint (e.g. `-qmp unix:…,server,nowait` or a second serial/`-monitor
-  telnet:…` in `qemu_std_args`) when the keyboard milestone starts. (For comparison, QEMU's
-  own docs use `-serial mon:stdio -display none` to mux monitor+serial.)
+  `input-send-event`; `sendkey` works fine with `-display none`. **Resolved (keyboard
+  milestone):** QEMU creates no monitor by default under our arguments, so `qemu_std_args`
+  now adds an explicit endpoint. The planned unix socket (`-monitor unix:/iso/qemu.sock`)
+  **failed empirically**: Docker Desktop does not relay unix-socket connections through bind
+  mounts — the socket file appears on the host but `connect(2)` gets `ECONNREFUSED` (probed
+  2026-11-21, Docker Desktop 27.4.0). What works is **TCP**: QEMU binds `tcp:0.0.0.0:PORT`
+  inside the container (a service bound to the container loopback is unreachable via `-p`,
+  which forwards to eth0), Docker publishes it with `-p 127.0.0.1:PORT:PORT`, and a host QEMU
+  binds `tcp:127.0.0.1:PORT` directly; the port is derived from the checkout path so parallel
+  worktrees don't collide. HMP key names are QEMU's `QKeyCode` enum (`qapi/ui.json`): letters
+  as-is, `spc`, `ret`, `shift-k`, `minus`. (For comparison, QEMU's own docs use
+  `-serial mon:stdio -display none` to mux monitor+serial — rejected: it would steal stdin
+  from the serial console in `cargo xtask run`.)
 - For the **later USB-HID milestone**, QEMU also offers `-device usb-kbd` (manpage:
   *"Standard USB keyboard. Will override the PS/2 keyboard (if present)"*) plus a USB
   controller (`-device piix3-usb-uhci` if the machine doesn't already have one —
@@ -805,22 +813,29 @@ Also note: `sti` is already in effect by the time IRQ0 ticks (the smoke test ass
 
 ### 2.7 Milestone plan — keyboard
 
-1. **[QEMU]** Add a key-injection endpoint to `qemu_std_args` (`xtask/src/main.rs:179-198`) —
+*Status (2026-11-21, keyboard milestone): steps 1, 2, 3 and 5 landed in QEMU — polled
+i8042 bring-up (`kernel/src/keyboard.rs`, config byte = IRQ1 + translation → set 1, bounded
+waits, fail-soft), `pc-keyboard` set-1/US decoding (evaluated in
+`docs/pc-keyboard-eval.md`), serial+keyboard multiplexed into one line discipline, and a
+`KEYBOARD_OK` smoke phase driven by HMP `sendkey`. Steps 4 (IRQ1), 6 (real-hardware i8042
+probe) and 7/8 (UHCI + HID) remain.*
+
+1. **[QEMU]** ✅ Add a key-injection endpoint to `qemu_std_args` (`xtask/src/main.rs:179-198`) —
    QMP unix socket or HMP telnet — so tests can run `sendkey`. Verify manually that
    `sendkey a` reaches the guest once the driver exists. (Needs an xtask change; out of
    scope for this document's file, listed here as the first step.)
-2. **[QEMU]** *Polled driver first, no IRQ:* implement the i8042 init of §2.3 (config ←
+2. **[QEMU]** ✅ *Polled driver first, no IRQ:* implement the i8042 init of §2.3 (config ←
    `IRQ1 + translation`), then in the boot/shell loop poll `0x64` bit0 and print raw scancode
    bytes on the serial console. Test matrix: `sendkey a` → `1E 9E`; `sendkey shift-a` →
    `2A 1E 9E AA`; `sendkey up` → `E0 48 E0 C8`; `sendkey ret` → `1C 9C`. This validates the
    set-1 assumption without touching the PIC.
-3. **[QEMU]** *Decode:* add the set-1 → ASCII state machine (§2.4); print the resulting
+3. **[QEMU]** ✅ *Decode:* add the set-1 → ASCII state machine (§2.4); print the resulting
    characters (`a`, `A` with CapsLock via `sendkey caps_lock`, `_` via `sendkey shift-minus`).
 4. **[QEMU]** *Interrupts:* unmask IRQ1 (`0xFC`), replace the vector-33 branch in
    `interrupt_dispatch` [idt.rs:183] with the drain+queue+EOI handler (§2.5); confirm the
    serial "unexpected IRQ" line no longer appears and keys arrive while the CPU is idle in
    the shell loop.
-5. **[QEMU]** *Wire into the console:* feed decoded characters into the same input path the
+5. **[QEMU]** ✅ *Wire into the console:* feed decoded characters into the same input path the
    serial shell uses (`main.rs:165` loop over `serial.rs:57 read_byte` — the shell that
    `cargo xtask run` drops into with `help`, asserted in smoke via the `… → INT_OK → SHELL_OK`
    marker chain in AGENTS.md), so the shell reads either source. Add a `KBD_OK`-style serial
