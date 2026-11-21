@@ -161,6 +161,23 @@ pd3:  .skip 4096
 boot_magic: .skip 4
 boot_mbi:   .skip 4
 
+/* Guard gap between the stack and the page tables above it: a stack
+ * overflow must eat this padding before it can corrupt a page-table
+ * entry. The tables' last page holds pd3, which maps the e1000 MMIO
+ * window (0xFExxxxxx) — a corrupted PDE faults on the next MMIO
+ * access, and with no IDT armed yet that is a double fault and a
+ * triple fault (QEMU exits under -no-reboot). The kernel fills this
+ * gap with a canary at boot and re-checks it on every serial line. */
 .balign 16
-stack_bottom: .skip 65536
+.global guard_start
+guard_start:
+.skip 16384
+.global guard_end
+guard_end:
+
+.balign 16
+/* 128 KiB: the TLS handshake (record buffers, verifier state, fmt
+ * frames) is the deepest chain so far; measured ~44 KiB of the old
+ * 64 KiB was in use when the stack touched pd3 (see guard above). */
+stack_bottom: .skip 131072
 stack_top:

@@ -70,6 +70,7 @@ impl fmt::Write for SerialPort {
 #[macro_export]
 macro_rules! serial_print {
     ($($arg:tt)*) => {{
+        $crate::guard::check();
         let mut port = $crate::serial::SerialPort::COM1;
         let _ = core::fmt::Write::write_fmt(&mut port, format_args!($($arg)*));
     }};

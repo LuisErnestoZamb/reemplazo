@@ -82,7 +82,7 @@ cargo test -p bootinfo <name>   # single test
 The smoke test asserts each milestone's serial marker within 30 s:
 
 ```
-BOOT_OK → MEM_OK → PCI_OK → E1000_OK → NET_OK → PING_OK → DHCP_OK → DNS_OK → TCP_OK → TLS_OK → INT_OK
+BOOT_OK → MEM_OK → RTC_OK → PCI_OK → E1000_OK → NET_OK → PING_OK → DHCP_OK → DNS_OK → TCP_OK → TLS_OK → INT_OK
 ```
 
 **Notes:**

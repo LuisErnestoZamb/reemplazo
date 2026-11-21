@@ -83,6 +83,8 @@ fn check(root: &Path) -> bool {
                 "net",
                 "-p",
                 "pci",
+                "-p",
+                "rtc",
                 "--all-targets",
                 "--",
                 "-D",
@@ -108,7 +110,7 @@ fn check(root: &Path) -> bool {
             root,
             "cargo",
             &[
-                "test", "-p", "xtask", "-p", "bootinfo", "-p", "net", "-p", "pci",
+                "test", "-p", "xtask", "-p", "bootinfo", "-p", "net", "-p", "pci", "-p", "rtc",
             ],
         )
         && build_kernel(root)
@@ -291,11 +293,11 @@ fn run(root: &Path) -> bool {
 /// broken boot path (header, trampoline, GDT, paging, mbi parse),
 /// memory path, PCI scan, e1000 driver, network path, DHCP/DNS/TCP
 /// clients, or interrupt path (IDT, stubs, EOI, timer), so it gates
-/// all eleven milestones.
+/// all twelve milestones.
 fn smoke(root: &Path) -> bool {
-    const MARKERS: [&str; 11] = [
-        "BOOT_OK", "MEM_OK", "PCI_OK", "E1000_OK", "NET_OK", "PING_OK", "DHCP_OK", "DNS_OK",
-        "TCP_OK", "TLS_OK", "INT_OK",
+    const MARKERS: [&str; 12] = [
+        "BOOT_OK", "MEM_OK", "RTC_OK", "PCI_OK", "E1000_OK", "NET_OK", "PING_OK", "DHCP_OK",
+        "DNS_OK", "TCP_OK", "TLS_OK", "INT_OK",
     ];
     if !iso(root) {
         return false;

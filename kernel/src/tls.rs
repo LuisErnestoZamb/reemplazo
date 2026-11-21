@@ -12,10 +12,12 @@
 //! Trust model: the chain must terminate at the pinned
 //! `USERTrust ECC Certification Authority` root (`usertrust_ecc_ca.der`,
 //! SHA-256 `4ff460d5…`), verified against `openssl verify` when this
-//! landed. Certificate *dates* are not checked — the kernel has no RTC
-//! yet — but `InsecureIgnoreDates` still enforces that the chain's
-//! validity periods overlap; hostname, chain, signatures and EKU are
-//! all checked. Date validation arrives with the RTC milestone.
+//! landed. Certificate dates come from the CMOS RTC ([`RtcClock`]): when
+//! the clock is unavailable the check degrades to "dates not verified"
+//! (embedded-tls still enforces that the chain's validity periods
+//! overlap), and the smoke test's `RTC_OK` marker guarantees the clock
+//! itself keeps working. Hostname, chain, signatures and EKU are always
+//! checked.
 //!
 //! Scope of this milestone (documented limits, not hidden bugs):
 //! `Conn`'s one-outstanding-segment rule is upheld by `Socket`, which
@@ -32,7 +34,7 @@ use core::cmp::min;
 use embedded_io::{ErrorKind, Read, Write};
 use embedded_tls::TlsError;
 use embedded_tls::blocking::{
-    Aes128GcmSha256, Certificate, InsecureIgnoreDates, TlsConfig, TlsConnection, TlsContext,
+    Aes128GcmSha256, Certificate, TlsClock, TlsConfig, TlsConnection, TlsContext,
 };
 use embedded_tls::webpki::CertVerifier;
 
@@ -64,10 +66,30 @@ const STASH_CAP: usize = 8192;
 /// still armed only after the network chain (main.rs order).
 static mut READ_STORAGE: [u8; READ_BUF] = [0; READ_BUF];
 static mut WRITE_STORAGE: [u8; WRITE_BUF] = [0; WRITE_BUF];
+/// The receive stash and last-sent segment are static for the same
+/// reason: `Socket` lives inside `TlsConnection` on `https_smoke`'s
+/// stack, and the handshake is the deepest call chain in the kernel
+/// (see `crate::guard` for what an overflow used to hit).
+static mut STASH: [u8; STASH_CAP] = [0; STASH_CAP];
+static mut LAST: [u8; MAX_SEND] = [0; MAX_SEND];
+/// Response header block (static with the rest; see above).
+static mut RESP: [u8; RESP_CAP] = [0; RESP_CAP];
 
 fn fatal(msg: &str) -> ! {
     serial_println!("FATAL: tls: {msg}");
     crate::halt()
+}
+
+/// Certificate-date checking through the CMOS clock: `None` when the
+/// clock is unavailable (UIP stuck, implausible year) makes
+/// embedded-tls skip date validation — the documented degradation,
+/// kept honest by the `RTC_OK` smoke marker.
+struct RtcClock;
+
+impl TlsClock for RtcClock {
+    fn now() -> Option<u64> {
+        crate::rtc::now_epoch()
+    }
 }
 
 /// Prove the whole HTTPS client path: open TCP to `remote_ip:443`,
@@ -86,7 +108,7 @@ pub fn https_smoke(nic: &mut E1000, cfg: &NetConfig, remote_ip: [u8; 4], host: &
     let mut tls: TlsConnection<_, Aes128GcmSha256> =
         TlsConnection::new(socket, read_buf, write_buf);
 
-    let verifier: CertVerifier<'_, Aes128GcmSha256, InsecureIgnoreDates, CERT_SIZE> =
+    let verifier: CertVerifier<'_, Aes128GcmSha256, RtcClock, CERT_SIZE> =
         CertVerifier::new(Certificate::X509(ROOT_CA));
     let config = TlsConfig::new().with_server_name(host);
     if let Err(e) = tls.open(TlsContext::new(&config, verifier)) {
@@ -110,7 +132,8 @@ pub fn https_smoke(nic: &mut E1000, cfg: &NetConfig, remote_ip: [u8; 4], host: &
 
     // Read the decrypted stream until the server's close_notify: keep
     // the header block, discard the body, bound the total.
-    let mut resp = [0u8; RESP_CAP];
+    // SAFETY: single-use static (see `RESP`).
+    let resp = unsafe { &mut *core::ptr::addr_of_mut!(RESP) };
     let mut resp_len = 0usize;
     let mut total = 0usize;
     let mut scratch = [0u8; MAX_SEND];
@@ -188,24 +211,30 @@ pub fn https_smoke(nic: &mut E1000, cfg: &NetConfig, remote_ip: [u8; 4], host: &
 struct Socket<'a> {
     conn: &'a mut Conn,
     nic: &'a mut E1000,
-    /// Received bytes not yet handed to the TLS reader.
-    stash: [u8; STASH_CAP],
+    /// Received bytes not yet handed to the TLS reader (static: see
+    /// `STASH`).
+    stash: &'a mut [u8; STASH_CAP],
     stash_len: usize,
     stash_pos: usize,
-    /// Last transmitted segment, for retransmission on stall.
-    last: [u8; MAX_SEND],
+    /// Last transmitted segment, for retransmission on stall (static:
+    /// see `LAST`).
+    last: &'a mut [u8; MAX_SEND],
     last_len: usize,
 }
 
 impl<'a> Socket<'a> {
     fn new(conn: &'a mut Conn, nic: &'a mut E1000) -> Self {
+        // SAFETY: the stash/last statics are single-use, taken once by
+        // `https_smoke` on a single core with interrupts still off.
+        let stash = unsafe { &mut *core::ptr::addr_of_mut!(STASH) };
+        let last = unsafe { &mut *core::ptr::addr_of_mut!(LAST) };
         Socket {
             conn,
             nic,
-            stash: [0; STASH_CAP],
+            stash,
             stash_len: 0,
             stash_pos: 0,
-            last: [0; MAX_SEND],
+            last,
             last_len: 0,
         }
     }

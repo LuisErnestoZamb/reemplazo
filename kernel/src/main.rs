@@ -23,6 +23,7 @@ mod pci;
 mod pic;
 mod pit;
 mod port;
+mod rtc;
 mod tcp;
 mod tls;
 
@@ -45,6 +46,7 @@ const MBI_MAX_BYTES: usize = 1 << 20;
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
     serial::SerialPort::COM1.init();
+    guard::arm();
     serial_println!("reemplazo kernel: long mode, multiboot2 handoff");
     init_logger();
 
@@ -65,6 +67,7 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
         }
     }
 
+    report_rtc(); // pure port I/O: no PCI needed, and RTC_OK precedes PCI_OK
     let scan = crate::pci::scan();
     crate::pci::selftest(&scan);
     if let Some(mut nic) = crate::e1000::init(&scan) {
@@ -105,6 +108,66 @@ fn init_logger() {
     static LOGGER: SerialLogger = SerialLogger;
     let _ = log::set_logger(&LOGGER); // only the first call wins
     log::set_max_level(log::LevelFilter::Info);
+}
+
+/// The stack-guard gap declared in `entry.S` (between the page tables
+/// and the stack), armed with a canary before any deep call chain runs
+/// and verified by every `serial_print!`.
+///
+/// Why it exists: the TLS handshake is the deepest stack user so far,
+/// and an overflow used to reach `pd3` — the page table for the e1000
+/// MMIO window — corrupting a PDE and triple-faulting the machine
+/// (no IDT is armed yet during the network chain, so there is no
+/// handler to catch it). The gap turns that silent paging corruption
+/// into a loud `FATAL` on the next print, and the 128 KiB stack makes
+/// reaching the gap unlikely in the first place.
+mod guard {
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    unsafe extern "C" {
+        static guard_start: u8;
+        static guard_end: u8;
+    }
+
+    const CANARY: u8 = 0xA5;
+    static ARMED: AtomicBool = AtomicBool::new(false);
+
+    fn range() -> (*const u8, usize) {
+        let start = core::ptr::addr_of!(guard_start);
+        let len = (core::ptr::addr_of!(guard_end) as usize) - (start as usize);
+        (start, len)
+    }
+
+    /// Fill the gap with the canary; call once, before deep calls.
+    pub fn arm() {
+        let (start, len) = range();
+        // SAFETY: guard_start..guard_end is one `.skip` region in
+        // entry.S's .bss, inside the identity map; single-core boot
+        // with interrupts still off, so nothing aliases it.
+        unsafe { core::ptr::write_bytes(start.cast_mut(), CANARY, len) };
+        ARMED.store(true, Ordering::Relaxed);
+    }
+
+    /// Verify the canary. Called from `serial_print!`; the failure path
+    /// writes through the UART directly (never through the macro) and
+    /// clears ARMED first, so it cannot recurse.
+    pub fn check() {
+        if !ARMED.load(Ordering::Relaxed) {
+            return;
+        }
+        let (start, len) = range();
+        // SAFETY: the same region as `arm`; read-only here.
+        let smashed = unsafe { core::slice::from_raw_parts(start, len) }
+            .iter()
+            .any(|&b| b != CANARY);
+        if smashed {
+            ARMED.store(false, Ordering::Relaxed);
+            let mut port = crate::serial::SerialPort::COM1;
+            use core::fmt::Write as _;
+            let _ = writeln!(port, "FATAL: stack overflow (guard gap smashed)");
+            crate::halt();
+        }
+    }
 }
 
 /// Read and validate the Multiboot2 information structure.
@@ -185,6 +248,31 @@ fn report_boot_info(info: &BootInfo) {
     }
     serial_println!("mbi: total_size={} bytes", info.total_size());
     serial_println!("BOOT_OK"); // machine-checked by `cargo xtask smoke`
+}
+
+/// Read the CMOS clock and report it — the smoke test's `RTC_OK`.
+///
+/// An unavailable clock is loud but not fatal: boot continues, TLS
+/// skips certificate dates (documented in `crate::tls`), and the smoke
+/// test fails on the missing marker so a broken RTC cannot pass
+/// unnoticed.
+fn report_rtc() {
+    match rtc::now_epoch() {
+        Some(epoch) => {
+            let t = rtc::from_epoch(epoch);
+            serial_println!(
+                "rtc: {:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC (epoch {epoch})",
+                t.year,
+                t.month,
+                t.day,
+                t.hour,
+                t.minute,
+                t.second
+            );
+            serial_println!("RTC_OK"); // machine-checked by `cargo xtask smoke`
+        }
+        None => serial_println!("rtc: unavailable — certificate dates will not be checked"),
+    }
 }
 
 /// Arm interrupts and prove both delivery paths before parking.

@@ -390,6 +390,7 @@ dependencies = [
  "pci",
  "rand_chacha",
  "rand_core 0.9.5",
+ "rtc",
 ]
 
 [[package]]
@@ -548,6 +549,10 @@ dependencies = [
  "crypto-bigint",
  "hmac",
 ]
+
+[[package]]
+name = "rtc"
+version = "0.1.0"
 
 [[package]]
 name = "rustls-pki-types"
