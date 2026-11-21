@@ -40,8 +40,11 @@ impl SerialPort {
 
     /// Write one byte, spinning until the transmit holding register is empty.
     fn write_byte(self, byte: u8) {
-        // SAFETY: standard COM1 register range (const above); polled port
-        // I/O with interrupts off — no reentrancy.
+        // SAFETY: standard COM1 register range (const above); polled
+        // port I/O. Reentrancy: the IRQ0 handler never prints, so the
+        // only nesting possible is an exception handler printing its
+        // own line between our bytes — interleaved lines at worst,
+        // never corrupted state.
         unsafe {
             while inb(COM1_BASE + 5) & 0x20 == 0 {
                 core::hint::spin_loop();

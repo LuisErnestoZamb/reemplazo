@@ -68,6 +68,7 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
         }
     }
 
+    arm_interrupts();
     report_rtc(); // pure port I/O: no PCI needed, and RTC_OK precedes PCI_OK
     let scan = crate::pci::scan();
     crate::pci::selftest(&scan);
@@ -84,7 +85,7 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
         lease = Some(net);
     }
 
-    arm_and_test_interrupts();
+    test_interrupts();
 
     // The shell is the kernel's idle state until a scheduler exists;
     // without a NIC there is nothing to drive, so just park.
@@ -288,7 +289,16 @@ fn report_rtc() {
 }
 
 /// Arm interrupts and prove both delivery paths before parking.
-fn arm_and_test_interrupts() {
+/// Arm IDT, PIC and PIT and enable interrupts **before** anything
+/// hardware-facing runs: smoltcp's timers (DHCP/DNS/TCP
+/// retransmission) read [`crate::pit::ticks`], interrupt-arrival
+/// timing perturbs the entropy pool's jitter sources, and any fault
+/// from here on prints a loud `EXC:` line instead of triple-faulting
+/// into a silent reboot (the IDT used to load only after the network
+/// chain). The delivery tests and the `INT_OK` marker stay after the
+/// network chain ([`test_interrupts`]) so the smoke's marker order
+/// still reflects the boot flow.
+fn arm_interrupts() {
     idt::init(); // build + lidt (needs the GDT64 from entry.S)
     pic::init(); // remap IRQs to 32..=47, mask all but IRQ0
     pit::init(); // PIT channel 0 at HZ
@@ -298,7 +308,12 @@ fn arm_and_test_interrupts() {
     // SAFETY: `sti` is the documented way to enable interrupts after the
     // IDT/PIC are armed; single-core, no races possible yet.
     unsafe { core::arch::asm!("sti", options(nomem, nostack)) }
+}
 
+/// Prove both delivery paths — the smoke's `INT_OK`, kept after the
+/// network chain so marker order matches the flow (RTC_OK … HTTP_OK
+/// happen with interrupts already armed; see [`arm_interrupts`]).
+fn test_interrupts() {
     // Prove the exception path: int3 must hit our handler and return here.
     unsafe { core::arch::asm!("int3", options(nomem, nostack)) }
     serial_println!("interrupts: int3 returned to caller");

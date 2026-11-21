@@ -64,8 +64,8 @@ const STASH_CAP: usize = 8192;
 
 /// Record buffers live in `static`s: 21 KiB would not fit the 64 KiB
 /// stack alongside the handshake frames. Both are written only from
-/// `https_smoke`, which runs once on a single core with interrupts
-/// still armed only after the network chain (main.rs order).
+/// `https_smoke`, which runs once on a single core — the only handler
+/// in play (IRQ0) does not touch these statics.
 static mut READ_STORAGE: [u8; READ_BUF] = [0; READ_BUF];
 static mut WRITE_STORAGE: [u8; WRITE_BUF] = [0; WRITE_BUF];
 /// The receive stash and last-sent segment are static for the same
@@ -262,7 +262,8 @@ struct Socket<'a> {
 impl<'a> Socket<'a> {
     fn new(conn: &'a mut Conn, nic: &'a mut E1000) -> Self {
         // SAFETY: the stash/last statics are single-use, taken once by
-        // `https_smoke` on a single core with interrupts still off.
+        // `https_smoke` on a single core; the only handler in play
+        // (IRQ0) never touches them.
         let stash = unsafe { &mut *core::ptr::addr_of_mut!(STASH) };
         let last = unsafe { &mut *core::ptr::addr_of_mut!(LAST) };
         Socket {

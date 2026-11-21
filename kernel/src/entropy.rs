@@ -13,12 +13,14 @@
 //!   project's `StdRng` construction, audited, `no_std`.
 //!
 //! Documented limits (not hidden bugs): the Core2 Duo T7400 has no
-//! RDRAND/RDSEED, and the network chain runs with interrupts off, so
-//! this is *best-effort* boot entropy — it defeats constant or
-//! per-boot-fixed secrets, but the entropy is not quantified. The pool
-//! is one-shot (samples after [`CAP`] are dropped); reseeding from
-//! interrupt-arrival timing, once the PIT is armed before the network
-//! chain, arrives with the entropy milestone.
+//! RDRAND/RDSEED, so this is *best-effort* boot entropy — it defeats
+//! constant or per-boot-fixed secrets, but the entropy is not
+//! quantified. Interrupts are armed before the network chain
+//! (`arm_interrupts` in main.rs), so IRQ0 preemption perturbs every
+//! `rdtsc` sample the pool absorbs; explicitly sampling
+//! interrupt-arrival times into the pool (and reseeding after boot)
+//! arrives with the entropy milestone. The pool is one-shot (samples
+//! after [`CAP`] are dropped).
 
 use embassy_crypto::Sha256;
 // Force-link the RustCrypto driver registrations (SHA-256, HMAC-SHA256,
@@ -50,8 +52,8 @@ pub(crate) fn boot_entropy() -> u32 {
 /// Record one received frame's arrival jitter. Called from the e1000 RX
 /// path for every frame, before the TLS handshake seeds the CSPRNG.
 pub(crate) fn note_rx() {
-    // SAFETY: the network chain runs single-core with interrupts armed
-    // only afterwards (main.rs order), so no reentrancy on POOL/LEN.
+    // SAFETY: single-core; the only handler in play (IRQ0's tick
+    // counter) never touches POOL/LEN, so `absorb` cannot reenter.
     unsafe { absorb(rdtsc()) }
 }
 
