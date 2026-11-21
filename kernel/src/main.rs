@@ -28,6 +28,11 @@ mod shell;
 mod tcp;
 mod tls;
 
+// smoltcp migration (docs/smoltcp-eval.md): M1 links the stack
+// scaffolding before the boot chain swaps onto it in M2.
+mod clock;
+mod netstack;
+
 use bootinfo::{BootInfo, ParseError};
 use core::panic::PanicInfo;
 

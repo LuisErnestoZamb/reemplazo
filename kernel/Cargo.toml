@@ -33,3 +33,24 @@ embassy-crypto-rustcrypto = { git = "https://github.com/embassy-rs/embassy", rev
 embedded-io = { version = "0.7", default-features = false }
 rand_chacha = { version = "0.9", default-features = false }
 rand_core = { version = "0.9", default-features = false }
+
+# TCP/IP stack (evaluated in docs/smoltcp-eval.md: ADOPT with
+# conditions — 0BSD, zero RustSec advisories, no_std/no-alloc verified
+# for x86_64-unknown-none, and a disassembly sweep of its 147812
+# instructions found 0 AVX/SSE4/SSSE3/popcnt, safe on the Core2).
+# Feature set is the doc's §1.2 minimum: Ethernet+ARP, IPv4, DHCP,
+# DNS, TCP (+ Reno congestion control — cubic is f64-based), ICMP
+# echo. Deliberately off: std/alloc, IPv6, UDP socket (DHCP/DNS emit
+# their own UDP), fragmentation, raw/mdns sockets.
+smoltcp = { version = "0.14", default-features = false, features = [
+    "medium-ethernet",
+    "proto-ipv4",
+    "proto-dhcpv4",
+    "proto-dns",
+    "socket-tcp",
+    "socket-tcp-reno",
+    "socket-dhcpv4",
+    "socket-dns",
+    "socket-icmp",
+    "log",
+] }
