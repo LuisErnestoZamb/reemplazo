@@ -328,6 +328,7 @@ pub fn parse_icmp_echo_reply(frame: &[u8]) -> Option<IcmpEchoReply<'_>> {
 
 pub mod dhcp;
 pub mod dns;
+pub mod tcp;
 
 /// A validated UDP datagram carried by an IPv4 frame.
 #[derive(Debug, PartialEq, Eq)]

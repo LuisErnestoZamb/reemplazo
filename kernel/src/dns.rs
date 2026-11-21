@@ -6,6 +6,7 @@
 
 use crate::dhcp::NetConfig;
 use crate::e1000::{E1000, RX_POLLS};
+use crate::entropy::boot_entropy;
 use net::dns;
 
 /// Attempts per resolution: UDP can drop a query (slirp rarely does,
@@ -16,31 +17,6 @@ const ATTEMPTS: u32 = 3;
 fn fatal(msg: &str) -> ! {
     serial_println!("FATAL: dns: {msg}");
     crate::halt()
-}
-
-/// Cheap boot-time jitter from the timestamp counter.
-///
-/// This is *not* a CSPRNG: it makes the DNS transaction id and source
-/// port non-constant across boots, which is what defeats off-path
-/// response guessing (RFC 5452 §3 — a fixed id+port lets an attacker
-/// spoof answers without seeing the query). A real CSPRNG seeded from
-/// interrupt timing arrives with the entropy milestone; until then
-/// treat this as defense in depth, not a claim of cryptographic
-/// randomness.
-fn boot_entropy() -> u32 {
-    // SAFETY: `rdtsc` is baseline x86 (present on the Core2 Duo T7400
-    // target and on QEMU's CPU), writes only EAX/EDX, and cannot alias
-    // memory — no preconditions beyond the CPU existing.
-    let (lo, hi): (u32, u32);
-    unsafe {
-        core::arch::asm!(
-            "rdtsc",
-            out("eax") lo,
-            out("edx") hi,
-            options(nomem, nostack, preserves_flags)
-        )
-    }
-    lo ^ hi.rotate_left(16)
 }
 
 /// Resolve `qname` to its first A record, print `DNS_OK`, and return

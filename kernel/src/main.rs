@@ -16,12 +16,14 @@ mod serial;
 mod dhcp;
 mod dns;
 mod e1000;
+mod entropy;
 mod idt;
 mod memory;
 mod pci;
 mod pic;
 mod pit;
 mod port;
+mod tcp;
 
 use bootinfo::{BootInfo, ParseError};
 use core::panic::PanicInfo;
@@ -67,7 +69,8 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
         let peer = nic.selftest();
         nic.ping_test(peer);
         let net = dhcp::configure(&mut nic);
-        dns::resolve(&mut nic, &net, "github.com"); // git's host, per AGENTS.md
+        let github_ip = dns::resolve(&mut nic, &net, "github.com"); // git's host, per AGENTS.md
+        tcp::http_smoke(&mut nic, &net, github_ip, "github.com");
     }
 
     arm_and_test_interrupts();

@@ -285,15 +285,17 @@ fn run(root: &Path) -> bool {
 /// roundtrip through slirp), `PING_OK` (IPv4/ICMP echo with validated
 /// checksums), `DHCP_OK` (full DISCOVER/OFFER/REQUEST/ACK lease),
 /// `DNS_OK` (RFC 1035 A lookup for github.com through the leased
-/// server), `INT_OK` (IDT + PIC remap + PIT ticks + int3 resume) —
-/// within `SMOKE_TIMEOUT`. This is the test that fails on a broken boot
-/// path (header, trampoline, GDT, paging, mbi parse), memory path, PCI
-/// scan, e1000 driver, network path, DHCP/DNS client, or interrupt path
-/// (IDT, stubs, EOI, timer), so it gates all nine milestones.
+/// server), `TCP_OK` (RFC 9293 connect + HTTP GET + FIN close against
+/// github.com:80), `INT_OK` (IDT + PIC remap + PIT ticks + int3
+/// resume) — within `SMOKE_TIMEOUT`. This is the test that fails on a
+/// broken boot path (header, trampoline, GDT, paging, mbi parse),
+/// memory path, PCI scan, e1000 driver, network path, DHCP/DNS/TCP
+/// clients, or interrupt path (IDT, stubs, EOI, timer), so it gates
+/// all ten milestones.
 fn smoke(root: &Path) -> bool {
-    const MARKERS: [&str; 9] = [
+    const MARKERS: [&str; 10] = [
         "BOOT_OK", "MEM_OK", "PCI_OK", "E1000_OK", "NET_OK", "PING_OK", "DHCP_OK", "DNS_OK",
-        "INT_OK",
+        "TCP_OK", "INT_OK",
     ];
     if !iso(root) {
         return false;
