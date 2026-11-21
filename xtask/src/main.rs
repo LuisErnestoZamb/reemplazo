@@ -292,12 +292,13 @@ fn run(root: &Path) -> bool {
 /// resume) — within `SMOKE_TIMEOUT`. This is the test that fails on a
 /// broken boot path (header, trampoline, GDT, paging, mbi parse),
 /// memory path, PCI scan, e1000 driver, network path, DHCP/DNS/TCP
-/// clients, interrupt path (IDT, stubs, EOI, timer), or the serial
-/// shell coming up, so it gates all thirteen milestones.
+/// clients, TLS and HTTP clients, interrupt path (IDT, stubs, EOI,
+/// timer), or the serial shell coming up, so it gates all fourteen
+/// milestones.
 fn smoke(root: &Path) -> bool {
-    const MARKERS: [&str; 13] = [
+    const MARKERS: [&str; 14] = [
         "BOOT_OK", "MEM_OK", "RTC_OK", "PCI_OK", "E1000_OK", "NET_OK", "PING_OK", "DHCP_OK",
-        "DNS_OK", "TCP_OK", "TLS_OK", "INT_OK", "SHELL_OK",
+        "DNS_OK", "TCP_OK", "TLS_OK", "HTTP_OK", "INT_OK", "SHELL_OK",
     ];
     if !iso(root) {
         return false;

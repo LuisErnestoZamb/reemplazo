@@ -23,13 +23,13 @@
 //! `Conn`'s one-outstanding-segment rule is upheld by `Socket`, which
 //! waits for each segment's ACK before sending the next and stashes
 //! any payload that arrives meanwhile (a stall that exhausts the stash
-//! aborts loudly rather than dropping bytes); the response is read
-//! until the server's `close_notify` with a total-byte bound, keeping
-//! only the header block (body parsing belongs to the HTTP milestone).
+//! aborts loudly rather than dropping bytes); the response body is
+//! bounded by `READ_CAP` for the smoke (the framer itself trusts the
+//! declared `Content-Length`).
 
 use crate::dhcp::NetConfig;
 use crate::e1000::E1000;
-use crate::tcp::{ATTEMPTS, Conn, MAX_SEND, build_get, headers_complete};
+use crate::tcp::{ATTEMPTS, Conn, MAX_SEND, build_get};
 use core::cmp::min;
 use embedded_io::{ErrorKind, Read, Write};
 use embedded_tls::TlsError;
@@ -37,6 +37,7 @@ use embedded_tls::blocking::{
     Aes128GcmSha256, Certificate, TlsClock, TlsConfig, TlsConnection, TlsContext,
 };
 use embedded_tls::webpki::CertVerifier;
+use net::http::ResponseParser;
 
 /// Pinned trust anchor: USERTrust ECC Certification Authority (DER).
 /// sha256 = 4ff460d54b9c86dabfbcfc5712e0400d2bed3fbc4d4fbdaa86e06adcd2a9ad7a
@@ -49,11 +50,12 @@ const WRITE_BUF: usize = 4096;
 /// `CertVerifier` keeps a copy of the server's own certificate: the
 /// github.com leaf is 1016 B DER; 2048 leaves room for a renewal.
 const CERT_SIZE: usize = 2048;
-/// Keep at most this much plaintext (headers arrive first; the body of
-/// `robots.txt` is discarded once the header block is complete).
-const RESP_CAP: usize = 4096;
-/// Total-byte bound on the decrypted stream: a stuck or hostile server
-/// cannot keep us reading forever (the smoke test has a 30 s budget).
+/// First bytes of the body kept for content validation (any valid
+/// robots.txt declares its user agent inside the first few lines).
+const BODY_HEAD_CAP: usize = 512;
+/// Response-body bound for the smoke: robots.txt is ~30 KiB, and a
+/// stuck or hostile server cannot keep us reading forever (the smoke
+/// test has a 30 s budget).
 const READ_CAP: usize = 64 * 1024;
 /// Held bytes a stalled write may accumulate: the residue of the last
 /// read (≤ one MSS) plus payload pumped while waiting for an ACK.
@@ -72,8 +74,13 @@ static mut WRITE_STORAGE: [u8; WRITE_BUF] = [0; WRITE_BUF];
 /// (see `crate::guard` for what an overflow used to hit).
 static mut STASH: [u8; STASH_CAP] = [0; STASH_CAP];
 static mut LAST: [u8; MAX_SEND] = [0; MAX_SEND];
-/// Response header block (static with the rest; see above).
-static mut RESP: [u8; RESP_CAP] = [0; RESP_CAP];
+/// HTTP parser state (head accumulation + framer), the body staging
+/// area for one feed (≤ one MSS of decrypted bytes) and the body
+/// prefix kept for content checks — static for the same stack-headroom
+/// reason as above; `ResponseParser::new` is `const`.
+static mut PARSER: ResponseParser = ResponseParser::new();
+static mut STAGING: [u8; MAX_SEND] = [0; MAX_SEND];
+static mut BODY_HEAD: [u8; BODY_HEAD_CAP] = [0; BODY_HEAD_CAP];
 
 fn fatal(msg: &str) -> ! {
     serial_println!("FATAL: tls: {msg}");
@@ -94,9 +101,10 @@ impl TlsClock for RtcClock {
 
 /// Prove the whole HTTPS client path: open TCP to `remote_ip:443`,
 /// complete a TLS 1.3 handshake against the pinned root, GET
-/// `/robots.txt` with `Connection: close`, read until the server's
-/// `close_notify`, validate the response, close both layers, print
-/// `TLS_OK`.
+/// `/robots.txt` with `Connection: close`, parse and frame the
+/// response with `net::http` (httparse head + RFC 9112 body framer),
+/// validate the body, close both layers, print `TLS_OK` then
+/// `HTTP_OK`.
 pub fn https_smoke(nic: &mut E1000, cfg: &NetConfig, remote_ip: [u8; 4], host: &str) {
     let mut conn = Conn::open(nic, cfg, remote_ip, 443);
 
@@ -116,6 +124,7 @@ pub fn https_smoke(nic: &mut E1000, cfg: &NetConfig, remote_ip: [u8; 4], host: &
         crate::halt();
     }
     serial_println!("tls: handshake ok (TLS 1.3, pinned USERTrust ECC root)");
+    serial_println!("TLS_OK"); // machine-checked by `cargo xtask smoke`
 
     // HTTP/1.1 GET over the established channel; `Connection: close`
     // makes the server finish with close_notify + FIN.
@@ -130,28 +139,63 @@ pub fn https_smoke(nic: &mut E1000, cfg: &NetConfig, remote_ip: [u8; 4], host: &
         crate::halt();
     }
 
-    // Read the decrypted stream until the server's close_notify: keep
-    // the header block, discard the body, bound the total.
-    // SAFETY: single-use static (see `RESP`).
-    let resp = unsafe { &mut *core::ptr::addr_of_mut!(RESP) };
-    let mut resp_len = 0usize;
-    let mut total = 0usize;
+    // Read the decrypted stream through the HTTP response parser:
+    // httparse parses the head, the RFC 9112 framer the body
+    // (content-length / chunked / close-delimited).
+    // SAFETY: single-use statics (see `READ_STORAGE`).
+    let parser = unsafe { &mut *core::ptr::addr_of_mut!(PARSER) };
+    let staging = unsafe { &mut *core::ptr::addr_of_mut!(STAGING) };
+    let body_head = unsafe { &mut *core::ptr::addr_of_mut!(BODY_HEAD) };
+    let mut body_head_len = 0usize;
+    let mut body_total = 0usize;
+    let mut status_checked = false;
     let mut scratch = [0u8; MAX_SEND];
     loop {
         match tls.read(&mut scratch) {
             Ok(0) => fatal("transport EOF without close_notify (truncated response)"),
             Ok(n) => {
-                total += n;
-                if total > READ_CAP {
-                    fatal("decrypted stream exceeds the byte bound");
+                let progress = match parser.feed(&scratch[..n], staging) {
+                    Ok(progress) => progress,
+                    Err(e) => {
+                        serial_println!("FATAL: tls: HTTP response refused: {e:?}");
+                        crate::halt();
+                    }
+                };
+                if !status_checked && let Some(status) = parser.status() {
+                    status_checked = true;
+                    // A parsed u16 — inherently safe to log (no
+                    // log-injection surface like raw text lines).
+                    serial_println!("http: status {status}");
+                    if status != 200 {
+                        fatal("unexpected HTTP status (expected 200)");
+                    }
                 }
-                if resp_len < RESP_CAP && !headers_complete(&resp[..resp_len]) {
-                    let take = min(n, RESP_CAP - resp_len);
-                    resp[resp_len..resp_len + take].copy_from_slice(&scratch[..take]);
-                    resp_len += take;
+                if progress.body > 0 {
+                    if body_head_len < body_head.len() {
+                        let take = min(body_head.len() - body_head_len, progress.body);
+                        body_head[body_head_len..body_head_len + take]
+                            .copy_from_slice(&staging[..take]);
+                        body_head_len += take;
+                    }
+                    body_total += progress.body;
+                    if body_total > READ_CAP {
+                        fatal("response body exceeds the byte bound");
+                    }
+                }
+                if progress.complete {
+                    break;
                 }
             }
-            Err(TlsError::ConnectionClosed) => break, // authenticated shutdown
+            Err(TlsError::ConnectionClosed) => {
+                // The authenticated shutdown doubles as EOF for
+                // close-delimited bodies; a framed body ending here
+                // was truncated and must fail, not "finish".
+                if let Err(e) = parser.eof() {
+                    serial_println!("FATAL: tls: response truncated: {e:?}");
+                    crate::halt();
+                }
+                break;
+            }
             Err(e) => {
                 serial_println!("FATAL: tls: read failed: {e:?}");
                 crate::halt();
@@ -159,24 +203,19 @@ pub fn https_smoke(nic: &mut E1000, cfg: &NetConfig, remote_ip: [u8; 4], host: &
         }
     }
 
-    // A real HTTP status line and a complete header block, or we did
-    // not get what we asked for. Same log-injection guard as the
-    // plain-HTTP smoke: only a printable-ASCII line reaches the log.
-    let resp = &resp[..resp_len];
-    if !resp.starts_with(b"HTTP/1.") || !headers_complete(resp) {
-        fatal("response is not a complete HTTP/1.x header block");
+    // A real, fully-framed body with real content: any valid
+    // robots.txt declares its user agent.
+    if body_total == 0 {
+        fatal("empty response body");
     }
-    let line_end = resp
-        .iter()
-        .position(|&b| b == b'\r' || b == b'\n')
-        .unwrap_or(resp.len());
-    if resp[..line_end].iter().all(|b| (0x20..=0x7E).contains(b)) {
-        if let Ok(line) = core::str::from_utf8(&resp[..line_end]) {
-            serial_println!("tls: {line}");
-        }
-    } else {
-        serial_println!("tls: (status line contains non-printable bytes)");
+    if !body_head[..body_head_len]
+        .windows(b"User-agent:".len())
+        .any(|window| window == b"User-agent:")
+    {
+        fatal("body does not look like robots.txt (no User-agent)");
     }
+    serial_println!("http: {body_total} bytes framed");
+    serial_println!("HTTP_OK"); // machine-checked by `cargo xtask smoke`
 
     // Orderly shutdown: close_notify (best-effort — the server's own
     // close_notify already authenticated everything we read; a failure
@@ -194,8 +233,6 @@ pub fn https_smoke(nic: &mut E1000, cfg: &NetConfig, remote_ip: [u8; 4], host: &
         ..
     } = socket;
     conn_ref.close(nic_ref);
-
-    serial_println!("TLS_OK"); // machine-checked by `cargo xtask smoke`
 }
 
 /// `embedded_io` transport over one TCP connection.
