@@ -64,7 +64,7 @@ All in Rust, all in this workspace:
 | Path | Crate / role |
 |---|---|
 | `kernel/` | The OS kernel — `no_std`, built only for `x86_64-unknown-none` |
-| `bootinfo/` | Boot information parsing (multiboot2) |
+| `mbi/` | Multiboot2 handoff range contract + hostile-input host tests |
 | `net/` | Wire-protocol logic (Ethernet→TCP frames, DNS, DHCP) + HTTP/1.1 responses on `httparse` — host-tested |
 | `rtc/` | CMOS clock decoding (BCD, 12/24 h, leap years, century plausibility) — host-tested |
 | `pci/` | PCI enumeration and device IDs (e1000, sky2, …) |
@@ -79,7 +79,7 @@ All in Rust, all in this workspace:
 cargo xtask check   # fmt + clippy (host and kernel target) + tests + cross-build
 cargo xtask smoke   # build ISO, boot headless, assert serial markers in order
 cargo xtask run     # interactive boot in QEMU (Ctrl-C quits)
-cargo test -p bootinfo <name>   # single test
+cargo test -p mbi <name>   # single test
 ```
 
 The smoke test asserts each milestone's serial marker within 30 s:

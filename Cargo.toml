@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["bootinfo", "kernel", "net", "pci", "rtc", "xtask"]
+members = ["kernel", "mbi", "net", "pci", "rtc", "xtask"]
 # Bare `cargo build` at the repo root must not try to build `kernel` for the
 # host: it is no_std and only valid for x86_64-unknown-none (built via xtask).
-default-members = ["bootinfo", "net", "pci", "rtc", "xtask"]
+default-members = ["mbi", "net", "pci", "rtc", "xtask"]
 
 [workspace.package]
 edition = "2024"
