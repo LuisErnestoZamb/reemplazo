@@ -89,6 +89,8 @@ fn check(root: &Path) -> bool {
                 "-p",
                 "bootinfo",
                 "-p",
+                "html",
+                "-p",
                 "net",
                 "-p",
                 "pci",
@@ -119,7 +121,8 @@ fn check(root: &Path) -> bool {
             root,
             "cargo",
             &[
-                "test", "-p", "xtask", "-p", "bootinfo", "-p", "net", "-p", "pci", "-p", "rtc",
+                "test", "-p", "xtask", "-p", "bootinfo", "-p", "html", "-p", "net", "-p", "pci",
+                "-p", "rtc",
             ],
         )
         && build_kernel(root)
