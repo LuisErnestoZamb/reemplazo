@@ -400,6 +400,7 @@ dependencies = [
  "linked_list_allocator",
  "log",
  "net",
+ "pc-keyboard",
  "pci",
  "rand_chacha",
  "rand_core 0.9.5",
@@ -473,6 +474,12 @@ dependencies = [
  "primeorder",
  "sha2",
 ]
+
+[[package]]
+name = "pc-keyboard"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73c53b65bbadd653c9d125e745d2659a3a060539b17d96ab1c59f9f5bfdacce5"
 
 [[package]]
 name = "pci"

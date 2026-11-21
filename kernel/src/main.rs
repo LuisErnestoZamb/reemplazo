@@ -24,6 +24,7 @@ mod e1000;
 mod entropy;
 mod heap;
 mod idt;
+mod keyboard;
 mod memory;
 mod pci;
 mod pic;
