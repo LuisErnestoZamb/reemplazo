@@ -9,6 +9,9 @@ bootinfo = { path = "../bootinfo" }
 net = { path = "../net" }
 pci = { path = "../pci" }
 rtc = { path = "../rtc" }
+# COM1 register I/O (polled TX/RX): default features are empty — no
+# nightly, no alloc; only `bitflags` beyond it.
+uart_16550 = "0.9"
 
 # TLS stack (reviewed in the TLS milestone commit): `embedded-tls` is
 # pinned by git rev for a reproducible Cargo.lock; its crypto comes from

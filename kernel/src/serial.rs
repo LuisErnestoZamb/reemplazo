@@ -1,12 +1,22 @@
-//! 16550 UART driver for COM1 (0x3F8) — polled TX, no interrupts.
+//! 16550 UART driver for COM1 (0x3F8) — polled TX/RX, no interrupts.
 //!
-//! Bring-up console: QEMU wires COM1 to `-serial stdio`. The port base is a
-//! compile-time constant, so the type is stateless — no `static mut`, no
-//! locking; safe to call from `kernel_main` and the panic path alike.
+//! Bring-up console: QEMU wires COM1 to `-serial stdio`. Register I/O
+//! lives in the [`uart_16550`] crate (its `unsafe` stays there); this
+//! module keeps the exact public surface the kernel was built on: a
+//! zero-sized [`SerialPort`] with [`SerialPort::COM1`], [`SerialPort::init`]
+//! at our config (38400 baud, 8N1, FIFO on), polled
+//! [`SerialPort::read_byte`], `fmt::Write` mapping `\n` → `\r\n`, and the
+//! [`serial_print!`]/[`serial_println!`] macros with the stack-guard check.
+//!
+//! The type stays stateless — every use constructs a fresh crate handle
+//! (no `static mut`, no locking), so a print from the panic/exception path
+//! can never alias a `&mut` held by mainline.
 
-use crate::port::{inb, outb};
 use core::fmt;
+use uart_16550::backend::PioBackend;
+use uart_16550::{BaudRate, Config, Uart16550};
 
+/// COM1 register base (standard PC port).
 const COM1_BASE: u16 = 0x3F8;
 
 /// A polled UART at a fixed COM-port base.
@@ -18,61 +28,68 @@ pub struct SerialPort {
 impl SerialPort {
     pub const COM1: Self = Self { _private: () };
 
+    /// A fresh crate handle for COM1, built per call — deliberately no
+    /// shared `static` state: a print from an exception or the panic
+    /// handler must never alias a `&mut` held by mainline. Interleaving
+    /// is at worst another print between our bytes (lines interleave,
+    /// state never corrupts).
+    fn uart(self) -> Uart16550<PioBackend> {
+        // SAFETY: `COM1_BASE..+8` is the standard 16550 register range
+        // (`new_port`'s contract: all 8 registers reachable from the
+        // base), and port I/O to a UART cannot violate memory safety.
+        // Single-core boot; the handle is a plain value, not shared.
+        // Infallible for 0x3F8: `new_port` only rejects u16 overflow of
+        // `base + 7`.
+        unsafe { Uart16550::new_port(COM1_BASE) }
+            .expect("COM1 (0x3F8) always fits the 16550 register range")
+    }
+
     /// Program the UART: disable interrupts, 8N1, FIFO on, divisor 3
     /// (38400 baud — irrelevant under QEMU, sane for real hardware).
     ///
     /// Idempotent: reprogramming identical register values is harmless, so
     /// the panic path may call it even if `kernel_main` already did.
     pub fn init(self) {
-        // SAFETY: COM1_BASE..+8 is the standard 16550 register range; port
-        // I/O to a UART cannot violate memory safety. Boot code is
-        // single-threaded with interrupts disabled, so no interleaving.
-        unsafe {
-            outb(COM1_BASE + 1, 0x00); // disable all interrupts
-            outb(COM1_BASE + 3, 0x80); // DLAB on
-            outb(COM1_BASE, 0x03); // divisor low byte
-            outb(COM1_BASE + 1, 0x00); // divisor high byte
-            outb(COM1_BASE + 3, 0x03); // 8N1, DLAB off
-            outb(COM1_BASE + 2, 0xC7); // FIFO: enable, clear, 14-byte threshold
-            outb(COM1_BASE + 4, 0x0B); // RTS/DSR/OUT2 enabled
-        }
+        let mut uart = self.uart();
+        // `Config::DEFAULT` already matches our old `outb` sequence —
+        // IER=0 (no interrupts), 8N1, FIFO enabled with the 14-byte
+        // trigger (our old 0xC7), MCR DTR|RTS|OUT2 (our old 0x0B) — and
+        // only the baud rate differs from its 9600 default: 38400 is
+        // divisor 3 at the crate's 1.8432 MHz clock, exactly what
+        // DLAB+DLL/DLM used to program.
+        let config = Config {
+            baud_rate: BaudRate::from_integer(38_400),
+            ..Config::DEFAULT
+        };
+        // Never halt on failure: a dead UART (`DeviceNotPresent`) must
+        // not stop the panic path — output degrades, the kernel does not
+        // die. The crate's init also runs a scratch-register presence
+        // check and drains stale RX data; both are standard and
+        // harmless when repeated.
+        let _ = uart.init(config);
     }
 
-    /// Write one byte, spinning until the transmit holding register is empty.
+    /// Write one byte, spinning until the transmit holding register is
+    /// empty (the crate polls `LSR::THR_EMPTY`, the same bit 5 we did).
     fn write_byte(self, byte: u8) {
-        // SAFETY: standard COM1 register range (const above); polled
-        // port I/O. Reentrancy: the IRQ0 handler never prints, so the
-        // only nesting possible is an exception handler printing its
-        // own line between our bytes — interleaved lines at worst,
-        // never corrupted state.
-        unsafe {
-            while inb(COM1_BASE + 5) & 0x20 == 0 {
-                core::hint::spin_loop();
-            }
-            outb(COM1_BASE, byte);
-        }
+        self.uart().send_bytes_exact(&[byte]);
     }
 
     /// Poll for one received byte: `None` when the receiver holding
-    /// register is empty. This is the shell console's input path —
+    /// register is empty — the crate's `try_receive_byte` is exactly our
+    /// LSR data-ready check. This is the shell console's input path,
     /// polled like the TX side; interrupt-driven RX arrives with the
     /// keyboard/IRQ milestone.
     pub fn read_byte(self) -> Option<u8> {
-        // SAFETY: standard COM1 register range; polled port I/O,
-        // single-core (the caller owns the only reader slot).
-        unsafe {
-            if inb(COM1_BASE + 5) & 0x01 == 0 {
-                None
-            } else {
-                Some(inb(COM1_BASE))
-            }
-        }
+        self.uart().try_receive_byte().ok()
     }
 }
 
 impl fmt::Write for SerialPort {
     /// Map `\n` to CRLF so terminals and `QEMU -serial file:` output read
-    /// sanely. Never returns `Err`.
+    /// sanely. Never returns `Err`. Deliberately *not* the crate's
+    /// `Uart16550Tty` wrapper: its `write_str` also echoes backspace,
+    /// which must not appear in the log stream.
     fn write_str(&mut self, s: &str) -> fmt::Result {
         for byte in s.bytes() {
             if byte == b'\n' {
