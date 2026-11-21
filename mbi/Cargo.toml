@@ -1,0 +1,15 @@
+[package]
+name = "mbi"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+# None on purpose: the range contract is pure arithmetic (no_std,
+# `forbid(unsafe_code)`) — it must be host-testable and tiny.
+
+[dev-dependencies]
+# Same read-path configuration the kernel uses (`default-features = false`
+# → no `builder`, no alloc), so the hostile-input tests exercise exactly
+# what ring 0 runs.
+multiboot2 = { version = "0.28", default-features = false }

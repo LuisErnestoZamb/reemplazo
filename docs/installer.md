@@ -80,7 +80,8 @@ Container contents *verified* with `dpkg -L`:
   buffers already live in `static`s — the same pattern applies to download buffers.
 - **No block/disk code exists anywhere** (*verified* by grep over all `*.rs`: no
   ATA/AHCI/IDE/partition/FS code). Every disk-related item below is new work.
-- `bootinfo` parses MBI tags but exposes only `bootloader_name`/mmap/framebuffer —
+- The `multiboot2` crate parses MBI tags but our kernel currently uses only
+  `bootloader_name`/mmap/framebuffer —
   **no cmdline and no multiboot2 module tags yet** (small, bounded additions).
 
 ### 1.3 Certificates on the hosts we may fetch from *(verified with `openssl s_client`)*
@@ -109,7 +110,8 @@ This constrains URL choice more than anything else (§5).
    }
    menuentry "live" { multiboot2 /boot/kernel.elf; boot }
    ```
-   `bootinfo` gains a module-tag accessor; the kernel walks the tar in memory.
+   The kernel reads `info.command_line_tag()` / `info.module_tags()`;
+   the tar is walked in memory.
 2. **(b) target-disk selection** — needs the block driver (§3), a `disks` listing
    builtin, and an explicit typed confirmation before anything is written (serial UX,
    `kernel/src/shell.rs` style).
@@ -475,7 +477,8 @@ QEMU-verifiable on this Mac.
    from GRUB → FAT → multiboot2. *This is the "bootable installer" milestone — the
    offline installer is end-to-end done at this point (payload files = running
    kernel's own image via `module2`, milestone 5, or a hardcoded minimal set first).*
-5. **`MOD_OK` — payload.tar as multiboot2 module.** `bootinfo` parses module tags;
+5. **`MOD_OK` — payload.tar as multiboot2 module.** the `multiboot2` crate's
+   `module_tags()` parses module tags;
    grub.cfg gets the `install` menuentry with `module2 /boot/payload.tar`; kernel
    walks ustar headers, prints file list + SHA-256, `xtask iso` builds `payload.tar`.
    *Verify:* `MOD_OK` in the regular boot smoke (CD path), file list matches
@@ -544,7 +547,7 @@ Milestones 1–3 are strictly sequential; 5 and 6 are independent of each other;
 Local (verified in this checkout): `xtask/src/main.rs` (`iso()`, `smoke()`,
 `qemu_std_args()`), `tools/Dockerfile`, `iso/boot/grub/grub.cfg`,
 `kernel/src/{main,tcp,tls,shell}.rs`, `net/src/http.rs` (`ResponseParser`),
-`bootinfo/src/lib.rs`, `kernel/Cargo.toml`
+`mbi/src/lib.rs` + `mbi/tests/hostile.rs`, `kernel/Cargo.toml`
 (pinned `embedded-tls` rev `63c59a1`), container inspection via `dpkg -L`, `grub-mkimage`
 size measurements, `qemu-system-x86_64 -device help`, `openssl s_client` chain checks
 (2026-11-21).

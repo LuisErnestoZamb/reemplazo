@@ -1,9 +1,10 @@
 //! Kernel entry point after the 32→64-bit trampoline in `entry.S`.
 //!
-//! Flow: init COM1 → validate Multiboot2 magic → parse+report the boot
-//! information → arm interrupts (IDT, PIC remap, PIT) → prove exception
-//! and timer paths → park the CPU. All user/hardware-provided data is
-//! treated as untrusted: bounds-checked by the `bootinfo` crate,
+//! Flow: init COM1 → validate Multiboot2 magic → range-check + load the
+//! boot information → arm interrupts (IDT, PIC remap, PIT) → prove
+//! exception and timer paths → park the CPU. All user/hardware-provided
+//! data is treated as untrusted: range-checked against the identity map
+//! (the `mbi` crate), parsed by the `multiboot2` crate,
 //! `Result`-propagated, no `unwrap`.
 
 #![no_std]
@@ -28,15 +29,12 @@ mod shell;
 mod tcp;
 mod tls;
 
-use bootinfo::{BootInfo, ParseError};
 use core::panic::PanicInfo;
+use multiboot2::{
+    BootInformation, BootInformationHeader, FramebufferType, LoadError, MemoryAreaType,
+};
 
 core::arch::global_asm!(include_str!("entry.S"), options(att_syntax));
-
-/// Highest `total_size` we'll read from a bootloader-supplied structure.
-/// Real Multiboot2 info is a few KiB; 1 MiB is a generous sanity bound
-/// that prevents constructing a slice over unrelated memory.
-const MBI_MAX_BYTES: usize = 1 << 20;
 
 /// Called from `entry.S` with System V AMD64 args.
 ///
@@ -183,61 +181,81 @@ mod guard {
     }
 }
 
+/// Why [`read_mbi`] refused the bootloader's handoff — printed with `{:?}`
+/// on the `FATAL: bad multiboot2 info` line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MbiError {
+    /// Our range pre-check rejected the address/size (GRUB data is
+    /// untrusted; see [`mbi::RangeError`]).
+    Range(mbi::RangeError),
+    /// The `multiboot2` crate rejected the structure itself (null,
+    /// alignment, malformed tag walk, missing end tag).
+    Load(LoadError),
+}
+
 /// Read and validate the Multiboot2 information structure.
 ///
 /// # Safety
 /// See [`kernel_main`]: `addr` is the bootloader-provided physical address,
 /// identity-mapped, not aliased mutably (single-core boot, interrupts off).
-fn read_mbi(addr: u64) -> Result<BootInfo<'static>, ParseError> {
-    // The spec places the structure below 4 GiB (EBX is 32-bit);
-    // reject anything our identity map or sanity bound wouldn't cover.
-    if addr == 0 || addr > 0xFFFF_FFFF {
-        return Err(ParseError::TooSmall); // unreachable-by-GRUB: treat as invalid
-    }
+fn read_mbi(addr: u64) -> Result<BootInformation<'static>, MbiError> {
+    // The spec places the structure below 4 GiB (EBX is 32-bit); reject
+    // anything the identity map or sanity bound wouldn't cover. Runs
+    // *before* the first read at `addr` — untrusted pointer first.
+    mbi::check_addr(addr).map_err(MbiError::Range)?;
 
-    // SAFETY: addr < 4 GiB is inside the identity map built in entry.S;
-    // reading 4 bytes there cannot fault and no one mutates it concurrently.
+    // SAFETY: `check_addr` proved addr ∈ (0, 4 GiB], inside the identity
+    // map built in entry.S; reading 4 bytes there cannot fault and no one
+    // mutates it concurrently.
     let total = unsafe { core::ptr::read_unaligned((addr as *const u8).cast::<u32>()) } as usize;
-    if !(8..=MBI_MAX_BYTES).contains(&total) {
-        // Don't build a slice until total_size itself checks out.
-        return Err(ParseError::BadTotalSize {
-            declared: total as u32,
-            available: MBI_MAX_BYTES,
-        });
-    }
 
-    // SAFETY: total just validated (8..=1 MiB); the identity map covers
-    // addr..addr+total (< 4 GiB + 1 MiB... bounded by the check above only
-    // if addr <= 4GiB - 1MiB; guard explicitly to keep the slice in-map).
-    if addr
-        .checked_add(total as u64)
-        .is_none_or(|end| end > 0x1_0000_0000)
-    {
-        return Err(ParseError::TooSmall);
-    }
-    let bytes = unsafe { core::slice::from_raw_parts(addr as *const u8, total) };
+    // `total_size` sanity (8..= mbi::MBI_MAX_BYTES) plus the whole
+    // structure inside the map — again before any pointer over it is
+    // built (this is the SAFETY contract below, in two steps because the
+    // 4-byte read needs the address check first).
+    mbi::check_range(addr, total).map_err(MbiError::Range)?;
 
-    BootInfo::parse(bytes)
+    // SAFETY — the contract with the crate's pointer API: `load` takes a
+    // pointer, not a slice, so it cannot know the real buffer length and
+    // trusts us that `addr..addr+total` is valid readable memory. The
+    // range pre-checks above are exactly that: `total` ≤
+    // `mbi::MBI_MAX_BYTES`, `addr+total` ≤ 4 GiB, identity-mapped,
+    // single-core, no concurrent mutation. The crate re-reads
+    // `total_size` and validates the tag walk within it.
+    // Documented trade-off vs the old slice-based parser: a corrupt
+    // `total_size` that is still ≤ 1 MiB and holds a valid tag sequence
+    // is now *accepted* where `total > buffer len` used to be rejected —
+    // reads stay inside the pre-validated in-map range (no safety issue);
+    // `total_size()` may then over-reserve ≤ 1 MiB of frames (bounded,
+    // acceptable). That case has no pointer-API test equivalent (the
+    // crate cannot know the buffer length): it lives on as this contract
+    // comment plus `mbi::check_range`'s unit tests.
+    unsafe { BootInformation::load(addr as *const BootInformationHeader) }.map_err(MbiError::Load)
 }
 
 /// Serial report of what the bootloader told us — the boot milestone's
-/// human-readable proof.
-fn report_boot_info(info: &BootInfo) {
-    match info.bootloader_name() {
+/// human-readable proof (line formats kept human-equivalent to the old
+/// `bootinfo` report; the smoke asserts the flow, not the text).
+fn report_boot_info(info: &BootInformation) {
+    match info.boot_loader_name_tag().and_then(|t| t.name().ok()) {
         Some(name) => serial_println!("mbi: bootloader '{}'", name),
         None => serial_println!("mbi: bootloader name missing"),
     }
-    if let Some((lower, upper)) = info.basic_memory_kb() {
-        serial_println!("mbi: memory lower={}K upper={}K", lower, upper);
+    if let Some(mem) = info.basic_memory_info_tag() {
+        serial_println!(
+            "mbi: memory lower={}K upper={}K",
+            mem.memory_lower(),
+            mem.memory_upper()
+        );
     }
-    match info.memory_map() {
+    match info.memory_map_tag() {
         Some(map) => {
             let mut regions = 0usize;
             let mut available_bytes = 0u64;
-            for region in map {
+            for area in map.memory_areas() {
                 regions += 1;
-                if region.is_available() {
-                    available_bytes = available_bytes.saturating_add(region.length);
+                if area.typ() == MemoryAreaType::Available {
+                    available_bytes = available_bytes.saturating_add(area.size());
                 }
             }
             serial_println!(
@@ -248,16 +266,40 @@ fn report_boot_info(info: &BootInfo) {
         }
         None => serial_println!("mbi: no memory map provided"),
     }
-    if let Some(fb) = info.framebuffer() {
-        serial_println!(
-            "mbi: framebuffer {:#x} {}x{}x{} pitch={} kind={}",
-            fb.addr,
-            fb.width,
-            fb.height,
-            fb.bpp,
-            fb.pitch,
-            fb.kind
-        );
+    // Kind as the old raw byte carried it: 0 indexed, 1 direct RGB,
+    // 2 EGA text (§3.6.12). `framebuffer_tag()` only yields `Ok` for
+    // known types, so the `Err` arm below is unreachable — printed via
+    // `{:?}` rather than inventing a number the crate no longer exposes.
+    match info.framebuffer_tag() {
+        Some(Ok(fb)) => match fb.buffer_type() {
+            Ok(kind) => {
+                let kind = match kind {
+                    FramebufferType::Indexed { .. } => 0,
+                    FramebufferType::RGB { .. } => 1,
+                    FramebufferType::Text => 2,
+                };
+                serial_println!(
+                    "mbi: framebuffer {:#x} {}x{}x{} pitch={} kind={}",
+                    fb.address(),
+                    fb.width(),
+                    fb.height(),
+                    fb.bpp(),
+                    fb.pitch(),
+                    kind
+                );
+            }
+            Err(e) => serial_println!(
+                "mbi: framebuffer {:#x} {}x{}x{} pitch={} kind={:?}",
+                fb.address(),
+                fb.width(),
+                fb.height(),
+                fb.bpp(),
+                fb.pitch(),
+                e
+            ),
+        },
+        Some(Err(e)) => serial_println!("mbi: framebuffer unknown type ({e:?})"),
+        None => {}
     }
     serial_println!("mbi: total_size={} bytes", info.total_size());
     serial_println!("BOOT_OK"); // machine-checked by `cargo xtask smoke`

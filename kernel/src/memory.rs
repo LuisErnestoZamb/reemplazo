@@ -9,8 +9,8 @@
 //! - Frames are 4 KiB; tracked space is 4 GiB because `entry.S` only
 //!   identity-maps the first 4 GiB (regions beyond that are ignored).
 
-use bootinfo::BootInfo;
 use core::sync::atomic::{AtomicU64, Ordering};
+use multiboot2::{BootInformation, MemoryAreaType};
 
 /// Frame size in bytes (x86-64 standard page).
 pub const FRAME_SIZE: u64 = 4096;
@@ -41,13 +41,17 @@ impl Frame {
 /// structure. Low memory (< 1 MiB) is reserved conservatively.
 ///
 /// Call once, before handing frames out. Idempotent.
-pub fn init(info: &BootInfo, mbi_addr: u64) {
-    if let Some(map) = info.memory_map() {
-        for region in map {
-            if region.is_available() {
+pub fn init(info: &BootInformation, mbi_addr: u64) {
+    if let Some(map) = info.memory_map_tag() {
+        // `memory_areas()` asserts `entry_size == 24` (GRUB's §3.6.8
+        // value): a bootloader that lied panics into our loud panic path
+        // instead of mis-iterating — no UB, the tag walk was already
+        // bounds-validated by the crate.
+        for area in map.memory_areas() {
+            if area.typ() == MemoryAreaType::Available {
                 set_range(
-                    region.base,
-                    region.base.saturating_add(region.length),
+                    area.start_address(),
+                    area.start_address().saturating_add(area.size()),
                     false,
                 );
             }
@@ -179,7 +183,7 @@ fn must_alloc() -> Frame {
 
 /// Machine-checked allocator test: prints `MEM_OK` on success, otherwise
 /// dumps context and parks (so `cargo xtask smoke` fails on the marker).
-pub fn selftest(info: &BootInfo, mbi_addr: u64) {
+pub fn selftest(info: &BootInformation, mbi_addr: u64) {
     let f0 = free_count();
     serial_println!(
         "memory: {f0} frames free ({} KiB)",

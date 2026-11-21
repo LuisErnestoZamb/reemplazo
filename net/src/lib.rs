@@ -1,6 +1,6 @@
 //! Pure network-protocol logic: Ethernet/ARP/IPv4/UDP/ICMP frames,
 //! DNS messages and HTTP/1.1 responses — no I/O, no allocator, every
-//! length bounds-checked — host-testable like `bootinfo` and `pci`.
+//! length bounds-checked — host-testable like `mbi` and `pci`.
 
 #![no_std]
 #![forbid(unsafe_code)]

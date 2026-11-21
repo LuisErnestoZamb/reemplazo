@@ -65,10 +65,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bootinfo"
-version = "0.1.0"
-
-[[package]]
 name = "byteorder"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -182,7 +178,7 @@ checksum = "59600e2c2d636fde9b65e99cc6445ac770c63d3628195ff39932b8d6d7409903"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -210,6 +206,12 @@ dependencies = [
  "signature",
  "zeroize",
 ]
+
+[[package]]
+name = "elf"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "55dd888a213fc57e957abf2aa305ee3e8a28dbe05687a251f33b637cd46b0070"
 
 [[package]]
 name = "elliptic-curve"
@@ -392,12 +394,13 @@ dependencies = [
 name = "kernel"
 version = "0.1.0"
 dependencies = [
- "bootinfo",
  "embassy-crypto",
  "embassy-crypto-rustcrypto",
  "embedded-io",
  "embedded-tls",
  "log",
+ "mbi",
+ "multiboot2",
  "net",
  "pci",
  "rand_chacha",
@@ -417,6 +420,38 @@ name = "log"
 version = "0.4.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
+
+[[package]]
+name = "mbi"
+version = "0.1.0"
+dependencies = [
+ "multiboot2",
+]
+
+[[package]]
+name = "multiboot2"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7cf7daaa58aa8e20c758a65a0f33f6b7dd16888bf34bd8e53cf7c2ce3ac9a477"
+dependencies = [
+ "bitflags",
+ "elf",
+ "log",
+ "multiboot2-common",
+ "ptr_meta",
+ "thiserror",
+ "uefi-raw",
+]
+
+[[package]]
+name = "multiboot2-common"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b40486c7028ec9fa2382232962262a2063eb7a609621f5fc9276f554fd9d4c5e"
+dependencies = [
+ "ptr_meta",
+ "thiserror",
+]
 
 [[package]]
 name = "net"
@@ -523,6 +558,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "ptr_meta"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "743da816b98c921cdbe8628ef7381b76f25ecf4da599fc80aca90eae7ef70cc0"
+dependencies = [
+ "ptr_meta_derive",
+]
+
+[[package]]
+name = "ptr_meta_derive"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c8d9ca532f185d5d4db7a7c9d51420b452168ea1c2b913953281bd6fe1fcbd0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.10",
 ]
 
 [[package]]
@@ -645,6 +700,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "syn"
+version = "3.0.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ae9ccbea3a7b0b09443036490c8f34a8b1b760fd345e5c0dae0aac718faea79"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
+
+[[package]]
+name = "thiserror"
+version = "2.0.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09e52cb86a36cede5cb101bf8908837b3e4c6e5e59fe7fd85c23fb56200d189e"
+dependencies = [
+ "thiserror-impl",
+]
+
+[[package]]
+name = "thiserror-impl"
+version = "2.0.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe5197923287db20a58125f0bc85c062f7f2c892de97b18c356f9efb14b28524"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.10",
+]
+
+[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -658,6 +744,22 @@ checksum = "a97f2587e2352cdee51c1f55c3eef6ddd4bcb08a9119bfbce800dd4a198fc42a"
 dependencies = [
  "bitflags",
 ]
+
+[[package]]
+name = "uefi-raw"
+version = "0.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b86018f5a44661f30db808298ccfcbe326279239c4d17a347c5476065ff72c0"
+dependencies = [
+ "bitflags",
+ "uguid",
+]
+
+[[package]]
+name = "uguid"
+version = "2.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0c8352f8c05e47892e7eaf13b34abd76a7f4aeaf817b716e88789381927f199c"
 
 [[package]]
 name = "unicode-ident"
@@ -680,7 +782,7 @@ source = "git+https://github.com/embassy-rs/unitrait?rev=bb96601b3d293fa27d1ca28
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -732,7 +834,7 @@ checksum = "a5cbd820fe3e35fb38c83b6dc7e6b1618bc46e0cd10073ae94e8d52dc468d8b9"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.119",
 ]
 
 [[package]]

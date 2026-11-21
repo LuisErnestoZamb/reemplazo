@@ -76,7 +76,7 @@ fn sh(root: &Path, program: &str, args: &[&str]) -> bool {
 }
 
 fn check(root: &Path) -> bool {
-    // Host crates (xtask, bootinfo) and kernel are linted separately: the
+    // Host crates (xtask, mbi, net, …) and kernel are linted separately: the
     // kernel is no_std and only valid for x86_64-unknown-none, never host.
     sh(root, "cargo", &["fmt", "--all", "--check"])
         && sh(
@@ -87,7 +87,7 @@ fn check(root: &Path) -> bool {
                 "-p",
                 "xtask",
                 "-p",
-                "bootinfo",
+                "mbi",
                 "-p",
                 "net",
                 "-p",
@@ -119,7 +119,7 @@ fn check(root: &Path) -> bool {
             root,
             "cargo",
             &[
-                "test", "-p", "xtask", "-p", "bootinfo", "-p", "net", "-p", "pci", "-p", "rtc",
+                "test", "-p", "xtask", "-p", "mbi", "-p", "net", "-p", "pci", "-p", "rtc",
             ],
         )
         && build_kernel(root)
