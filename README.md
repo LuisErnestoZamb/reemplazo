@@ -78,7 +78,7 @@ All in Rust, all in this workspace:
 ```sh
 cargo xtask check   # fmt + clippy (host and kernel target) + tests + cross-build
 cargo xtask smoke   # build ISO, boot headless, assert serial markers in order
-cargo xtask smoke-install  # same + FAT16 IDE disk; assert BLK_OK + FAT_OK + FS_WRITE_OK
+cargo xtask smoke-install  # same + FAT16 IDE disk; assert BLK_OK + FAT_OK + FS_WRITE_OK + GIT_CHECKOUT_OK
 cargo xtask run     # interactive boot in QEMU (Ctrl-C quits)
 cargo test -p mbi <name>   # single test
 ```
@@ -87,7 +87,7 @@ The smoke test asserts each milestone's serial marker in order — boot
 markers within 30 s, then the keyboard phase within a further 15 s:
 
 ```
-BOOT_OK → VGA_OK → MEM_OK → ALLOC_OK → RTC_OK → PCI_OK → USB_KBD_OK → E1000_OK → NET_OK → PING_OK → DHCP_OK → DNS_OK → TCP_OK → TLS_OK → HTTP_OK → GIT_LSREMOTE_OK → SSH_KEXINIT_OK → SSH_KEX_OK → INT_OK → TUI_OK → EDITOR_OK → AI_CHAT_OK → BROWSER_FETCH_OK → AI_EDIT_OK → BROWSER_RENDER_OK → SHELL_OK → KEYBOARD_OK
+BOOT_OK → VGA_OK → MEM_OK → ALLOC_OK → RTC_OK → PCI_OK → USB_KBD_OK → E1000_OK → NET_OK → PING_OK → DHCP_OK → DNS_OK → TCP_OK → TLS_OK → HTTP_OK → GIT_LSREMOTE_OK → GIT_FETCH_OK → SSH_KEXINIT_OK → SSH_KEX_OK → INT_OK → TUI_OK → EDITOR_OK → AI_CHAT_OK → BROWSER_FETCH_OK → AI_EDIT_OK → BROWSER_RENDER_OK → SHELL_OK → KEYBOARD_OK
 ```
 
 `KEYBOARD_OK` is the keyboard milestone's end-to-end proof: after
@@ -98,9 +98,14 @@ alone does not count), proving i8042 → scancode decode → line
 discipline → builtin.
 `cargo xtask smoke-install` boots the same ISO with a 64 MiB FAT16 IDE
 disk attached and asserts `BLK_OK` (the ATA PIO probe), `FAT_OK` — the
-FAT mount plus a byte-exact `/README.TXT` read — and `FS_WRITE_OK`:
-the kernel *writes* `/RESULT.TXT`, re-mounts from scratch and reads it
-back byte-exact (with `/README.TXT` re-checked for clobbering).
+FAT mount plus a byte-exact `/README.TXT` read — `FS_WRITE_OK`: the
+kernel *writes* `/RESULT.TXT`, re-mounts from scratch and reads it
+back byte-exact (with `/README.TXT` re-checked for clobbering) — and
+`GIT_CHECKOUT_OK`: the depth-1 fetch's 8.3-representable root-level
+blobs are written into the FAT16 volume, re-mounted from scratch and
+`/README.md` is read back byte-exact (AGPL fragment checked). Nested
+paths and long names are counted as skipped until `fat` grows `mkdir`
+and LFN writes.
 
 **Notes:**
 
@@ -148,6 +153,7 @@ Milestones landed so far (see `git log` for details):
 - [x] TCP/IP stack migrated to **smoltcp** — hand-rolled frame/DHCP/DNS/TCP code replaced, ~2300 lines removed (docs/smoltcp-eval.md)
 - [x] TLS 1.3 client — HTTPS against github.com:443, pinned root certificate
 - [x] HTTP/1.1 client — `httparse` head + RFC 9112 body framing (HTTP_OK)
+- [x] git over HTTPS — smart-HTTP `ls-remote` advertisement (GIT_LSREMOTE_OK), depth-1 `fetch` via v0 `want`/`deepen 1`/`done` → `git-pack` decode → iterative tree walk (GIT_FETCH_OK), and a root-level checkout into FAT16 with re-mount read-back (GIT_CHECKOUT_OK, `smoke-install`)
 - [x] Shell — serial-console REPL with minimal builtins (ping, resolve, netinfo, …)
 - [x] Keyboard — polled i8042 + set-1 decode feeding the shell's line discipline (QEMU `sendkey` → `KEYBOARD_OK`; MacBook needs UHCI/HID)
 - [ ] sky2 driver (real hardware only)

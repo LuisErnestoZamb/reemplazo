@@ -1,7 +1,7 @@
 //! FAT filesystem — installer milestones FS1 (`FAT_OK`) and FS2
-//! (`FS_WRITE_OK`).
+//! (`FS_WRITE_OK`), plus G3's checkout write target.
 //!
-//! Two halves:
+//! Three pieces:
 //!
 //! - [`AtaDisk`], the block adapter: the ATA driver's sector reads
 //!   *and writes* behind `fat::BlockDevice`'s byte-range interface.
@@ -15,6 +15,10 @@
 //!   image was written from, print `FAT_OK`; then (FS2) *write*
 //!   `/RESULT.TXT`, re-mount from scratch, read it back byte-exact and
 //!   re-check `/README.TXT`, print `FS_WRITE_OK`.
+//! - [`checkout_root`] + [`read_back`], G3's disk write target: write
+//!   the fetched repo's 8.3-representable root-level blobs into the
+//!   volume, then re-mount and read `/README.md` back (the
+//!   `GIT_CHECKOUT_OK` proof in `crate::git_fetch`).
 //!
 //! ## Fail-closed, silent-when-absent
 //!
@@ -158,20 +162,7 @@ pub(crate) fn prove(dev: &ata::Drive) {
 fn write_proof(dev: &ata::Drive) {
     // Timestamps come from the CMOS RTC; a dead clock falls back to
     // the crate's documented fixed value (1980-01-01), never a guess.
-    let stamp = match crate::rtc::now_epoch() {
-        Some(epoch) => {
-            let clock = crate::rtc::from_epoch(epoch);
-            fat::Stamp {
-                year: clock.year,
-                month: clock.month,
-                day: clock.day,
-                hour: clock.hour,
-                minute: clock.minute,
-                second: clock.second,
-            }
-        }
-        None => fat::Stamp::FAT_EPOCH,
-    };
+    let stamp = stamp();
 
     // Step 1: the write (fresh mount — `/RESULT.TXT` may exist from a
     // previous run of the same image; `write_file` overwrites it).
@@ -224,6 +215,87 @@ fn write_proof(dev: &ata::Drive) {
     }
 
     serial_println!("FS_WRITE_OK"); // machine-checked by `cargo xtask smoke-install`
+}
+
+/// Write the fetched repo's root-level blobs into the FAT16 root
+/// (milestone G3's checkout half): one mount, one `write_file` per
+/// blob, returning `(written, skipped)`. `skipped` counts names this
+/// crate cannot *create* yet — `fat` writes 8.3 names only (no LFN
+/// writer) and has no `mkdir`, so nested paths never reach here and a
+/// long/exotic root name is refused with [`fat::Error::InvalidName`]
+/// rather than mangled. Any other failure (mount, I/O, disk full) is
+/// `FATAL: fs:` — a checkout that silently drops a write would be a
+/// lying checkout.
+pub(crate) fn checkout_root(dev: &ata::Drive, files: &[(&[u8], &[u8])]) -> (usize, usize) {
+    let stamp = stamp();
+    let disk = AtaDisk(dev);
+    let fs = match fat::Fat16::mount(&disk) {
+        Ok(fs) => fs,
+        Err(e) => fatal(e),
+    };
+    let (mut written, mut skipped) = (0usize, 0usize);
+    let mut path = [0u8; 16];
+    for &(name, data) in files {
+        // 8 + '.' + 3 is the longest 8.3 name; anything longer cannot
+        // be created and is counted as skipped before the call.
+        if name.is_empty() || name.len() > 12 {
+            skipped += 1;
+            continue;
+        }
+        let Some(slot) = path.get_mut(..name.len() + 1) else {
+            skipped += 1;
+            continue;
+        };
+        slot[0] = b'/';
+        slot[1..].copy_from_slice(name);
+        let path_str = match core::str::from_utf8(&path[..name.len() + 1]) {
+            Ok(path) => path,
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
+        };
+        match fs.write_file(path_str, data, stamp) {
+            Ok(()) => written += 1,
+            Err(fat::Error::InvalidName) => skipped += 1,
+            Err(e) => fatal(e),
+        }
+    }
+    (written, skipped)
+}
+
+/// Re-mount from scratch and read `path` back into `out` (the G3
+/// checkout proof). A fresh mount means the bytes can only come from
+/// the device; any failure is `FATAL: fs:`.
+pub(crate) fn read_back(dev: &ata::Drive, path: &str, out: &mut [u8]) -> usize {
+    let disk = AtaDisk(dev);
+    let fs = match fat::Fat16::mount(&disk) {
+        Ok(fs) => fs,
+        Err(e) => fatal(e),
+    };
+    match fs.read_file(path, out) {
+        Ok(n) => n,
+        Err(e) => fatal(e),
+    }
+}
+
+/// The write timestamp: the CMOS RTC, or FAT's documented fixed epoch
+/// when the clock is unavailable (never a guess).
+fn stamp() -> fat::Stamp {
+    match crate::rtc::now_epoch() {
+        Some(epoch) => {
+            let clock = crate::rtc::from_epoch(epoch);
+            fat::Stamp {
+                year: clock.year,
+                month: clock.month,
+                day: clock.day,
+                hour: clock.hour,
+                minute: clock.minute,
+                second: clock.second,
+            }
+        }
+        None => fat::Stamp::FAT_EPOCH,
+    }
 }
 
 /// Fail-closed: name the refusal and stop the machine, so a broken

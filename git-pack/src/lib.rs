@@ -80,6 +80,10 @@ use miniz_oxide::inflate::TINFLStatus;
 use miniz_oxide::inflate::core::{DecompressorOxide, decompress, inflate_flags};
 use sha1::{Digest, Sha1};
 
+mod tree;
+
+pub use tree::{EntryMode, ObjectError, TreeEntry, parse_commit_tree, parse_tree_entry};
+
 /// The four-byte packfile signature.
 pub const PACK_MAGIC: [u8; 4] = *b"PACK";
 /// The only pack version this crate accepts.
@@ -816,6 +820,18 @@ pub fn decode_with_index(pack: &[u8]) -> Result<(Vec<Object>, PackIndex), Error>
 /// stall classification → objects in pack order.
 pub fn decode_with_limits(pack: &[u8], limits: &Limits) -> Result<Vec<Object>, Error> {
     decode_core(pack, limits).map(|(objects, _)| objects)
+}
+
+/// Like [`decode_with_limits`], but also returns the sha1 → offset
+/// [`PackIndex`] — needed by the kernel's `git fetch` (G3), which
+/// decodes under its own heap-bounded [`Limits`] *and* wants the
+/// in-memory `.idx` main table. Additive (no behaviour change to the
+/// existing entry points).
+pub fn decode_with_limits_and_index(
+    pack: &[u8],
+    limits: &Limits,
+) -> Result<(Vec<Object>, PackIndex), Error> {
+    decode_core(pack, limits)
 }
 
 fn decode_core(pack: &[u8], limits: &Limits) -> Result<(Vec<Object>, PackIndex), Error> {

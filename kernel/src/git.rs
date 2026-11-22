@@ -2,7 +2,9 @@
 //! docs/git-ssh-deps.md: TLS to `github.com`, GET the
 //! `git-upload-pack` advertisement of our public repo, parse it with
 //! the `git-pktline` crate, print the refs — the smoke test's
-//! `GIT_LSREMOTE_OK`.
+//! `GIT_LSREMOTE_OK`. The chosen start oid (`HEAD`, else
+//! `refs/heads/main`) is returned to the caller for G3's fetch
+//! ([`crate::git_fetch::fetch`]).
 //!
 //! TLS trust, framing and shutdown all come from [`crate::tls`]
 //! (pinned USERTrust root, RFC 9112 body framer); the pkt-line state
@@ -51,7 +53,7 @@ fn fatal(msg: &str) -> ! {
 
 /// Copy `name` into `buf` as printable ASCII, returning the str — raw
 /// wire bytes never reach the serial log (or the VGA mirror).
-fn sanitize<'a>(name: &[u8], buf: &'a mut [u8]) -> &'a str {
+pub(crate) fn sanitize<'a>(name: &[u8], buf: &'a mut [u8]) -> &'a str {
     let n = name.len().min(buf.len());
     for (slot, &b) in buf[..n].iter_mut().zip(&name[..n]) {
         *slot = if b.is_ascii_graphic() || b == b' ' {
@@ -69,7 +71,11 @@ fn sanitize<'a>(name: &[u8], buf: &'a mut [u8]) -> &'a str {
 /// git-client wire path end to end (TLS → smart HTTP → pkt-line).
 /// Any protocol violation is `fatal` — a git client that skips a bad
 /// line is a git client that lies about what the server said.
-pub fn ls_remote(stack: &mut Stack, ip: Ipv4Address) {
+///
+/// Returns the object id the clone starts from: `HEAD` when the
+/// advertisement has one, else `refs/heads/main` — the input to the
+/// G3 fetch ([`crate::git_fetch::fetch`]).
+pub fn ls_remote(stack: &mut Stack, ip: Ipv4Address) -> [u8; 20] {
     let handle = stack.tcp3_handle;
     let tls = tls::tls_open(stack, handle, ip, HOST, LOCAL_PORT);
 
@@ -96,14 +102,26 @@ pub fn ls_remote(stack: &mut Stack, ip: Ipv4Address) {
     let mut refs = Refs::new(body);
     let mut name_buf = [0u8; SANITIZE_CAP];
     let mut count = 0usize;
+    let mut head: Option<[u8; 20]> = None;
+    let mut main_branch: Option<[u8; 20]> = None;
     loop {
         match refs.next_ref() {
             Ok(Some(r)) => {
+                // Advertisement ref lines end with LF (the pkt-line
+                // payload includes it); strip it before comparing or
+                // logging, so names stay exact and the log clean.
+                let raw_name = r.name.strip_suffix(b"\n").unwrap_or(r.name);
                 // Sanitize before the macro: the serial macros
                 // evaluate their arguments twice (VGA + UART), so the
                 // expression must stay side-effect free.
-                let name = sanitize(r.name, &mut name_buf);
+                let name = sanitize(raw_name, &mut name_buf);
                 serial_println!("git: {name} {}", r.oid); // oid is 40 hex
+                let oid = parse_oid(r.oid);
+                if raw_name == b"HEAD" {
+                    head = oid;
+                } else if raw_name == b"refs/heads/main" {
+                    main_branch = oid;
+                }
                 count += 1;
             }
             Ok(None) => break,
@@ -121,5 +139,34 @@ pub fn ls_remote(stack: &mut Stack, ip: Ipv4Address) {
     let caps = sanitize(caps, &mut name_buf);
     serial_println!("git: {count} refs, capabilities: {caps}");
 
+    let Some(start) = head.or(main_branch) else {
+        fatal("advertisement has neither HEAD nor refs/heads/main");
+    };
+
     serial_println!("GIT_LSREMOTE_OK"); // machine-checked by `cargo xtask smoke`
+    start
+}
+
+/// 40 hex digits → the 20-byte object id. `None` on any non-hex byte
+/// (the parser already enforced the length); fail-closed, no indexing.
+pub(crate) fn parse_oid(hex: &str) -> Option<[u8; 20]> {
+    let bytes = hex.as_bytes();
+    if bytes.len() != 40 {
+        return None;
+    }
+    let mut oid = [0u8; 20];
+    let (pairs, _) = bytes.as_chunks::<2>();
+    for (slot, pair) in oid.iter_mut().zip(pairs) {
+        *slot = (hex_digit(pair[0])? << 4) | hex_digit(pair[1])?;
+    }
+    Some(oid)
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }

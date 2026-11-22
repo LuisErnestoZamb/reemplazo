@@ -299,7 +299,64 @@ pub(crate) fn tls_fetch(
         cap: READ_CAP,
         who: "tls",
     };
-    let (status, body_total, _loc_len) = exchange(tls, host, path, headers, policy, body, &mut []);
+    let mut req = [0u8; 512];
+    let Some(req_len) = http::build_request(&mut req, host, path, headers) else {
+        fatal_as(policy.who, "GET request does not fit the buffer");
+    };
+    let (status, body_total, _loc_len) = exchange(tls, &req[..req_len], policy, body, &mut []);
+    (status, body_total)
+}
+
+/// A smart-HTTP request body and its media type (the `tls_post`
+/// argument bundle — keeps the call under clippy's argument budget).
+pub(crate) struct Post<'a> {
+    /// Request path (`/owner/repo.git/git-upload-pack`).
+    pub path: &'a str,
+    /// `Content-Type` of the request body.
+    pub content_type: &'a str,
+    /// The pkt-line request stream.
+    pub body: &'a [u8],
+}
+
+/// POST variant of [`tls_fetch`] for the smart-HTTP git fetch (G3):
+/// the identical framing/validation policy, but the request is a
+/// `POST` whose body is the pkt-line want/deepen/done stream
+/// (http-protocol: "the client can request ... POST ... with the
+/// body"), and the response bound is the caller's — a pack is far
+/// larger than [`READ_CAP`]. Always requires a 200 and the
+/// `application/x-git-upload-pack-result` media type; any other
+/// response is fatal (see [`crate::git_fetch`]).
+pub(crate) fn tls_post(
+    tls: TlsConnection<'_, Stream<'_>, Aes128GcmSha256>,
+    host: &str,
+    post: Post<'_>,
+    expect_ct: &[u8],
+    cap: usize,
+    body: &mut [u8],
+) -> (u16, usize) {
+    let policy = Policy {
+        require_200: true,
+        expect_ct: Some(expect_ct),
+        cap,
+        who: "git",
+    };
+    let mut req = [0u8; 1024];
+    // The accept header is what tells http-backend to hand back the
+    // raw `git-upload-pack-result` rather than anything re-encoded.
+    let Some(req_len) = http::build_post(
+        &mut req,
+        host,
+        post.path,
+        post.content_type,
+        post.body,
+        &[
+            "Accept: application/x-git-upload-pack-result",
+            "User-Agent: reemplazo-git/0.1",
+        ],
+    ) else {
+        fatal_as(policy.who, "POST request does not fit the buffer");
+    };
+    let (status, body_total, _loc_len) = exchange(tls, &req[..req_len], policy, body, &mut []);
     (status, body_total)
 }
 
@@ -331,32 +388,31 @@ pub(crate) fn tls_fetch_any(
         cap: cfg.cap,
         who: cfg.who,
     };
-    exchange(tls, host, path, headers, policy, body, loc)
+    let mut req = [0u8; 512];
+    let Some(req_len) = http::build_request(&mut req, host, path, headers) else {
+        fatal_as(policy.who, "GET request does not fit the buffer");
+    };
+    exchange(tls, &req[..req_len], policy, body, loc)
 }
 
-/// The exchange both entry points share: send the GET, frame the
-/// response through the module's `PARSER` static (reset first — one
-/// parser runs every sequential exchange), bound the body, extract
-/// `Location`, then close per [`Policy`] + status. Every failure is
+/// The exchange all entry points share: send `request` (a complete
+/// HTTP/1.1 head plus any POST body), frame the response through the
+/// module's `PARSER` static (reset first — one parser runs every
+/// sequential exchange), bound the body, extract `Location`, then close
+/// per [`Policy`] + status. Every failure is
 /// `FATAL: {policy.who}: …` + [`crate::halt`] — a partial result is
 /// never returned.
 fn exchange(
     tls: TlsConnection<'_, Stream<'_>, Aes128GcmSha256>,
-    host: &str,
-    path: &str,
-    headers: &[&str],
+    request: &[u8],
     policy: Policy<'_>,
     body: &mut [u8],
     loc: &mut [u8],
 ) -> (u16, usize, usize) {
     let mut tls = tls;
-    // HTTP/1.1 GET over the established channel; `Connection: close`
-    // makes the server finish with close_notify + FIN.
-    let mut req = [0u8; 512];
-    let Some(req_len) = http::build_request(&mut req, host, path, headers) else {
-        fatal_as(policy.who, "GET request does not fit the buffer");
-    };
-    if let Err(e) = tls.write_all(&req[..req_len]) {
+    // `Connection: close` in the request makes the server finish with
+    // close_notify + FIN.
+    if let Err(e) = tls.write_all(request) {
         serial_println!("FATAL: {}: write failed: {:?}", policy.who, e);
         crate::halt();
     }

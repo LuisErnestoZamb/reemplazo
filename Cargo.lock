@@ -778,6 +778,7 @@ dependencies = [
  "embedded-io",
  "embedded-tls",
  "fat",
+ "git-pack",
  "git-pktline",
  "hmac",
  "linked_list_allocator",

@@ -26,6 +26,7 @@ mod e1000;
 mod entropy;
 mod fs;
 mod git;
+mod git_fetch;
 mod heap;
 mod idt;
 mod keyboard;
@@ -110,9 +111,13 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
     // back, byte for byte. FS2's FS_WRITE_OK then writes /RESULT.TXT,
     // re-mounts from scratch and reads it back (plus a README re-check).
     // No drive → `prove` never runs and nothing at all is printed (the
-    // diskless neutrality the main smoke requires).
+    // diskless neutrality the main smoke requires). The handle is kept
+    // for G3's checkout, which runs later in the network phase (so the
+    // probe/`BLK_OK` happens exactly once).
+    let mut detected_drive = None;
     if let Some(drive) = crate::ata::probe() {
         crate::fs::prove(&drive); // FAT_OK + FS_WRITE_OK — or `FATAL: fs:` + halt
+        detected_drive = Some(drive);
     }
 
     // QEMU's e1000 first (byte-identical history: on a machine with
@@ -144,7 +149,12 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
         serial_println!("DNS_OK"); // machine-checked by `cargo xtask smoke`
         stack.plain_get_smoke(github_ip, "github.com"); // TCP_OK
         tls::https_smoke(stack, github_ip, "github.com"); // TLS_OK + HTTP_OK
-        git::ls_remote(stack, github_ip); // GIT_LSREMOTE_OK
+        let head = git::ls_remote(stack, github_ip); // GIT_LSREMOTE_OK
+        // G3: the same repo, a second TLS connection: v0 upload-pack
+        // want/deepen=1/done → raw pack → `git-pack` decode + tree
+        // walk (GIT_FETCH_OK), then — only with a disk attached — the
+        // FAT16 checkout + re-mount read-back (GIT_CHECKOUT_OK).
+        git_fetch::fetch(stack, github_ip, head, detected_drive.as_ref());
         ssh::kex_smoke(stack, github_ip); // SSH_KEXINIT_OK + SSH_KEX_OK
     }
 
