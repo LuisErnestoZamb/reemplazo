@@ -170,10 +170,54 @@ pub fn run(stack: &mut Stack, payloads: &Payloads) -> ! {
                     .map(|c| (c as u8, Source::Keyboard))
             });
         let Some((byte, src)) = incoming else {
-            core::hint::spin_loop();
+            idle();
             continue;
         };
         disc.feed(byte, src, stack);
+    }
+}
+
+/// One trip through the shell's idle state, called when **both** input
+/// sources just reported empty.
+///
+/// The loop above is itself the pre-sleep drain: it reads the UART and
+/// the keyboard (PS/2 + the USB pump) until neither has a byte, so by
+/// the time we get here the UART's 16-byte FIFO is empty — nothing
+/// pending is left behind *before* we sleep. Then:
+///
+/// - **`hlt` with RFLAGS.IF set** parks the CPU until the next
+///   interrupt. The PIT ticks at [`pit::HZ`] (100 Hz), so a sleep lasts
+///   at most ~10 ms and the next keystroke/byte is picked up on the
+///   wake-up (both sources are polled, never IRQ-driven — IRQ1/IRQ4
+///   stay masked, `crate::keyboard`/`crate::serial` module docs).
+/// - **IF clear → `spin_loop`, never `hlt`:** with maskable interrupts
+///   disabled nothing would ever wake us, so the guard reads RFLAGS
+///   first (that is the whole point of the guard).
+///
+/// Documented FIFO risk (the note AGENTS.md's optional-idle item asks
+/// for): a byte arriving *during* the sleep waits for the tick, and 16
+/// bytes at 38400 baud is only ~4 ms of line time — shorter than one
+/// 10 ms tick. A sender faster than that (a full-rate paste to a real
+/// UART with no flow control) can overrun the FIFO while we sleep;
+/// QEMU's chardev back-pressures instead of dropping (so `cargo xtask
+/// run` loses nothing), and human typing is orders of magnitude slower
+/// than 3840 B/s either way. Interrupt-driven RX is the documented
+/// serial milestone that removes the window completely.
+fn idle() {
+    let rflags: u64;
+    // SAFETY: `pushfq`/`pop` is the documented way to read RFLAGS; the
+    // output register is written by the `pop` alone, and flags are
+    // preserved (`preserves_flags`). No `nostack`: `pushfq` pushes.
+    unsafe {
+        core::arch::asm!("pushfq", "pop {}", out(reg) rflags, options(preserves_flags));
+    }
+    if rflags & 0x200 != 0 {
+        // SAFETY: IF is set (checked above), and the IDT/PIC/PIT were
+        // armed before the shell ran — an IRQ0 tick resumes right after
+        // this instruction (the `test_interrupts` pattern).
+        unsafe { core::arch::asm!("hlt", options(nomem, nostack)) };
+    } else {
+        core::hint::spin_loop();
     }
 }
 
