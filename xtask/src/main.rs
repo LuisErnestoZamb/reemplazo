@@ -7,7 +7,8 @@
 //!   smoke   boot the ISO headless; assert serial markers in order,
 //!           then type a command through QEMU's monitor (KEYBOARD_OK)
 //!   smoke-install  boot with a FAT16 IDE disk; assert BLK_OK + FAT_OK
-//!           + FS_WRITE_OK (write + re-mount read-back)
+//!           + FS_WRITE_OK (write + re-mount read-back) + GIT_CHECKOUT_OK
+//!           (fetched root blobs written to FAT16, README.md read back)
 //!   run     build + iso + boot interactively (serial on stdio; keys
 //!           can also be injected via the printed monitor address)
 //!
@@ -675,7 +676,9 @@ fn run(root: &Path) -> bool {
 /// GDT, paging, mbi parse), the VGA text mirror, memory path, heap path
 /// (carve + global allocator), PCI scan, UHCI enumeration (HID boot
 /// keyboard via `usbwire` + `kernel/src/usb.rs`), e1000 driver, network path,
-/// DHCP/DNS/TCP clients, TLS and HTTP clients, interrupt path (IDT,
+/// DHCP/DNS/TCP clients, TLS and HTTP clients, git ls-remote and git
+/// fetch (smart-HTTP want/deepen/done POST, `git-pack` decode, tree
+/// walk), interrupt path (IDT,
 /// stubs, EOI, timer), the A1 screen layer (cell diff flush into the
 /// text buffer, ratatui backend, full-screen frame readback), the A2
 /// editor (gap buffer + line index edits with undo/redo, viewport frame
@@ -692,7 +695,7 @@ fn run(root: &Path) -> bool {
 /// It runs **without a disk**, so the `ata::probe` that sits between
 /// `PCI_OK` and `E1000_OK` stays silent here.
 fn smoke(root: &Path) -> bool {
-    const MARKERS: [&str; 25] = [
+    const MARKERS: [&str; 26] = [
         "BOOT_OK",
         "VGA_OK",
         "MEM_OK",
@@ -709,6 +712,7 @@ fn smoke(root: &Path) -> bool {
         "TLS_OK",
         "HTTP_OK",
         "GIT_LSREMOTE_OK",
+        "GIT_FETCH_OK",
         "SSH_KEXINIT_OK",
         "INT_OK",
         "TUI_OK",
@@ -725,16 +729,20 @@ fn smoke(root: &Path) -> bool {
     boot_assert(root, "smoke", &MARKERS, None, true)
 }
 
-/// Installer milestones 1 + FS1 + FS2 (`BLK_OK`, `FAT_OK`,
-/// `FS_WRITE_OK`): build the ISO, write a 64 MiB
+/// Installer milestones 1 + FS1 + FS2 + G3's checkout (`BLK_OK`,
+/// `FAT_OK`, `FS_WRITE_OK`, `GIT_CHECKOUT_OK`): build the ISO, write a
+/// 64 MiB
 /// `target/iso-root/disk.img` that is a **valid FAT16 volume** carrying
 /// the `ata` magic in its boot sector's bootstrap area (see
 /// [`write_disk_image`]), boot with the image attached as an IDE drive,
 /// and require the kernel's `BLK_OK` (the ATA probe accepted LBA0),
 /// `FAT_OK` (the kernel mounted that volume and read `/README.TXT`
-/// back byte for byte) and `FS_WRITE_OK` (the kernel *wrote*
+/// back byte for byte), `FS_WRITE_OK` (the kernel *wrote*
 /// `/RESULT.TXT`, re-mounted from scratch and read it back byte-exact,
-/// with `/README.TXT` re-checked for clobbering) in that order.
+/// with `/README.TXT` re-checked for clobbering) and `GIT_CHECKOUT_OK`
+/// (the depth-1 fetch wrote its 8.3 root blobs into the volume and
+/// re-read `/README.md` byte-exact, AGPL fragment checked) in that
+/// order.
 ///
 /// Note the image is created **after** `iso()` (which wipes
 /// `target/iso-root`) and lives inside it, so the container's `/iso`
@@ -751,7 +759,7 @@ fn smoke_install(root: &Path) -> bool {
     boot_assert(
         root,
         "smoke-install",
-        &["BLK_OK", "FAT_OK", "FS_WRITE_OK"],
+        &["BLK_OK", "FAT_OK", "FS_WRITE_OK", "GIT_CHECKOUT_OK"],
         Some(&disk),
         false,
     )

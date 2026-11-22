@@ -11,6 +11,11 @@ mbi = { path = "../mbi" }
 # exception (a) — `gix-packetline` is std-only; rationale and the
 # adversarial test suite live in the crate's docs.
 git-pktline = { path = "../git-pktline" }
+# Packfile v2 decoder (G3a of docs/git-ssh-deps.md §A.4): from-scratch
+# under dependency-policy exception (a) — `gix-pack` is std-only; the
+# format review and adversarial suite live in the crate's docs. G3's
+# `git fetch` decodes the upload-pack reply with it.
+git-pack = { path = "../git-pack" }
 # SSH wire codec (S1 of docs/git-ssh-deps.md §B): from-scratch under
 # dependency-policy exception (a) — `russh` is std-only with an
 # advisory history, `ssh-protocol` is a WIP facade; rationale and the

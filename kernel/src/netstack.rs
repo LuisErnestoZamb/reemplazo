@@ -273,11 +273,10 @@ pub struct LeaseInfo {
 
 /// Everything the stack lives in, `const`-constructible for a
 /// `static mut` (the same idiom as the TLS record buffers; measured
-/// sizes in docs/smoltcp-eval.md §1.6 — ~11 KiB, plus the second,
-/// third, fourth, fifth, sixth and seventh TCP pairs the sequential
-/// smoke connections need ≈ +46 KiB).
+/// sizes in docs/smoltcp-eval.md §1.6 — ~11 KiB, plus the seven extra
+/// TCP pairs the sequential smoke connections need ≈ +56 KiB).
 pub struct Storage {
-    pub slots: [SocketStorage<'static>; 10],
+    pub slots: [SocketStorage<'static>; 11],
     /// First connection (the plain-HTTP proof).
     pub tcp_rx: [u8; 4096],
     pub tcp_tx: [u8; 4096],
@@ -306,6 +305,13 @@ pub struct Storage {
     /// (local port 49165), recycled the same way between redirect hops.
     pub tcp7_rx: [u8; 4096],
     pub tcp7_tx: [u8; 4096],
+    /// Eighth connection (git fetch, milestone G3): the smart-HTTP
+    /// POST carrying the want/deepen/done request and the pack reply
+    /// (local port 49166). The pack is far larger than this buffer —
+    /// smoltcp refills it as [`tls::tls_post`] drains, so 4 KiB is
+    /// throughput, not a size limit.
+    pub tcp8_rx: [u8; 4096],
+    pub tcp8_tx: [u8; 4096],
     pub icmp_rx_pkts: [icmp::PacketMetadata; 1],
     pub icmp_rx: [u8; 256],
     pub icmp_tx_pkts: [icmp::PacketMetadata; 1],
@@ -317,7 +323,7 @@ pub struct Storage {
 impl Storage {
     pub const fn new() -> Self {
         Storage {
-            slots: [SocketStorage::EMPTY; 10],
+            slots: [SocketStorage::EMPTY; 11],
             tcp_rx: [0; 4096],
             tcp_tx: [0; 4096],
             tcp2_rx: [0; 4096],
@@ -332,6 +338,8 @@ impl Storage {
             tcp6_tx: [0; 4096],
             tcp7_rx: [0; 4096],
             tcp7_tx: [0; 4096],
+            tcp8_rx: [0; 4096],
+            tcp8_tx: [0; 4096],
             icmp_rx_pkts: [icmp::PacketMetadata::EMPTY; 1],
             icmp_rx: [0; 256],
             icmp_tx_pkts: [icmp::PacketMetadata::EMPTY; 1],
@@ -363,6 +371,10 @@ pub struct Stack {
     pub tcp6_handle: SocketHandle,
     /// Browser fetch (B1): TLS hop, local port 49165.
     pub tcp7_handle: SocketHandle,
+    /// git fetch (G3): the smart-HTTP POST that carries the pack,
+    /// local port 49166 — like every sequential smoke connection it
+    /// needs its own socket (TIME-WAIT).
+    pub tcp8_handle: SocketHandle,
     pub icmp_handle: SocketHandle,
     pub dns_handle: SocketHandle,
     /// Added only after PING_OK (R7 — see module docs).
@@ -398,6 +410,8 @@ impl Stack {
             tcp6_tx,
             tcp7_rx,
             tcp7_tx,
+            tcp8_rx,
+            tcp8_tx,
             icmp_rx_pkts,
             icmp_rx,
             icmp_tx_pkts,
@@ -446,6 +460,10 @@ impl Stack {
             tcp::SocketBuffer::new(&mut tcp7_rx[..]),
             tcp::SocketBuffer::new(&mut tcp7_tx[..]),
         ));
+        let tcp8_handle = sockets.add(tcp::Socket::new(
+            tcp::SocketBuffer::new(&mut tcp8_rx[..]),
+            tcp::SocketBuffer::new(&mut tcp8_tx[..]),
+        ));
         let icmp_handle = sockets.add(icmp::Socket::new(
             icmp::PacketBuffer::new(&mut icmp_rx_pkts[..], &mut icmp_rx[..]),
             icmp::PacketBuffer::new(&mut icmp_tx_pkts[..], &mut icmp_tx[..]),
@@ -459,6 +477,7 @@ impl Stack {
             tcp5_handle,
             tcp6_handle,
             tcp7_handle,
+            tcp8_handle,
         ] {
             // With `socket-tcp-reno` enabled Reno is already the
             // default; setting it documents the choice (cubic is f64
@@ -482,6 +501,7 @@ impl Stack {
             tcp5_handle,
             tcp6_handle,
             tcp7_handle,
+            tcp8_handle,
             icmp_handle,
             dns_handle,
             dhcp_handle: None,

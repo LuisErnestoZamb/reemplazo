@@ -115,6 +115,26 @@ Honest sizing for a full clone (numbers derived from [pack-format](https://git-s
 | G6 | push: serialize full-object pack + idx, `receive-pack` state machine | **`GIT_PUSH_OK`** against a test repo | G5, G1 |
 | G7 | git over ssh (`git-upload-pack` exec channel) | **`GIT_SSH_OK`** | G2 + S4 (§B.4) |
 
+**Status (G3, landed 2026-11-22):** `GIT_FETCH_OK` is in the boot chain
+between `GIT_LSREMOTE_OK` and `SSH_KEXINIT_OK`. The kernel POSTs the v0
+`want <head> ofs-delta shallow` / `deepen 1` / flush / `done` / flush
+stream (no `side-band`, per
+[pack-protocol](https://git-scm.com/docs/pack-protocol#_packfile_negotiation))
+to `github.com/LuisErnestoZamb/reemplazo.git/git-upload-pack`, parses the
+`shallow` + `NAK` pkt-lines and hands the raw pack to `git-pack`, which
+verifies the trailer SHA-1 and returns the objects plus the sha1 →
+offset `PackIndex` (the in-memory `.idx` main table). An iterative
+commit → tree → blob walk then enforces depth/entry/path/bounds caps.
+**Deferred:** the **`.idx` file write** (the index exists in memory and
+is exercised, but no `.idx` bytes are written to disk yet) and the
+loose-object store — both belong to G4/G5's `clone` layout. **Partial
+G4:** `smoke-install`'s `GIT_CHECKOUT_OK` checks the fetched repo's
+8.3-representable **root-level** blobs (`README.md`, `AGENTS.md`,
+`LICENSE`, …) into the FAT16 volume and re-reads `/README.md`
+byte-exactly (AGPL fragment checked); nested paths and long names are
+counted as skipped because `fat` has no `mkdir`/LFN writer yet (the
+full tree checkout is the rest of G4).
+
 ---
 
 ## B. `ssh`
