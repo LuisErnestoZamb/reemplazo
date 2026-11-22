@@ -20,7 +20,7 @@ Estado: **hito 1 completado** (`e53295e`).kernel+apps separados por una frontera
 | Gate | cadena |
 |---|---|
 | `cargo xtask smoke` | 30 markers originales, byte-idénticos — el ISO no lleva módulo `hello` |
-| `cargo xtask smoke-user` | `BOOT_OK … SHELL_OK, ELF_OK, USER_RUN_OK, SYSCALL_OK, USER_RETURN_OK, SCHED_RR_OK, USER_YIELD_OK, USER_FAULT_OK` (27 marcadores) |
+| `cargo xtask smoke-user` | `BOOT_OK … SHELL_OK, ELF_OK, USER_RUN_OK, SYSCALL_OK, USER_CONSOLE_OK, USER_SHELL_OK, USER_RETURN_OK, SCHED_RR_OK, USER_YIELD_OK, USER_FAULT_OK` (30 marcadores) |
 | `cargo xtask smoke-ssh` | PASS (interop OpenSSH real, intento 1) |
 | `cargo xtask smoke-install` | temporalmente limitado por el presupuesto de 60 s con carga de host >7 (documentado; no es regresión) |
 
@@ -31,13 +31,14 @@ Estado: **hito 1 completado** (`e53295e`).kernel+apps separados por una frontera
 | 1 · frontera mínima | ✅ `e53295e` | — |
 | 2 · RR preventivo por PIT | ✅ (mergeado) | quantum 10 ticks, `Yield` real, #PF→kill con #PF real desde CPL3, `fxsave`/`fxrstor` por PCB; `userptr::set_vm` publicado en cada switch (hito 2b) |
 | 3 · consola de usuario | ✅ (mergeado) | syscalls 4–9 (`Read`, `VgaDims/PutCell/Clear/Flush/Peek`), `vgaservice.rs` con diff contra `0xb8000`, proceso `user/shell` con REPL; deuda: publicar `owns_console` desde el PCB |
-| 4 · FS | 📋 | `Open/Close/Read/Write/Stat`, fds por PCB, editor como proceso |
+| 4 · FS | 🔨 (agente activo) | `Open/Close/Read/Write/Stat`, fds por PCB, editor como proceso |
 | 5 · red/TLS | 📋 | handles opacos para `netstack`/`tls`, estados `Blocked`, migrar AI y browser |
 | 6 · git/ssh/instalador | 📋 | `Spawn/Waitpid`, IPC acotado, ELFs de usuario en p2 y `GRUB_EARLY_CFG` |
 | 7 · corte total | 📋 | borrar `kernel/src/apps/`, `shell::run` solo fallback, `USER_ONLY_OK` |
 
 ## Deuda y decisiones
 
+- **netinstall real (I2b)**: `netinstall-real <dev> yes` usa `api.github.com` sobre TLS con la raíz pinnada; el payload aún no está publicado (404), y el fetch desde el kernel en hardware real queda pendiente.
 - **Barra superior/launcher** (`kernel/src/apps/launcher.rs`, builtin `apps`): hoy dibuja la fila 0 del VGA en ring 0 con `screen::put` + `flush_diff`; en el hito 3/7 se convierte en el proceso `shell` de usuario, dibujando celdas por `VgaPutCell`/`VgaFlush` sobre el mismo servicio kernel de `flush_diff` (para no romper el readback de `0xb8000`). Su API de navegación (`keyboard::next_event`) ya es la misma que usaría el proceso.
 
 - **Qué se queda en ring 0 al final**: ATA/AHCI/e1000/sky2, PCI/PIC/PIT/IDT, memory/heap, `netstack` (smoltcp), `tls` + raíces, `fs/` + `install.rs`, VGA/serial, y el propio loader/scheduler/dispatch. Razones: sin IOMMU el DMA de usuario es inseguro; el NIC es polled y el stack necesita el PIT en ring 0; FAT16 `write` ya es no-atómico; el installer debe poder formatear antes de que exista un proceso.
