@@ -71,6 +71,19 @@ const POLL_LIMIT: u32 = 10_000_000;
 /// Must stay byte-identical to `DISK_MAGIC` in `xtask/src/main.rs`.
 const MAGIC: &[u8] = b"reemplazo-disk-v1";
 
+/// Magic pattern `xtask smoke-install` writes at LBA0 of the *target*
+/// image (`target.img`, the blank disk the installer may wipe) — a
+/// different string on purpose, so the source and target can never be
+/// confused. Must stay byte-identical to `TARGET_DISK_MAGIC` in
+/// `xtask/src/main.rs`.
+///
+/// Safety rule this encodes: the installer only ever formats a disk
+/// that carries this marker (fail-closed — an unmarked second disk is
+/// ignored, never wiped). Real-hardware installs with an unmarked disk
+/// go through the guided `install <id>` shell builtin instead
+/// (docs/installer.md §7.1, future milestone).
+const TARGET_MAGIC: &[u8] = b"reemplazo-target-v1";
+
 /// Byte offset of [`MAGIC`] inside LBA0 — the FAT boot sector's
 /// **bootstrap area** (62..510, the region after the BPB that FAT never
 /// parses). Must stay byte-identical to `DISK_MAGIC_OFFSET` in xtask.
@@ -100,10 +113,51 @@ pub(crate) struct Drive {
 }
 
 impl Drive {
+    /// Which unit on the channel this drive answers on (0 = master,
+    /// 1 = slave) — `crate::install` uses it to skip the *source*
+    /// disk when hunting for the target.
+    pub(crate) fn unit(&self) -> u8 {
+        self.unit
+    }
+
+    /// The IDENTIFY model string, sanitized for printing: trailing
+    /// spaces trimmed, every byte outside printable ASCII replaced
+    /// with `?` — the bytes come from the device itself, so they are
+    /// untrusted and must not reach the console raw (the
+    /// "sanitize before `serial_println!`" rule; the macro also
+    /// evaluates its arguments twice, hence writing into a
+    /// caller-provided buffer once instead of formatting per call).
+    /// All output bytes are ASCII by construction, so the `&str`
+    /// conversion cannot fail (`unwrap_or` keeps that honest without
+    /// a panic path).
+    pub(crate) fn model_name<'a>(&self, out: &'a mut [u8; 40]) -> &'a str {
+        let end = self
+            .model
+            .iter()
+            .rposition(|&b| b != b' ')
+            .map_or(0, |i| i + 1);
+        for (dst, &src) in out.iter_mut().take(end).zip(&self.model[..end]) {
+            *dst = if src.is_ascii_graphic() || src == b' ' {
+                src
+            } else {
+                b'?'
+            };
+        }
+        core::str::from_utf8(&out[..end]).unwrap_or("?")
+    }
+
     /// Read `buf.len() / 512` sectors (1..=256) starting at `lba`
     /// into `buf`, which must hold a whole number of sectors.
     /// Returns `false` on any error or poll-timeout — never blocks
     /// forever.
+    ///
+    /// **One `READ SECTORS` command per sector** (not one command for
+    /// the whole request): every command here is the exact
+    /// single-sector sequence the boot proofs exercise end to end, so
+    /// no multi-sector data-phase handshake (DRQ clear → re-assert
+    /// between sectors) is ever *assumed*. The per-command overhead is
+    /// ~10 port accesses per 512 bytes — noise next to the 256 word
+    /// transfers themselves.
     pub(crate) fn read_sectors(&self, lba: u32, buf: &mut [u8]) -> bool {
         let count = buf.len() / 512;
         if buf.is_empty() || !buf.len().is_multiple_of(512) || count > 256 {
@@ -117,31 +171,35 @@ impl Drive {
             return false;
         }
 
-        // SAFETY: fixed primary-channel ports (module docs); register
-        // widths match the ATA contract; single-core boot, IRQ14 masked.
-        unsafe {
-            // Select the unit first so the LBA registers below land on
-            // it, then the ≥400 ns settle time via alternate-status
-            // reads (0x3F6 reads have no INTRQ side effect).
-            outb(
-                DRIVE_HEAD,
-                0xE0 | (self.unit << 4) | (((lba >> 24) as u8) & 0x0F),
-            );
-            for _ in 0..4 {
-                let _ = inb(ALT_STATUS);
-            }
-            if !wait_bsy_clear() {
-                return false;
-            }
-            outb(SECTOR_COUNT, count as u8); // 256 sectors encodes as 0
-            outb(LBA_LOW, lba as u8);
-            outb(LBA_MID, (lba >> 8) as u8);
-            outb(LBA_HIGH, (lba >> 16) as u8);
-            outb(COMMAND, CMD_READ_SECTORS);
+        for i in 0..count {
+            // `end` above bounds `lba + i` inside the LBA28 window.
+            let sector_lba = lba + i as u32;
+            let sector = match buf.get_mut(i * 512..i * 512 + 512) {
+                Some(s) => s,
+                None => return false, // unreachable (count derived from len)
+            };
+            // SAFETY: fixed primary-channel ports (module docs); register
+            // widths match the ATA contract; single-core boot, IRQ14 masked.
+            unsafe {
+                // Select the unit first so the LBA registers below land on
+                // it, then the ≥400 ns settle time via alternate-status
+                // reads (0x3F6 reads have no INTRQ side effect).
+                outb(
+                    DRIVE_HEAD,
+                    0xE0 | (self.unit << 4) | (((sector_lba >> 24) as u8) & 0x0F),
+                );
+                for _ in 0..4 {
+                    let _ = inb(ALT_STATUS);
+                }
+                if !wait_bsy_clear() {
+                    return false;
+                }
+                outb(SECTOR_COUNT, 1);
+                outb(LBA_LOW, sector_lba as u8);
+                outb(LBA_MID, (sector_lba >> 8) as u8);
+                outb(LBA_HIGH, (sector_lba >> 16) as u8);
+                outb(COMMAND, CMD_READ_SECTORS);
 
-            // Whole sectors only (checked above), so the tail is empty.
-            let (sectors, _) = buf.as_chunks_mut::<512>();
-            for sector in sectors {
                 if !wait_drq() {
                     return false;
                 }
@@ -153,10 +211,13 @@ impl Drive {
                     pair[0] = word as u8;
                     pair[1] = (word >> 8) as u8;
                 }
+                // ERR after the last word means the transfer failed.
+                if inb(STATUS) & ST_ERR != 0 {
+                    return false;
+                }
             }
-            // ERR after the last word means the tail end failed.
-            inb(STATUS) & ST_ERR == 0
         }
+        true
     }
 
     /// Write `buf.len() / 512` sectors (1..=256) from `buf` starting at
@@ -166,11 +227,20 @@ impl Drive {
     /// capacity (FS2's device-side bound, mirrored from the read path).
     ///
     /// Protocol (PIO `WRITE SECTORS`, 0x30, no IRQ — polling only):
-    /// program the LBA/sector-count registers, issue the command, then
-    /// for each sector wait (bounded) for DRQ, push 256 words, and wait
-    /// (bounded) for the drive to consume the sector before the next
-    /// one — the final wait doubles as the command-completion check
-    /// (BSY clear, DRQ clear, no ERR). Drive-side write caches are not
+    /// **one command per sector**, each the exact single-sector
+    /// sequence FS2 proved end to end — select + ≥400 ns settle, bounded
+    /// BSY wait, program LBA/count, issue, bounded DRQ wait, push 256
+    /// words, bounded completion wait (BSY clear, DRQ clear, no ERR).
+    ///
+    /// Why not one command for the whole request (the I1 milestone hit
+    /// this the hard way): between data phases of a *multi-sector*
+    /// command the drive re-asserts DRQ for the next sector, so a
+    /// "wait for DRQ to go low" completion poll can miss the low window
+    /// entirely and spin to its budget — QEMU does exactly this. One
+    /// command per sector means the completion wait only ever runs
+    /// where it is proven: the command's final (only) sector. Cost:
+    /// ~10 extra port accesses per 512 bytes, next to the 256 words
+    /// the data phase moves anyway. Drive-side write caches are not
     /// flushed (`FLUSH CACHE` is future work — see `fat::write`'s
     /// crash-consistency note).
     pub(crate) fn write_sectors(&self, lba: u32, buf: &[u8]) -> bool {
@@ -186,32 +256,36 @@ impl Drive {
             return false;
         }
 
-        // SAFETY: fixed primary-channel ports (module docs); register
-        // widths match the ATA contract; single-core boot, IRQ14 masked
-        // (polling only — no DMA, no IRQ on this path either).
-        unsafe {
-            // Select the unit first so the LBA registers below land on
-            // it, then the ≥400 ns settle time via alternate-status
-            // reads (0x3F6 reads have no INTRQ side effect).
-            outb(
-                DRIVE_HEAD,
-                0xE0 | (self.unit << 4) | (((lba >> 24) as u8) & 0x0F),
-            );
-            for _ in 0..4 {
-                let _ = inb(ALT_STATUS);
-            }
-            if !wait_bsy_clear() {
-                return false;
-            }
-            outb(SECTOR_COUNT, count as u8); // 256 sectors encodes as 0
-            outb(LBA_LOW, lba as u8);
-            outb(LBA_MID, (lba >> 8) as u8);
-            outb(LBA_HIGH, (lba >> 16) as u8);
-            outb(COMMAND, CMD_WRITE_SECTORS);
+        for i in 0..count {
+            // `end` above bounds `lba + i` inside the LBA28 window.
+            let sector_lba = lba + i as u32;
+            let sector = match buf.get(i * 512..i * 512 + 512) {
+                Some(s) => s,
+                None => return false, // unreachable (count derived from len)
+            };
+            // SAFETY: fixed primary-channel ports (module docs); register
+            // widths match the ATA contract; single-core boot, IRQ14 masked
+            // (polling only — no DMA, no IRQ on this path either).
+            unsafe {
+                // Select the unit first so the LBA registers below land on
+                // it, then the ≥400 ns settle time via alternate-status
+                // reads (0x3F6 reads have no INTRQ side effect).
+                outb(
+                    DRIVE_HEAD,
+                    0xE0 | (self.unit << 4) | (((sector_lba >> 24) as u8) & 0x0F),
+                );
+                for _ in 0..4 {
+                    let _ = inb(ALT_STATUS);
+                }
+                if !wait_bsy_clear() {
+                    return false;
+                }
+                outb(SECTOR_COUNT, 1);
+                outb(LBA_LOW, sector_lba as u8);
+                outb(LBA_MID, (sector_lba >> 8) as u8);
+                outb(LBA_HIGH, (sector_lba >> 16) as u8);
+                outb(COMMAND, CMD_WRITE_SECTORS);
 
-            // Whole sectors only (checked above), so the tail is empty.
-            let (sectors, _) = buf.as_chunks::<512>();
-            for sector in sectors {
                 if !wait_drq() {
                     return false;
                 }
@@ -223,15 +297,15 @@ impl Drive {
                     outw(DATA, word);
                 }
                 // The drive clears DRQ once it has consumed the 256
-                // words; wait for that before offering the next sector,
-                // and (for the last one) for BSY to drop with no ERR —
-                // the bounded command-completion check.
+                // words; with no further sectors in this command that
+                // is the bounded command-completion check (BSY drop,
+                // DRQ drop, no ERR).
                 if !wait_drq_clear() {
                     return false;
                 }
             }
-            true
         }
+        true
     }
 }
 
@@ -250,14 +324,8 @@ pub(crate) fn probe() -> Option<Drive> {
         };
         let mut sector = [0u8; 512];
         if drive.read_sectors(0, &mut sector) && has_magic(&sector) {
-            // ATA pads model strings with spaces; keep the serial line
-            // printable even if a device reports garbage bytes.
-            let end = drive
-                .model
-                .iter()
-                .rposition(|&b| b != b' ')
-                .map_or(0, |i| i + 1);
-            let name = core::str::from_utf8(&drive.model[..end]).unwrap_or("<non-ascii>");
+            let mut name_buf = [0u8; 40];
+            let name = drive.model_name(&mut name_buf);
             let unit_name = if drive.unit == 0 { "master" } else { "slave" };
             let sectors = drive.sectors;
             serial_println!(
@@ -265,6 +333,30 @@ pub(crate) fn probe() -> Option<Drive> {
                 sectors / 2048
             );
             serial_println!("BLK_OK"); // machine-checked by `cargo xtask smoke-install`
+            return Some(drive);
+        }
+    }
+    None
+}
+
+/// Find the installer's *target* disk: the unit on the primary
+/// channel that is **not** `source_unit` and whose LBA0 carries
+/// [`TARGET_MAGIC`]. Prints **nothing** and returns `None` when no
+/// such disk exists — the diskless/single-disk neutrality every boot
+/// proof depends on (the main smoke has no disks at all; the FS1/FS2
+/// smoke has only the source). An unmarked second disk is *also* a
+/// silent `None`: the installer never wipes a disk it was not handed
+/// the target marker for (module docs of `crate::install`).
+pub(crate) fn probe_target(source_unit: u8) -> Option<Drive> {
+    for unit in [0u8, 1] {
+        if unit == source_unit {
+            continue;
+        }
+        let Some(drive) = identify(unit) else {
+            continue;
+        };
+        let mut sector = [0u8; 512];
+        if drive.read_sectors(0, &mut sector) && has_target_magic(&sector) {
             return Some(drive);
         }
     }
@@ -418,4 +510,19 @@ fn magic_checksum() -> u8 {
 fn has_magic(sector: &[u8; 512]) -> bool {
     let end = MAGIC_OFFSET + MAGIC.len();
     sector.get(MAGIC_OFFSET..end) == Some(MAGIC) && sector.get(end) == Some(&magic_checksum())
+}
+
+/// Same shape as [`has_magic`] for [`TARGET_MAGIC`] (its own wrapping
+/// sum — the marker identifies the wipe-able target disk, so it gets
+/// its own checksum byte and its own string).
+fn has_target_magic(sector: &[u8; 512]) -> bool {
+    let end = MAGIC_OFFSET + TARGET_MAGIC.len();
+    sector.get(MAGIC_OFFSET..end) == Some(TARGET_MAGIC)
+        && sector.get(end) == Some(&target_magic_checksum())
+}
+
+/// Wrapping-sum checksum byte that follows [`TARGET_MAGIC`] —
+/// duplicated in xtask's `write_target_image`.
+fn target_magic_checksum() -> u8 {
+    TARGET_MAGIC.iter().fold(0u8, |acc, &b| acc.wrapping_add(b))
 }

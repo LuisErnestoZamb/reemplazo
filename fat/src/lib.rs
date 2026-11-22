@@ -106,9 +106,16 @@
 #![forbid(unsafe_code)]
 
 mod dir;
+/// The formatter (mkfs): [`format::format_fat16`] derives the FAT16
+/// geometry from the device size and writes boot sector + FATs + root,
+/// self-checked against this crate's own reader — shared by xtask's
+/// `write_disk_image` and the kernel's installer (docs/installer.md
+/// §8.1 → §8.3).
+pub mod format;
 /// FS3's directory + long-name half: mkdir, nested paths, LFN writes and
 /// the alias rules live here.
 pub mod tree;
+pub use format::{FormatOpts, Geometry, format_fat16, geometry, geometry_with};
 /// The write half (FS2): [`write::Stamp`] and the writer's module docs
 /// (ordering, naming rule, refusals) live here.
 pub mod write;

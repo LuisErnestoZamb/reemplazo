@@ -84,6 +84,15 @@ dom = { path = "../dom" }
 # computed values are ours. `no_std` + `forbid(unsafe_code)`, zero deps,
 # adversarially host-tested in `csscore/tests/`.
 csscore = { path = "../csscore" }
+# GPT reader/writer (installer I1 — docs/installer.md §2(3)/§3.2):
+# from-scratch under dependency-policy exception (a) — "the OS
+# partitions itself … it is the only option" (no sfdisk anywhere, and
+# no maintained no_std GPT crate was adopted for a zero-dep,
+# `forbid(unsafe_code)` parser+writer); CRC32 is the documented §3.2
+# protocol glue. Rationale and the adversarial suite (bad CRC,
+# absurd entry counts, backup mismatch, overlap, MBR garbage) live in
+# the crate's docs.
+gptwire = { path = "../gptwire" }
 net = { path = "../net" }
 pci = { path = "../pci" }
 rtc = { path = "../rtc" }

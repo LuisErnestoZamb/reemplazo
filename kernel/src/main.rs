@@ -29,6 +29,7 @@ mod git;
 mod git_fetch;
 mod heap;
 mod idt;
+mod install;
 mod keyboard;
 mod keyfile;
 mod memory;
@@ -112,13 +113,28 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
     // back, byte for byte. FS2's FS_WRITE_OK then writes /RESULT.TXT,
     // re-mounts from scratch and reads it back (plus a README re-check).
     // No drive → `prove` never runs and nothing at all is printed (the
-    // diskless neutrality the main smoke requires). The handle is kept
-    // for G3's checkout, which runs later in the network phase (so the
-    // probe/`BLK_OK` happens exactly once).
-    let mut detected_drive = None;
-    if let Some(drive) = crate::ata::probe() {
-        crate::fs::prove(&drive); // FAT_OK + FS_WRITE_OK — or `FATAL: fs:` + halt
-        detected_drive = Some(drive);
+    // diskless neutrality the main smoke requires).
+    // The source disk (FS1/FS2's `disk.img`): probed once, kept for
+    // the offline proof *and* the network installer at the end of the
+    // boot chain (I2 needs the NIC, which is not up yet here).
+    let source_drive = crate::ata::probe();
+    // The install target is probed **once, here** — before either
+    // proof runs: the first install rewrites LBA0 (the protective
+    // MBR), which is where the `reemplazo-target-v1` wipe marker
+    // lives, so re-probing after `INST_OK` could never find it again.
+    // No source → never probed; no marked target → `None`, zero
+    // output (the diskless/single-disk neutrality both proofs keep).
+    let target_drive = source_drive
+        .as_ref()
+        .and_then(|drive| crate::ata::probe_target(drive.unit()));
+    if let Some(drive) = source_drive.as_ref() {
+        crate::fs::prove(drive); // FAT_OK + FS_WRITE_OK — or `FATAL: fs:` + halt
+        // Installer I1 (docs/installer.md §8.3): GPT + format p2 +
+        // payload copy + byte-exact re-read → INST_OK. Silent when no
+        // *marked* target disk is attached (single-disk and diskless
+        // boots print nothing extra); with one, every failure is
+        // `FATAL: install:` + halt.
+        crate::install::prove(drive, target_drive.as_ref());
     }
 
     // QEMU's e1000 first (byte-identical history: on a machine with
@@ -155,7 +171,7 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
         // want/deepen=1/done → raw pack → `git-pack` decode + tree
         // walk (GIT_FETCH_OK), then — only with a disk attached — the
         // FAT16 checkout + re-mount read-back (GIT_CHECKOUT_OK).
-        git_fetch::fetch(stack, github_ip, head, detected_drive.as_ref());
+        git_fetch::fetch(stack, github_ip, head, source_drive.as_ref());
         ssh::kex_smoke(stack, github_ip); // SSH_KEXINIT_OK + SSH_KEX_OK
     }
 
@@ -225,6 +241,17 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
         // it costs no network and can sit inside the same `Some(stack)`
         // branch; the screen is cleared after the proof.
         browser::css_smoke(); // BROWSER_CSS_OK
+    }
+
+    // I2 network installer (docs/installer.md §8.4): fetch
+    // `payload.tar` over our own stack (smoltcp + `net::http`, the
+    // in-container responder on 10.0.2.2:8080), walk the ustar
+    // headers, install onto the marked target, read back byte-exact →
+    // NETINST_OK. Gated on the target found above (probed only when
+    // the source disk exists) — silently skipped otherwise, so the
+    // diskless main smoke's marker chain stays untouched.
+    if let (Some(stack), Some(target)) = (stack.as_mut(), target_drive.as_ref()) {
+        crate::install::netprove(stack, Some(target));
     }
 
     // The shell is the kernel's idle state until a scheduler exists;
