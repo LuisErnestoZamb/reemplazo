@@ -72,18 +72,36 @@
 //! loud `FATAL: install: …` + `halt()` — the smoke can never pass on
 //! a half-written disk.
 //!
+//! ## Guided shell builtins (`disks` / `install` / `netinstall`)
+//!
+//! docs/installer.md §7.1's interactive path is implemented in
+//! `kernel/src/shell.rs` on top of three entry points here:
+//!
+//! - [`guided_install`] — the offline `install <device> yes`: the same
+//!   [`install_payload`] as `INST_OK`, behind a fail-soft pre-flight
+//!   (capacity, ISO modules, source volume) so a bad request returns to
+//!   the prompt instead of halting,
+//! - [`netinstall_run`] — the fallible core `NETINST_OK` also runs
+//!   (see there),
+//! - and the read-only inventory the shell builds from `ata::list` +
+//!   `ahci::list`, which is where the wipe-marker rule is enforced:
+//!   **only a disk carrying `reemplazo-target-v1` is ever written**,
+//!   with the device line (id, model, size) printed before anything
+//!   happens and the literal confirmation `yes` required on top. An
+//!   unmarked disk is refused even then — that rule is what lets the
+//!   boot proofs stay automatic while a *manual* wipe always needs a
+//!   marked disk (AGENTS.md).
+//!
 //! ## What these milestones deliberately do *not* do (later work)
 //!
-//! - **No shell `disks`/`install`/`netinstall` builtins** (boot-time
-//!   proof chosen for I1/I2 — see docs/installer.md §8.3/§8.4), no
-//!   HTTPS fetch (TLS against a local server is impossible — §7.2;
-//!   the real `api.github.com` fetch is a later milestone), no AHCI
-//!   *install* write path yet (the driver exists and probes + reads;
-//!   the smoke's install runs on the IDE disk — `AHCI_OK` is the
-//!   additive proof), no `/boot/grub/grub.cfg` on p2 (I1b embeds a tiny early config in
-//!   `core.img` instead, §8.6), no GRUB modules beyond the tested
-//!   boot-critical set, and no interactive menu (timeout 0 semantics:
-//!   boot the only entry).
+//! - **No HTTPS payload fetch** (TLS against a local server is
+//!   impossible — §7.2; the real `api.github.com` fetch is a later
+//!   milestone), no AHCI *install* write path yet (the driver exists
+//!   and probes + reads; the smoke's install runs on the IDE disk —
+//!   `AHCI_OK` is the additive proof), no `/boot/grub/grub.cfg` on p2
+//!   (I1b embeds a tiny early config in `core.img` instead, §8.6), no
+//!   GRUB modules beyond the tested boot-critical set, and no
+//!   interactive menu (timeout 0 semantics: boot the only entry).
 
 use crate::ata;
 use crate::clock;
@@ -497,6 +515,38 @@ fn p2_window(target: &ata::Disk, first_lba: u64, last_lba: u64) -> Part<'_> {
     Part(target, first_lba * 512, bytes)
 }
 
+/// Capacity check shared by every install path (the boot proofs and the
+/// shell's guided builtins): the layout needs GPT's fixed bookkeeping at
+/// both ends and p2 must reach FAT16's cluster window — see
+/// [`MIN_TARGET_SECTORS`]. Returns the refusal message instead of
+/// printing it, so the boot proofs turn it into `FATAL:` + halt (via
+/// [`prepare`]) and the shell prints it and returns to the prompt.
+fn check_size(target: &ata::Disk) -> Result<(), alloc::string::String> {
+    let total = u64::from(target.sectors());
+    if total < MIN_TARGET_SECTORS {
+        return Err(alloc::format!(
+            "target too small ({total} sectors, need {MIN_TARGET_SECTORS})"
+        ));
+    }
+    Ok(())
+}
+
+/// [`check_size`] plus the one target report line the boot proofs print
+/// before any write (byte-identical to I1/I2's output). Fail-closed: a
+/// too-small target is `Err`, never a guess.
+fn prepare(target: &ata::Disk) -> Result<(), alloc::string::String> {
+    check_size(target)?;
+    let total = u64::from(target.sectors());
+    let mut name_buf = [0u8; 40];
+    let model = target.model_name(&mut name_buf);
+    serial_println!(
+        "install: target {transport} '{model}' {total} sectors ({} MiB)",
+        total / 2048,
+        transport = target.transport()
+    );
+    Ok(())
+}
+
 /// Validate the install target (shared by [`prove`] and [`netprove`]):
 /// the marked second disk, big enough for the layout. `None`
 /// (silently — the caller returns without a word) when there is no
@@ -506,20 +556,9 @@ fn p2_window(target: &ata::Disk, first_lba: u64, last_lba: u64) -> Part<'_> {
 /// this function only checks and reports.
 fn prepare_target(target: Option<&ata::Disk>) -> Option<&ata::Disk> {
     let target = target?;
-    let total = u64::from(target.sectors());
-    if total < MIN_TARGET_SECTORS {
-        serial_println!(
-            "FATAL: install: target too small ({total} sectors, need {MIN_TARGET_SECTORS})"
-        );
-        crate::halt();
+    if let Err(e) = prepare(target) {
+        fatal_msg(&e);
     }
-    let mut name_buf = [0u8; 40];
-    let model = target.model_name(&mut name_buf);
-    serial_println!(
-        "install: target {transport} '{model}' {total} sectors ({} MiB)",
-        total / 2048,
-        transport = target.transport()
-    );
     Some(target)
 }
 
@@ -817,6 +856,69 @@ fn write_sectors_at(target: &ata::Disk, lba: u64, bytes: &[u8]) -> bool {
 /// `FATAL`, never a truncated "pass").
 const VERIFY_LEN: usize = DOWNLOAD_CAP;
 
+/// Why assembling the offline payload file list failed. Kept separate
+/// from [`fatal`] so the boot proof can print exactly what it always
+/// printed while the shell's guided `install` reports the same refusal
+/// as a soft error (return to the prompt, nothing written).
+#[derive(Debug, Clone, Copy)]
+enum OfflineError {
+    /// The ISO carried no `payload` module — without the kernel image
+    /// the installed disk would not boot, so the install is refused
+    /// before the first write.
+    NoKernel,
+    /// The source volume refused to mount, or a payload file could not
+    /// be read (bounded by [`PAYLOAD_CAP`]: too big is refused, never
+    /// truncated).
+    Fat(fat::Error),
+}
+
+/// The offline payload file list — `/README.TXT` + `/RESULT.TXT` read
+/// from the source volume (the FS1 machinery, bounded by
+/// [`PAYLOAD_CAP`]) and `/KERNEL.ELF` from the ISO's `payload` module
+/// (I1b: the running kernel's own ELF bytes, so the installed disk
+/// boots standalone even offline).
+///
+/// Shared by [`prove`] (boot) and [`guided_install`] (shell), so both
+/// install the same files. Refusals are returned, not printed: [`prove`]
+/// turns them into the `FATAL: install: …` + halt it always had, the
+/// shell into a line and a fresh prompt.
+fn offline_files<'a>(
+    source: &ata::Disk,
+    payloads: &Payloads,
+    readme: &'a mut [u8; PAYLOAD_CAP],
+    result: &'a mut [u8; PAYLOAD_CAP],
+) -> Result<[PayloadFile<'a>; 3], OfflineError> {
+    let kernel = payloads.kernel_image().ok_or(OfflineError::NoKernel)?;
+
+    let src_disk = BlockDisk(source);
+    let src_fs = match fat::Fat16::mount(&src_disk) {
+        Ok(fs) => fs,
+        Err(e) => return Err(OfflineError::Fat(e)),
+    };
+    let n_readme = read_named(&src_fs, PAYLOAD[0], readme).map_err(OfflineError::Fat)?;
+    let n_result = read_named(&src_fs, PAYLOAD[1], result).map_err(OfflineError::Fat)?;
+    // The reads are done; the buffers are handed to the returned list
+    // for its whole lifetime (the caller keeps them alive on its stack
+    // for exactly as long as `files` lives).
+    let readme: &'a [u8] = readme;
+    let result: &'a [u8] = result;
+    Ok([
+        PayloadFile {
+            name: PAYLOAD[0],
+            data: &readme[..n_readme],
+        },
+        PayloadFile {
+            name: PAYLOAD[1],
+            data: &result[..n_result],
+        },
+        PayloadFile {
+            // 8.3, uppercase: the path core.img's embedded config opens.
+            name: "KERNEL.ELF",
+            data: kernel,
+        },
+    ])
+}
+
 /// Offline install (I1): read the payload from the source volume, add
 /// the ISO's `payload` module as `/KERNEL.ELF`, run [`install_payload`],
 /// print `INST_OK`. Silent without a marked target disk; `FATAL:` +
@@ -825,48 +927,105 @@ pub(crate) fn prove(source: &ata::Disk, target: Option<&ata::Disk>, payloads: &P
     let Some(target) = prepare_target(target) else {
         return; // no (marked) target disk → zero output, boot continues
     };
-    // The installed system's kernel: the ISO's own `payload` module
-    // (I1b — without it an offline install could not boot standalone).
-    let Some(kernel) = payloads.kernel_image() else {
-        fatal_msg("payload module missing (installed disk would not boot)");
-    };
-
-    // Read the payload from the source volume — the FS1 machinery,
-    // bounded by [`PAYLOAD_CAP`] per file (a bigger file on the
-    // source is refused, never truncated).
-    let src_disk = BlockDisk(source);
-    let src_fs = match fat::Fat16::mount(&src_disk) {
-        Ok(fs) => fs,
-        Err(e) => fatal(e),
-    };
     let mut first = [0u8; PAYLOAD_CAP];
     let mut second = [0u8; PAYLOAD_CAP];
-    let n_first = match read_named(&src_fs, PAYLOAD[0], &mut first) {
-        Ok(n) => n,
-        Err(e) => fatal(e),
+    let files = match offline_files(source, payloads, &mut first, &mut second) {
+        Ok(files) => files,
+        // Same two refusals, same messages and same order as before
+        // this was factored out (the module check came first).
+        Err(OfflineError::NoKernel) => {
+            fatal_msg("payload module missing (installed disk would not boot)")
+        }
+        Err(OfflineError::Fat(e)) => fatal(e),
     };
-    let n_second = match read_named(&src_fs, PAYLOAD[1], &mut second) {
-        Ok(n) => n,
-        Err(e) => fatal(e),
-    };
-    let files = [
-        PayloadFile {
-            name: PAYLOAD[0],
-            data: &first[..n_first],
-        },
-        PayloadFile {
-            name: PAYLOAD[1],
-            data: &second[..n_second],
-        },
-        PayloadFile {
-            // 8.3, uppercase: the path core.img's embedded config opens.
-            name: "KERNEL.ELF",
-            data: kernel,
-        },
-    ];
 
     install_payload(target, &files, payloads);
     serial_println!("INST_OK"); // machine-checked by `cargo xtask smoke-install`
+}
+
+/// The guided shell `install <device> yes` builtin (docs/installer.md
+/// §7.1): the *same* [`install_payload`] the boot proofs run — GPT →
+/// format p2 → copy → byte-exact re-read → GRUB last — reached through
+/// a fail-soft pre-flight instead of `FATAL:` + halt:
+///
+/// 1. capacity ([`check_size`]),
+/// 2. the installer ISO's modules (`grubpayload` for GRUB's boot code,
+///    `payload` for `/KERNEL.ELF`) — without them the installed disk
+///    would not boot, so the request is refused *before* any write,
+/// 3. the source volume, when one is attached: [`offline_files`] reads
+///    the same `/README.TXT` + `/RESULT.TXT` [`prove`] copies; with no
+///    source (the real-hardware case: DVD ISO + empty disk) only
+///    `/KERNEL.ELF` goes to p2, which is all the boot path needs.
+///
+/// Every refusal here is an `Err` the shell prints and returns from —
+/// the builtin never halts the machine. Once [`install_payload`] starts
+/// writing, a disk failure stays `FATAL:` + halt exactly like the boot
+/// proof: a half-written target must never look like a success (the
+/// wipe marker already guaranteed the disk *may* be written).
+pub(crate) fn guided_install(
+    target: &ata::Disk,
+    payloads: &Payloads,
+    source: Option<&ata::Disk>,
+) -> Result<(), alloc::string::String> {
+    check_size(target)?;
+    if payloads.grub().is_none() {
+        return Err(alloc::string::String::from(
+            "no GRUB artifacts captured (boot the installer ISO, not the installed system)",
+        ));
+    }
+
+    let mut first = [0u8; PAYLOAD_CAP];
+    let mut second = [0u8; PAYLOAD_CAP];
+    let mut files = [PayloadFile {
+        name: "",
+        data: &[],
+    }; 3];
+    let count = match source {
+        Some(source) => match offline_files(source, payloads, &mut first, &mut second) {
+            Ok(list) => {
+                files = list;
+                list.len()
+            }
+            Err(OfflineError::NoKernel) => {
+                return Err(alloc::string::String::from(
+                    "payload module missing (installed disk would not boot)",
+                ));
+            }
+            Err(OfflineError::Fat(e)) => return Err(source_error(e)),
+        },
+        None => {
+            // No source volume: the kernel image alone makes the disk
+            // bootable (I1b's early GRUB config only opens /KERNEL.ELF).
+            let Some(kernel) = payloads.kernel_image() else {
+                return Err(alloc::string::String::from(
+                    "payload module missing (boot the installer ISO, not the installed system)",
+                ));
+            };
+            files[0] = PayloadFile {
+                name: "KERNEL.ELF",
+                data: kernel,
+            };
+            1
+        }
+    };
+
+    install_payload(target, &files[..count], payloads);
+    Ok(())
+}
+
+/// A source-volume refusal as the shell prints it — the two cases a
+/// user can actually fix get plain text, everything else keeps the
+/// `fat::Error` name (fail-closed, no guessing).
+fn source_error(e: fat::Error) -> alloc::string::String {
+    match e {
+        fat::Error::NotFound => alloc::string::String::from(
+            "source volume is missing README.TXT or RESULT.TXT — refusing a partial install",
+        ),
+        fat::Error::BufferTooSmall => alloc::string::String::from(
+            "a payload file on the source volume is larger than the install bound",
+        ),
+        other => alloc::format!("source volume refused: {other:?}"),
+    }
 }
 
 /// Read `name` (bare, [`qualify`]-prefixed) from a mounted volume
@@ -890,18 +1049,51 @@ fn read_named(
 /// [`install_payload`], print `NETINST_OK`. Requires the NIC (called
 /// after the boot network chain) and a *marked* target — silent
 /// otherwise, like every other proof here.
+///
+/// The boot contract is unchanged: every refusal still ends in
+/// `FATAL: install: …` + halt, with the same messages I2 always
+/// printed. The fallible core the shell's `netinstall` builtin shares
+/// is [`netinstall_run`].
 pub(crate) fn netprove(stack: &mut Stack, target: Option<&ata::Disk>, payloads: &Payloads) {
-    let Some(target) = prepare_target(target) else {
+    let Some(target) = target else {
         return; // no marked target → no network noise either
     };
+    // Report line first, exactly where `prepare_target` printed it
+    // (before `netinstall: GET …`), then the install itself.
+    if let Err(e) = prepare(target) {
+        fatal_msg(&e);
+    }
+    if let Err(e) = netinstall_run(stack, target, payloads) {
+        fatal_msg(&e);
+    }
+    serial_println!("NETINST_OK"); // machine-checked by `cargo xtask smoke-install`
+}
+
+/// The fallible core of the network install — [`netprove`] above and
+/// the shell's `netinstall <device> yes` builtin (docs/installer.md
+/// §7.1) run exactly this: capacity + module pre-flight (soft `Err`,
+/// nothing written), then the `payload.tar` download over our own
+/// stack, the ustar walk, and the same [`install_payload`] as `INST_OK`
+/// and the guided `install`. [`netprove`] wraps it with `FATAL:` +
+/// halt so the boot chain's fail-closed contract is untouched; the
+/// shell prints the `Err` and returns to the prompt. A *disk* failure
+/// inside [`install_payload`] still halts — see [`guided_install`].
+pub(crate) fn netinstall_run(
+    stack: &mut Stack,
+    target: &ata::Disk,
+    payloads: &Payloads,
+) -> Result<(), alloc::string::String> {
+    check_size(target)?;
+    if payloads.grub().is_none() {
+        return Err(alloc::string::String::from(
+            "no GRUB artifacts captured (boot the installer ISO, not the installed system)",
+        ));
+    }
 
     let gw = net::SLIRP_GATEWAY;
     let host = alloc::format!("{}.{}.{}.{}", gw[0], gw[1], gw[2], gw[3]);
     serial_println!("netinstall: GET {host}:{PAYLOAD_PORT}{PAYLOAD_PATH}");
-    let n = match download(stack, &host) {
-        Ok(n) => n,
-        Err(e) => fatal_msg(e),
-    };
+    let n = download(stack, &host).map_err(alloc::string::String::from)?;
     serial_println!("netinstall: {n} bytes received");
 
     // SAFETY: `download` wrote exactly `n` bytes into the single-use
@@ -912,14 +1104,11 @@ pub(crate) fn netprove(stack: &mut Stack, target: Option<&ata::Disk>, payloads: 
         name: "",
         data: &[],
     }; MAX_PAYLOAD_FILES];
-    let count = match parse_tar(archive, &mut files) {
-        Ok(count) => count,
-        Err(e) => fatal_msg(e),
-    };
+    let count = parse_tar(archive, &mut files).map_err(alloc::string::String::from)?;
     serial_println!("netinstall: payload carries {count} files");
 
     install_payload(target, &files[..count], payloads);
-    serial_println!("NETINST_OK"); // machine-checked by `cargo xtask smoke-install`
+    Ok(())
 }
 
 /// Fetch the whole `payload.tar` into [`DOWNLOAD`] over `tcp5` —
