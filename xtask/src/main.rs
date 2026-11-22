@@ -137,6 +137,7 @@ fn main() {
         "check" => check(&root),
         "build" => build_kernel(&root),
         "user" => build_user(&root),
+        "smoke-user" => smoke_user(&root),
         "iso" => iso(&root),
         "smoke" => smoke(&root),
         "smoke-install" => smoke_install(&root),
@@ -145,7 +146,7 @@ fn main() {
         "hwtest" => hwtest(&root),
         _ => {
             eprintln!(
-                "usage: cargo xtask <check|build|user|iso|smoke|smoke-install|smoke-ssh|run|hwtest>"
+                "usage: cargo xtask <check|build|user|iso|smoke|smoke-user|smoke-install|smoke-ssh|run|hwtest>"
             );
             false
         }
@@ -434,7 +435,7 @@ ls -l /work/boot/boot.img /work/boot/core.img /work/boot/grubpayload.bin
 ";
 
 fn iso(root: &Path) -> bool {
-    iso_inner(root, false)
+    iso_inner(root, false, false)
 }
 
 /// Hard cap on the `hello` module: the kernel's capture buffer is 4 MiB
@@ -514,13 +515,14 @@ fn stage_hello_module(root: &Path, iso_root: &Path, cfg_path: &Path) {
 /// authorized client's raw public key) and the GRUB config loads it
 /// as the multiboot2 module `sshd`, which switches the kernel into
 /// `crate::hwtest` (static address, sshd, no smoke chain).
-fn iso_inner(root: &Path, hwtest: bool) -> bool {
+fn iso_inner(root: &Path, hwtest: bool, user_mode: bool) -> bool {
     if !build_kernel(root) {
         return false;
     }
-    // U1: build the userland ELF before wiping iso-root (stage_hello_module
-    // copies it from the cargo artifact into the ISO below).
-    if !build_user(root) {
+    // U1: build/stage the userland ELF only in the dedicated smoke-user
+    // ISO. The standard smoke/install/ssh/hwtest ISOs stay byte-identical
+    // (no hello module -> no ELF_OK -> original marker chains).
+    if user_mode && !build_user(root) {
         return false;
     }
     let kernel = root.join("target/x86_64-unknown-none/release/kernel");
@@ -606,7 +608,9 @@ fn iso_inner(root: &Path, hwtest: bool) -> bool {
     // a silent no-op, so diskless/installed-system boots keep their marker
     // chains. With the ELF present the kernel's ELF_OK proof runs after
     // SHELL_OK (the module is captured before `memory::init`).
-    stage_hello_module(root, &iso_root, &boot_dir.join("grub.cfg"));
+    if user_mode {
+        stage_hello_module(root, &iso_root, &boot_dir.join("grub.cfg"));
+    }
     // I1b: the config embedded in the installed disk's core.img.
     if let Err(e) = std::fs::write(iso_root.join("boot/early.cfg"), GRUB_EARLY_CFG) {
         eprintln!("xtask: cannot write early.cfg: {e}");
@@ -1637,7 +1641,7 @@ fn run(root: &Path) -> bool {
 /// server's serial (with every drop/auth reason — the exact
 /// diagnosis the real MacBook needs) is printed live as `hwtest| …`.
 fn hwtest(root: &Path) -> bool {
-    if !iso_inner(root, true) {
+    if !iso_inner(root, true, false) {
         return false;
     }
     let iso_dir = root.join("target/iso-root");
@@ -1840,6 +1844,43 @@ fn netlog_probe(container: &str) -> Result<usize, String> {
     Ok(out.stdout.len())
 }
 
+/// U1 smoke: boots the dedicated ISO with the `hello` userland module
+/// and asserts the userland markers (ELF_OK, USER_RUN_OK, SYSCALL_OK,
+/// USER_RETURN_OK) after the unchanged boot chain.
+fn smoke_user(root: &Path) -> bool {
+    let markers: Vec<&str> = vec![
+        "BOOT_OK",
+        "VGA_OK",
+        "MEM_OK",
+        "ALLOC_OK",
+        "RTC_OK",
+        "PCI_OK",
+        "USB_KBD_OK",
+        "E1000_OK",
+        "NET_OK",
+        "PING_OK",
+        "DHCP_OK",
+        "DNS_OK",
+        "TCP_OK",
+        "TLS_OK",
+        "HTTP_OK",
+        "GIT_LSREMOTE_OK",
+        "GIT_FETCH_OK",
+        "SSH_KEXINIT_OK",
+        "SSH_KEX_OK",
+        "INT_OK",
+        "SHELL_OK",
+        "ELF_OK",
+        "USER_RUN_OK",
+        "SYSCALL_OK",
+        "USER_RETURN_OK",
+    ];
+    if !iso_inner(root, false, true) {
+        return false;
+    }
+    boot_assert(root, "smoke-user", &markers, SMOKE_TIMEOUT, &[], &[], true)
+}
+
 fn smoke(root: &Path) -> bool {
     const BASE_MARKERS: [&str; 30] = [
         "BOOT_OK",
@@ -1876,12 +1917,9 @@ fn smoke(root: &Path) -> bool {
     // The U1 marker is only meaningful when the ISO actually carries the
     // `hello` module. Before `user/hello/` lands (or on a boot without it)
     // the chain stays exactly the original 30 markers.
-    let mut markers: Vec<&str> = BASE_MARKERS.to_vec();
-    if hello_source(root).is_some()
-        && let Some(pos) = markers.iter().position(|m| *m == "SHELL_OK")
-    {
-        markers.insert(pos + 1, "ELF_OK");
-    }
+    // The normal smoke never stages the hello module, so its marker
+    // chain is the original 30 — byte-identical, no ELF_OK.
+    let markers: Vec<&str> = BASE_MARKERS.to_vec();
     if !iso(root) {
         return false;
     }

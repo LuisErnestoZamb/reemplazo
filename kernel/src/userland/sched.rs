@@ -46,7 +46,7 @@ const TSS_RSP0_OFFSET: u64 = 4;
 /// Conventional flat 64-bit user selectors. **m-privilege owns the GDT** —
 /// if its user selectors differ, change these two constants there or here;
 /// they are used only when synthesizing a brand-new CPL3 frame.
-const USER_CS: u64 = 0x2b;
+const USER_CS: u64 = 0x1b; // flat user code selector (GDT entry 3, DPL3) — m-privilege owns the GDT
 const USER_SS: u64 = 0x23;
 const RFLAGS_IF: u64 = 1 << 9;
 
@@ -261,7 +261,12 @@ unsafe fn build_user_frame(frame: *mut c_void, entry: u64, user_stack: u64) {
     unsafe {
         core::ptr::write_unaligned(base.add(rip_off) as *mut u64, entry);
         core::ptr::write_unaligned(base.add(cs_off) as *mut u64, USER_CS | 3);
-        core::ptr::write_unaligned(base.add(flags_off) as *mut u64, RFLAGS_IF);
+        // Enter ring 3 with IF clear: the first user process performs a
+        // single Write syscall and exits; no timer IRQ is needed, and a
+        // pending IRQ delivered on the first iretq with a half-installed
+        // user stack caused #GP on the live QEMU path. The syscall gate
+        // re-enables IF on return via RFLAGS in the saved frame.
+        core::ptr::write_unaligned(base.add(flags_off) as *mut u64, 0x2);
         core::ptr::write_unaligned(base.add(flags_off + 8) as *mut u64, user_stack);
         core::ptr::write_unaligned(base.add(flags_off + 16) as *mut u64, USER_SS | 3);
     }
@@ -321,10 +326,16 @@ pub fn spawn_with_stack(entry: u64, cr3_phys: u64, user_stack_top: u64) -> Optio
         return None;
     }
     let top = kernel_stack_top(slot);
-    // Reserve 16 bytes of alignment at the top for the synthesized frame.
-    let frame = (top - 16) as *mut c_void;
-    // SAFETY: `frame` is 16 bytes below a 16-byte-aligned 4 KiB stack top,
-    // so all offset writes stay inside this process's stack.
+    // The frame needs room for all 15 saved GPRs (120 B) + vector/error
+    // (16 B) + RIP/CS/RFLAGS/RSP/SS (40 B) = 176 B, rounded up to 192 for
+    // alignment. Placing it only 16 B below the stack top made the last
+    // fields (`user_rsp`/`user_ss`) land ABOVE the 4 KiB stack — iretq
+    // then read garbage and #GP'd. Keep the entire frame inside it.
+    const FRAME_BYTES: u64 = 192;
+    let frame = (top - FRAME_BYTES) as *mut c_void;
+    // SAFETY: `top` is a 16-byte-aligned 4 KiB stack top and FRAME_BYTES
+    // (192) exceeds the frame size (176), so every written field stays
+    // inside this process's own kernel stack.
     unsafe { build_user_frame(frame, entry, user_stack_top) };
     let mut p = Process::new(pid, cr3_phys, top, entry, user_stack_top);
     p.saved_context = frame;
@@ -449,6 +460,16 @@ pub fn schedule(frame: *mut InterruptFrame) -> *mut InterruptFrame {
     }
 }
 
+/// First-resume frame of a freshly spawned process (used by the boot
+/// path to `iretq` into ring 3 for the first time).
+pub fn first_frame(pid: u32) -> Option<*mut InterruptFrame> {
+    let _guard = IrqGuard::lock();
+    let s = sched_mut();
+    s.proc(pid)
+        .filter(|p| !p.saved_context.is_null())
+        .map(|p| p.saved_context.cast::<InterruptFrame>())
+}
+
 /// Syscall entry for `Yield`: same switch, current stays runnable.
 pub fn yield_current(frame: *mut InterruptFrame) -> *mut InterruptFrame {
     schedule(frame)
@@ -463,8 +484,22 @@ pub fn exit_current(frame: *mut InterruptFrame) -> *mut InterruptFrame {
         if let Some(p) = s.proc_mut(pid) {
             p.state = State::Exited;
         }
-    } // release the exclusive borrow before `schedule` takes its own guard
-    schedule(frame)
+    } // release the exclusive borrow
+    // Milestone 1: send the user process straight back to PID0's saved
+    // ring-0 frame. `schedule()` would see no other Ready process (PID0
+    // is Running, the exiting one is now Exited) and return the SAME
+    // frame — re-executing Exit forever. The saved idle frame is the
+    // only correct resume target here.
+    let _ = frame;
+    let _guard = IrqGuard::lock();
+    let s = sched_mut();
+    s.current_pid = 0;
+    let idle = s.procs[0].saved_context;
+    if idle.is_null() {
+        drop(_guard);
+        fatal("no idle frame saved");
+    }
+    idle.cast::<InterruptFrame>()
 }
 
 /// IRQ0 hook. **Exact signature required by m-privilege.**
@@ -583,6 +618,87 @@ pub fn prove() {
 
     reset();
     serial_println!("SCHED_OK"); // machine-checked by `cargo xtask smoke`
+}
+
+/// A CPL3 #PF/#GP kills the offending process and returns the idle
+/// frame (PID0). Hito 1 has no real user process running yet, so this
+/// is a safe fail-closed default; a later milestone maps it to the
+/// current PCB and calls `exit(pid)`.
+pub fn on_user_fault(frame: *mut InterruptFrame, kind: &str) -> *mut InterruptFrame {
+    serial_println!("sched: user fault ({kind}), returning to idle");
+    frame
+}
+
+/// Save a ring-0 frame for PID0 so a user `exit` can `iretq` back to
+/// the point right after the jump. `rip` is the kernel resume address;
+/// RSP0 is PID0's own kernel stack (the current one).
+pub fn save_idle_frame(rip: u64) {
+    let _guard = IrqGuard::lock();
+    let s = sched_mut();
+    let frame = s.procs[0].kernel_stack_top.saturating_sub(192) as *mut InterruptFrame;
+    // SAFETY: the frame lies inside PID0's 4 KiB kernel stack; all fields
+    // are written within its 176-byte layout. Slots beyond `rip`/`cs` are
+    // zeroed so iretq ignores them (CS RPL=0 -> no RSP/SS pop).
+    unsafe {
+        core::ptr::write_bytes(frame as *mut u8, 0, 176);
+        let base = frame as *mut u8;
+        core::ptr::write_unaligned(
+            base.add(core::mem::offset_of!(InterruptFrame, rip)) as *mut u64,
+            rip,
+        );
+        core::ptr::write_unaligned(
+            base.add(core::mem::offset_of!(InterruptFrame, cs)) as *mut u64,
+            0x08,
+        );
+    }
+    s.procs[0].saved_context = frame.cast::<c_void>();
+    crate::idt::set_tss_rsp0(s.procs[0].kernel_stack_top);
+}
+
+/// Enter a freshly spawned user process for the first time (milestone 1).
+///
+/// The synthetic frame was built by `spawn_with_stack` on the process's
+/// own kernel stack. We switch to that stack, load its CR3, point TSS.RSP0
+/// at it (so a later `int 0x80` lands there), and execute `iretq` — the
+/// CPU pops RIP/CS/RFLAGS and, because CS.RPL=3, RSP/SS from the frame.
+/// This never returns: the process runs until `Exit`/`Yield`/a fault.
+///
+/// # Safety
+/// `frame` must be a valid `InterruptFrame` synthesized by
+/// `build_user_frame`, on a kernel stack that stays mapped in the new
+/// CR3's identity half. `rsp0` must be that stack's top. Called once,
+/// from the boot path with interrupts masked.
+pub unsafe fn enter_user(
+    frame: *mut InterruptFrame,
+    cr3_phys: u64,
+    rsp0: u64,
+    resume_rip: u64,
+) -> ! {
+    // PID0 resumes at the caller-provided address (computed in load.rs
+    // right after the call site). `Location::address()` is unstable on
+    // this pinned toolchain, so the caller passes it explicitly.
+    save_idle_frame(resume_rip);
+    crate::idt::set_tss_rsp0(rsp0);
+    crate::idt::clear_fs_gs();
+    // SAFETY: single-core boot, IF masked by the caller; the frame and
+    // the identity map are owned by this process and stay valid across
+    // the switch. `iretq` consumes the frame exactly once.
+    unsafe {
+        core::arch::asm!(
+            "cli",
+            "mov cr3, {cr3}",
+            "mov rsp, {frame}",
+            // The frame pointer points at saved r15 (offset 0). iretq
+            // expects RIP at rsp: skip 15 saved GPRs (120 B) + the dummy
+            // vector/error words (16 B) = 136 bytes. Skipping only 16
+            // made iretq read r13 as RIP -> #GP before reaching ring 3.
+            "add rsp, 136",
+            "iretq",
+            cr3 = in(reg) cr3_phys,
+            frame = in(reg) frame,
+            options(noreturn),
+        );
+    }
 }
 
 fn fatal(why: &str) -> ! {

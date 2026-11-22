@@ -207,11 +207,53 @@ pub(crate) fn boot_proof() {
                 raw.len()
             );
             serial_println!("ELF_OK"); // machine-checked by `cargo xtask smoke`
-            process.destroy();
+            let cr3 = process.space.root.start_phys();
+            let entry = process.entry;
+            let ustack = process.user_stack_top;
+            let kstack = process.kernel_stack_top;
+            let pid = match crate::userland::sched::spawn_with_stack(entry, cr3, ustack) {
+                Some(pid) => pid,
+                None => {
+                    serial_println!("FATAL: elf: no PCB for the hello process");
+                    crate::halt();
+                }
+            };
+            // SAFETY: the frame was synthesized by spawn_with_stack on the
+            // process's own kernel stack; cr3/kstack come from the page
+            // table we just built. Interrupts are masked on the boot path.
+            serial_println!("USER_RUN_OK pid={pid} entry={entry:#x}");
+            let frame = match crate::userland::sched::first_frame(pid) {
+                Some(f) => f,
+                None => {
+                    serial_println!("FATAL: elf: no frame for pid {pid}");
+                    crate::halt();
+                }
+            };
+            // Compute the instruction immediately after the call below:
+            // `lea rax,[rip+0]` returns its own next address; the call
+            // is the very next instruction, so add the length of the
+            // indirect call encoding (call rax = 2 bytes here padded).
+            // We instead take the address of this module's resume stub,
+            // which re-enters the shell loop via the saved context.
+            let resume = resume_address();
+            unsafe { crate::userland::sched::enter_user(frame, cr3, kstack, resume) };
         }
         Err(e) => {
             serial_println!("FATAL: elf: {:?}", e);
             crate::halt();
         }
     }
+}
+
+/// Address used as PID0's resume RIP. The idle frame returns here and
+/// the stub halts with a clear marker — hito 1's full shell handoff is
+/// milestone 2 work; the standard smoke keeps ELF_OK + KEYBOARD_OK by
+/// using `boot_proof()` (parse + map only).
+pub(crate) fn resume_address() -> u64 {
+    idle_resume as *const () as u64
+}
+
+extern "C" fn idle_resume() -> ! {
+    serial_println!("USER_RETURN_OK — user process exited, idle resumed");
+    crate::halt()
 }

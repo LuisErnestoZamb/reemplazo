@@ -158,6 +158,9 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
     };
 
     arm_interrupts();
+    // Userland boundary (GDT6/TSS + int 0x80 gate already installed by
+    // entry.S/idt.rs): register the syscall and scheduler callbacks.
+    crate::userland::install_hooks();
     report_rtc(); // pure port I/O: no PCI needed, and RTC_OK precedes PCI_OK
     let scan = crate::pci::scan();
     crate::pci::selftest(&scan);
