@@ -65,8 +65,10 @@ const RESULT_PAYLOAD: &[u8] = b"reemplazo fs write ok\n";
 /// `Drive::write_sectors`. Stateless on purpose — no cache, no dirty
 /// tracking: `write_at` returning `Ok` means the bytes went to the
 /// device (write-through), which is what makes a fresh re-mount a
-/// meaningful read-back in [`write_proof`].
-struct AtaDisk<'a>(&'a ata::Drive);
+/// meaningful read-back in [`write_proof`]. `pub(crate)` so
+/// `crate::install` mounts the *source* volume through the same
+/// adapter when copying the payload.
+pub(crate) struct AtaDisk<'a>(pub(crate) &'a ata::Drive);
 
 impl fat::BlockDevice for AtaDisk<'_> {
     fn size_bytes(&self) -> u64 {
@@ -143,6 +145,28 @@ pub(crate) fn prove(dev: &ata::Drive) {
     write_proof(dev); // FS_WRITE_OK — or `FATAL: fs:` + halt
 }
 
+/// The timestamp writes get: the CMOS RTC when it answers, the crate's
+/// documented fixed value (`1980-01-01`) when it does not — this code
+/// never invents a clock. Shared by [`write_proof`] (FS2) and
+/// `crate::install`'s payload copy (I1), so both write paths stamp
+/// identically.
+pub(crate) fn stamp() -> fat::Stamp {
+    match crate::rtc::now_epoch() {
+        Some(epoch) => {
+            let clock = crate::rtc::from_epoch(epoch);
+            fat::Stamp {
+                year: clock.year,
+                month: clock.month,
+                day: clock.day,
+                hour: clock.hour,
+                minute: clock.minute,
+                second: clock.second,
+            }
+        }
+        None => fat::Stamp::FAT_EPOCH,
+    }
+}
+
 /// FS2's proof (`FS_WRITE_OK`), reached only after `FAT_OK` and only
 /// with a drive present (the diskless main smoke never gets here).
 ///
@@ -156,22 +180,7 @@ pub(crate) fn prove(dev: &ata::Drive) {
 /// 3. Assert `/RESULT.TXT` byte-exact, then re-read `/README.TXT` and
 ///    assert it too — a writer that clobbers its neighbour fails here.
 fn write_proof(dev: &ata::Drive) {
-    // Timestamps come from the CMOS RTC; a dead clock falls back to
-    // the crate's documented fixed value (1980-01-01), never a guess.
-    let stamp = match crate::rtc::now_epoch() {
-        Some(epoch) => {
-            let clock = crate::rtc::from_epoch(epoch);
-            fat::Stamp {
-                year: clock.year,
-                month: clock.month,
-                day: clock.day,
-                hour: clock.hour,
-                minute: clock.minute,
-                second: clock.second,
-            }
-        }
-        None => fat::Stamp::FAT_EPOCH,
-    };
+    let stamp = stamp();
 
     // Step 1: the write (fresh mount — `/RESULT.TXT` may exist from a
     // previous run of the same image; `write_file` overwrites it).

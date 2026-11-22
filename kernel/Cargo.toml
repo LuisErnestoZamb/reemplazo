@@ -46,6 +46,15 @@ multiboot2 = { version = "0.28", default-features = false }
 # (its `core_io` backend's build script rejects modern rustc); the
 # recorded evaluation is `docs/installer.md` §5/§9.1 plus the FS1 commit.
 fat = { path = "../fat" }
+# GPT reader/writer (installer I1 — docs/installer.md §2(3)/§3.2):
+# from-scratch under dependency-policy exception (a) — "the OS
+# partitions itself … it is the only option" (no sfdisk anywhere, and
+# no maintained no_std GPT crate was adopted for a zero-dep,
+# `forbid(unsafe_code)` parser+writer); CRC32 is the documented §3.2
+# protocol glue. Rationale and the adversarial suite (bad CRC,
+# absurd entry counts, backup mismatch, overlap, MBR garbage) live in
+# the crate's docs.
+gptwire = { path = "../gptwire" }
 net = { path = "../net" }
 pci = { path = "../pci" }
 rtc = { path = "../rtc" }

@@ -5,9 +5,10 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
-
-[dev-dependencies]
-# Host round-trip test only: `write_disk_image` must emit a volume the
-# kernel's own reader (`fat`) mounts — same crate, same code path the
-# `FAT_OK` boot proof takes, exercised on the build host first.
+# Host-side disk work, shared with the kernel through the same crates:
+# `fat` formats `disk.img` (and verifies `target.img`'s volume after
+# the VM ran) through the exact reader/writer the boot proofs use;
+# `gptwire` parses the GPT the kernel wrote (installer I1's host-side
+# independent check — docs/installer.md §7.3).
 fat = { path = "../fat" }
+gptwire = { path = "../gptwire" }

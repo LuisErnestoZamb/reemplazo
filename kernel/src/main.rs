@@ -28,6 +28,7 @@ mod fs;
 mod git;
 mod heap;
 mod idt;
+mod install;
 mod keyboard;
 mod memory;
 mod pci;
@@ -105,6 +106,12 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
     // diskless neutrality the main smoke requires).
     if let Some(drive) = crate::ata::probe() {
         crate::fs::prove(&drive); // FAT_OK + FS_WRITE_OK — or `FATAL: fs:` + halt
+        // Installer I1 (docs/installer.md §8.3): GPT + format p2 +
+        // payload copy + byte-exact re-read → INST_OK. Silent when no
+        // *marked* target disk is attached (single-disk and diskless
+        // boots print nothing extra); with one, every failure is
+        // `FATAL: install:` + halt.
+        crate::install::prove(&drive);
     }
 
     // QEMU's e1000 first (byte-identical history: on a machine with

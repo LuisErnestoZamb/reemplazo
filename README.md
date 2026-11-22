@@ -78,7 +78,7 @@ All in Rust, all in this workspace:
 ```sh
 cargo xtask check   # fmt + clippy (host and kernel target) + tests + cross-build
 cargo xtask smoke   # build ISO, boot headless, assert serial markers in order
-cargo xtask smoke-install  # same + FAT16 IDE disk; assert BLK_OK + FAT_OK + FS_WRITE_OK
+cargo xtask smoke-install  # two FAT16/blank IDE disks; assert BLK_OK + FAT_OK + FS_WRITE_OK + INST_OK
 cargo xtask run     # interactive boot in QEMU (Ctrl-C quits)
 cargo test -p mbi <name>   # single test
 ```
@@ -96,11 +96,18 @@ BOOT_OK → VGA_OK → MEM_OK → ALLOC_OK → RTC_OK → PCI_OK → E1000_OK �
 shell's `echo` builtin printed (an exact match — the keystroke echo
 alone does not count), proving i8042 → scancode decode → line
 discipline → builtin.
-`cargo xtask smoke-install` boots the same ISO with a 64 MiB FAT16 IDE
-disk attached and asserts `BLK_OK` (the ATA PIO probe), `FAT_OK` — the
-FAT mount plus a byte-exact `/README.TXT` read — and `FS_WRITE_OK`:
-the kernel *writes* `/RESULT.TXT`, re-mounts from scratch and reads it
-back byte-exact (with `/README.TXT` re-checked for clobbering).
+`cargo xtask smoke-install` boots the same ISO with **two** 64 MiB IDE
+disks attached — a FAT16 *source* volume (`disk.img`) and a blank
+*target* (`target.img`, carrying the wipe marker the installer
+requires) — and asserts `BLK_OK` (the ATA PIO probe), `FAT_OK` — the
+FAT mount plus a byte-exact `/README.TXT` read — `FS_WRITE_OK`: the
+kernel *writes* `/RESULT.TXT`, re-mounts from scratch and reads it
+back byte-exact (with `/README.TXT` re-checked for clobbering), and
+`INST_OK`: the install flow on the target — GPT written and re-read
+(`gptwire`), p2 formatted FAT16 with the shared `fat::format_fat16`,
+the payload copied from the source volume and read back byte-exact
+after a fresh re-mount. When QEMU exits, xtask re-verifies `target.img`
+on the host (GPT + FAT + files byte-exact).
 
 **Notes:**
 
@@ -155,6 +162,9 @@ Milestones landed so far (see `git log` for details):
 - [ ] ISO installer + network installer
   - [x] Block layer: ATA PIO driver on the legacy IDE primary channel (`cargo xtask smoke-install` asserts `BLK_OK`)
   - [x] Filesystem: FAT16 reader + writer, `no_std` + `forbid(unsafe_code)` + zero deps (`smoke-install` asserts `FAT_OK` then `FS_WRITE_OK` — write + re-mount read-back; `fat/` crate, 71 adversarial host tests incl. a randomized write oracle)
+  - [x] Shared FAT16 formatter: `fat::format_fat16` derives the geometry from the device size and self-checks against the reader — used by xtask's disk images *and* the kernel installer (`fat/tests/format.rs`, +8 tests)
+  - [x] GPT reader + writer: `gptwire` crate, `no_std` + `forbid(unsafe_code)` + zero deps, 49 adversarial host tests (CRC32 vectors, truncated/bad-CRC headers, absurd entry counts, backup mismatch, overlap, MBR garbage)
+  - [x] Install-to-disk (I1): GPT → FAT16 p2 → payload copy → byte-exact re-read (`smoke-install` asserts `INST_OK`; host-side re-verify after QEMU exits). GRUB boot code on the target is deferred (I1b) — the installed disk is not yet bootable
 
 ## License
 

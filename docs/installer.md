@@ -2,7 +2,8 @@
 
 Status: design (research complete) + **FS1 landed** — FAT16 reader and its `FAT_OK`
 smoke marker (§8.1) + **FS2 landed** — FAT16 write path and its `FS_WRITE_OK` marker
-(§8.2). Scope: the two installer deliverables from
+(§8.2) + **I1 landed** — GPT + install-to-disk and its `INST_OK` marker (§8.3).
+Scope: the two installer deliverables from
 AGENTS.md — *a bootable ISO* and *a network installer that fetches the system over the
 network with the OS's own stack*. Target: 2007 MacBook2,1, GRUB i386-pc boot chain
 (32-bit Apple EFI in BIOS emulation — **no UEFI, no ESP**, see AGENTS.md).
@@ -597,7 +598,86 @@ file operations on FAT16.
   tests + 1 new mount-hardening test = 48). Total: **71 host tests** in `fat/`.
 - **Still open (FS3+):** crash consistency (journal/flush ordering, drive `FLUSH CACHE`), LFN
   writes, `mkdir`/unlink as public operations, cross-file cross-link detection (needs a visited set
-  — i.e. the heap), FAT32, and the GPT wrapper (milestone 2).
+  — i.e. the heap), FAT32, and … the GPT wrapper — which is exactly what **I1** landed next.
+
+### 8.3 I1 landed — GPT + install-to-disk (`INST_OK`)
+
+The install-to-disk milestone is in (branch `m-installer-full`). `cargo xtask smoke-install`
+now asserts `["BLK_OK", "FAT_OK", "FS_WRITE_OK", "INST_OK"]` and, after QEMU exits, re-verifies
+the target image on the host.
+
+- **Invocation choice (the doc was silent for boot time):** the install proof runs **at boot,
+  immediately after `fs::prove`** (`kernel/src/main.rs` → `install::prove`), with the same
+  neutrality discipline: no source disk → never reached; no *marked* target disk → silent
+  `return`, zero output. The interactive `disks`/`install <id>` builtins of §7.1 remain the
+  future path for unmarked real hardware (they need typed confirmation — a boot-time wipe of an
+  unmarked disk would violate the fail-closed rule, so the boot path only ever touches a disk
+  carrying the `reemplazo-target-v1` marker xtask writes).
+- **Second disk.** `smoke-install` creates **two** images after `iso()`: `disk.img` (the FS1/FS2
+  FAT16 source, unchanged contract) and `target.img` — 64 MiB of zeros carrying only the wipe
+  marker at LBA0 offset 62 (no BPB, no `55 AA`: never bootable, provably *not* the source).
+  Both attach as `-drive …,if=ide`: source = master, target = slave; `ata::probe_target(unit)`
+  skips the source unit and requires the target marker.
+- **GPT: `gptwire` crate** (new workspace member, `#![no_std]`, `#![forbid(unsafe_code)]`,
+  zero deps). Reads **and** writes the full layout of §3.2: protective MBR (type `0xEE`,
+  start LBA 1, `0xFFFFFF` end CHS per UEFI spec Table 17), header at LBA1 with CRC-32 over the
+  header with its own CRC field zeroed, 128 × 128 B entry array (hard cap — a `u32::MAX` count
+  from a corrupt disk is refused before any storage is committed), mirrored backup whose
+  **bytes** are re-checksummed, pairwise overlap + usable-range validation, and checked
+  LBA→byte arithmetic at every read (`lba_bytes` is the choke point). Dependency-policy
+  exception (a), cited from §2(3): *"the OS partitions itself … it is the only option"*; the
+  CRC32 is the §3.2 budgeted glue. **49 adversarial host tests** (`gptwire/tests/hostile.rs`):
+  known CRC vectors, write→read round-trips, and one-field corruptions each asserting the exact
+  refusal (signature, revision, header size/CRC/reserved, current/backup LBA, usable range,
+  absurd/over-cap entry counts, entry size, array bounds/CRC, backup signature/CRC/offset/mirror
+  drift, corrupt backup bytes, MBR garbage vs. missing `0xEE`, out-of-range/inverted/overlapping
+  partitions, truncation, read-only writes, name/GUID handling).
+- **Formatter extraction (the choice the milestone asked for):** the FS1 xtask formatter moved
+  into the `fat` crate as **`fat::format_fat16`** — one implementation shared by xtask's
+  `write_disk_image` and the kernel's installer (the doc's "reuse/extract" option). Unlike the
+  FS1 fixed constants, the geometry is *derived* from the device size (smallest sectors/cluster
+  that lands in the FAT16 window, FAT sized from an upper bound on the cluster count, `hidden`
+  sectors carrying the partition offset), it refuses what no cluster size can express
+  (`TooSmall`/`NotFat16`), and it **re-mounts its own output through `Fat16::mount` before
+  returning**. Host tests: `fat/tests/format.rs` (8) — geometry pinned for the real sizes
+  (64 MiB superfloppy, the 126943-sector p2, 8 MiB, ~2 GiB, refusal edges), boot-sector
+  contract, file round-trip, hidden-sectors, label/refusal cases. `fat` totals **79 host tests**.
+- **Install flow (`kernel/src/install.rs`):** validate target capacity (≥ 8 MiB) → write the
+  §3.2 layout (p1 `bios_grub` 1 MiB @ 1 MiB, p2 Microsoft Basic Data to the last usable LBA —
+  GUIDs from `gptwire`, verified against Microsoft's `PARTITION_BASIC_DATA_GUID`) → **re-read
+  through `gptwire::read`** (the marker asserts the device's state, not our intent) → format p2
+  with `fat::format_fat16` → copy `/README.TXT` + `/RESULT.TXT` from the source volume (bounded
+  4 KiB buffers, `BufferTooSmall` refuses a lying size) → **re-mount p2 from scratch** and read
+  both back byte-exact → `INST_OK`. Every failure with a target present is
+  `FATAL: install: …` + `halt()`.
+- **ATA driver change this milestone forced:** `read_sectors`/`write_sectors` now issue **one
+  single-sector command per 512 B** instead of one command for the whole request. FS2 had only
+  ever proven single-sector writes; the GPT's first 32-sector write failed exactly at the
+  multi-sector DRQ handshake (QEMU re-asserts DRQ for the next sector immediately, so a
+  "wait DRQ low" completion poll never observes the low window — `FATAL: install: Write` in the
+  first I1 run). One command per transfer means only the proven handshake is ever assumed; cost
+  is ~10 port accesses per sector, noise next to the 256-word data phase.
+- **Host-side verify (§7.3's "assert after QEMU exits"):** `xtask::verify_installed_image`
+  re-reads `target.img`, parses the GPT with `gptwire`, checks p1/p2 bounds against the layout
+  constants, mounts p2 through `fat` and requires both payload files byte-exact against the
+  kernel-side constants (`README_CONTENT`/`RESULT_PAYLOAD`, duplicated as everywhere because
+  host crates cannot depend on the kernel).
+- **GRUB-on-target: deferred to I1b, honestly split.** §4's plan needs `boot.img`/`core.img`
+  *bytes inside the kernel*, and today the kernel has neither an ISO9660 reader nor the
+  multiboot2-module payload path (milestone `MOD_OK`) — the artifacts exist only on the ISO.
+  Embedding them at kernel-build time would also invert the build order (`core.img` is made by
+  `grub-mkimage` *during* `xtask iso`, after the kernel compiles). So I1 lands without GRUB:
+  the installed disk is **not yet bootable**, and `INST_OK` asserts only what it actually did
+  (GPT + FAT + files + read-back). I1b = §4's write sequence once `MOD_OK` (or an ISO reader)
+  delivers the bytes; the §4 ordering rule (GRUB boot code last = commit point) is already
+  honored in spirit by `gptwire::write`, which writes the protective MBR last.
+- **Not in I1:** `PT_OK`/`FS_OK` are folded into `INST_OK` (the GPT write + re-read and the FAT
+  format + read-back are asserted inside it — the milestone table's separate markers would be
+  redundant in the chain); shell builtins (§7.1), reboot-from-disk assert (needs GRUB), AHCI.
+- **Verified:** `cargo xtask check` exit 0; `cargo xtask smoke` PASS, all 24 markers unchanged
+  (diskless neutrality: `install::prove` never reached, and silent without a marked target);
+  `cargo xtask smoke-install` PASS — `BLK_OK + FAT_OK + FS_WRITE_OK + INST_OK` plus the host
+  verify line; `gptwire` 49 + `fat` 79 + `xtask` 2 host tests green.
 
 ---
 
