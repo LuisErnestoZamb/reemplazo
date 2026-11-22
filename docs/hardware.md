@@ -1102,3 +1102,23 @@ i8042 config byte with translation set; what monitor QEMU creates under our exac
 `-serial stdio -display none` arguments; whether the status ring advances with all
 interrupts masked; whether the default `pc` machine in our QEMU has a USB controller
 without `-usb`; ASPM state of the NIC after Apple EFI/GRUB.
+
+## Fase C — instalación en el MacBook (preparación, 2026-11-22)
+
+Estado verificado en vivo (`ssh -i ~/.ssh/mac_legacy_rescue luis@192.168.1.71`):
+
+- Disco: `sda` (FUJITSU MHW2120BH, 111.8 G), GPT con `sda1`=1 M (bios_grub),
+  `sda2`=102.4 G (Debian), `sda3`=9.3 G. DVD `sr0` MATSHITADVD-R UJ-857E.
+- firmware `MB21.88Z.00A5.B07.0706270922` (32-bit Apple EFI + BIOS emulation).
+- GRUB tiene la entrada `menuentry "reemplazo"` (kernel en
+  `/boot/reemplazo/kernel.elf` + módulo `sshd.bin`); `GRUB_DEFAULT=0` (Debian),
+  sin `next_entry` pendiente. El ciclo usa `sudo grub-reboot reemplazo && sudo reboot`.
+- **LBA0 de `/dev/sda` NO lleva el wipe-marker `reemplazo-target-v1`** (verificado
+  con `dd if=/dev/sda bs=512 count=1 | strings`). El installer lo rechazará —
+  es la salvaguarda que impide formatear el disco sin confirmación.
+
+Antes de instalar hay que, **con confirmación explícita del operador**, grabar el
+marker en LBA0 del disco destino (offset 62 del sector, sin tocar BPB ni `55 AA`).
+Ese paso destruye la tabla de particiones actual de Debian y solo debe hacerse
+cuando el operador esté delante de la máquina y haya decidido reemplazar Debian.
+No está automatizado a propósito.
