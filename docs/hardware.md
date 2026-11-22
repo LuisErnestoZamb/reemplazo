@@ -856,6 +856,57 @@ probe) and 7/8 (UHCI + HID) remain.*
 
 ---
 
+## Section 3 — Remote hardware validation setup (landed 2026-11-21, user-approved)
+
+Everything below was provisioned on the real MacBook (`luis@192.168.1.71`, key
+`~/.ssh/mac_legacy_rescue`, hostname `macbook21`) with explicit user approval
+(QEMU install + GRUB entry). Reversible: remove `/etc/grub.d/15_reemplazo` +
+`update-grub` and uninstall `qemu-system-x86`.
+
+### QEMU/KVM on the MacBook (baseline + speed tests without rebooting)
+
+- Installed: `qemu-system-x86` (Debian); `luis` added to group `kvm` (use
+  `sg kvm -c "…"` — group applies to new login sessions).
+- **Validated 2026-11-21: our ISO booted to `SHELL_OK` — 20/20 boot-phase
+  markers — on the real Core2 T7400 under `-enable-kvm -cpu host`**, no
+  SIGILL/FATAL: the x86-64-v1 baseline (SSSE3 ceiling) is clean on real
+  silicon, and DNS/TCP/TLS/HTTP/git/ssh-KEXINIT all worked through slirp.
+  QEMU exit was `timeout`-124 (expected: no keyboard phase without sendkey).
+- Reproduce (ISO must be re-scp'd after every build — see below):
+
+```
+scp -i ~/.ssh/mac_legacy_rescue target/iso-root/os.iso luis@192.168.1.71:~/reemplazo-os.iso
+ssh -i ~/.ssh/mac_legacy_rescue luis@192.168.1.71 'sg kvm -c "timeout 75 qemu-system-x86_64 \
+  -enable-kvm -cpu host -m 512 -cdrom ~/reemplazo-os.iso -display none -serial stdio \
+  -netdev user,id=n0 -device e1000,netdev=n0"'
+```
+
+### GRUB entry for remote reboot cycles (one-shot, Debian stays default)
+
+- `/boot/reemplazo/kernel.elf` (scp'd `target/iso-root/boot/kernel.elf`;
+  re-scp after every build), `/etc/grub.d/15_reemplazo` with
+  `multiboot2 /boot/reemplazo/kernel.elf` (Debian runs pure BIOS
+  i386-pc GRUB — `multiboot2.mod` present, verified).
+- `grub-script-check` passes; **`GRUB_DEFAULT` untouched (Debian remains the
+  default boot)** — the entry is selected one-shot with:
+
+```
+sudo grub-reboot reemplazo && sudo reboot   # boots OUR OS once; next reboot returns Debian
+```
+
+  Verified `grub-reboot` writes `next_entry=reemplazo`; the pending value was
+  cleared afterwards (`sudo grub-editenv /boot/grub/grubenv unset next_entry` —
+  note the correct syntax: FILE then COMMAND).
+
+### Recovery rule (until USB HID + sky2 + sshd exist)
+
+Booting our OS on real hardware is a **one-way trip**: no keyboard (MacBook
+keyboard is USB/UHCI — milestone pending), no network (sky2 driver — in
+progress), no serial port. If our OS is running on the MacBook, the only way
+back is the **physical power button**. Only run `grub-reboot` when someone is
+physically near the machine, or after sky2+sshd land (then our OS is reachable
+over the network).
+
 ## Sources
 
 **Linux sky2 driver (line numbers in this document):**
