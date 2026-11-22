@@ -65,19 +65,31 @@ pub fn seed(arg: &str) -> Option<[u8; 32]> {
 
     let mut file = [0u8; KEY_FILE_CAP];
     let n = read_from_fat(arg, &mut file)?;
-    if n == 32 {
-        // Raw seed bytes.
-        seed.copy_from_slice(&file[..32]);
-        return Some(seed);
+    let seed = decode_seed(&file[..n]);
+    if seed.is_none() {
+        // Never echo the contents — that could be the seed.
+        serial_println!("ssh-auth: {arg} is {n} bytes, not 32 raw or 64 hex digits");
     }
-    match ssh_wire::parse_seed_hex(&file[..n], &mut seed) {
-        Ok(()) => Some(seed),
-        Err(_) => {
-            // Never echo the contents — that could be the seed.
-            serial_println!("ssh-auth: {arg} is {n} bytes, not 32 raw or 64 hex digits");
-            None
-        }
+    seed
+}
+
+/// Interpret key-file bytes as a 32-byte ed25519 seed: 32 raw bytes, or
+/// 64 hex digits (surrounding ASCII whitespace allowed). The local copy
+/// of the raw bytes is scrubbed before returning — best effort, see
+/// `ssh::AuthKey`'s note on what that guarantee is worth.
+fn decode_seed(bytes: &[u8]) -> Option<[u8; 32]> {
+    let mut seed = [0u8; 32];
+    let ok = if bytes.len() == 32 {
+        seed.copy_from_slice(bytes);
+        true
+    } else {
+        ssh_wire::parse_seed_hex(bytes, &mut seed).is_ok()
+    };
+    if !ok {
+        seed.fill(0);
+        return None;
     }
+    Some(seed)
 }
 
 /// Read `path` (absolute, `/`-rooted) from the FAT16 volume on the
@@ -137,4 +149,106 @@ impl fat::BlockDevice for KeyDisk<'_> {
             Err(fat::Error::Read)
         }
     }
+}
+
+// ---- S5: the sshd's on-disk configuration -------------------------
+//
+// A disk that carries a **host key seed** and an `authorized_keys`-style
+// file turns the kernel into an sshd for one connection (`cargo xtask
+// smoke-ssh`); a disk that carries only a client seed makes the boot
+// auto-run the two-VM probe client. Everything else — including the
+// installer smoke's disk, which has neither — is silent: no listener,
+// no probe, no log line (the 29-marker `smoke` and `smoke-install`
+// chains stay untouched).
+//
+// File names are 8.3 (the `fat` crate writes/reads short names only):
+// `/HOST.BIN` (server seed), `/AUTH.KEY` (one `ssh-ed25519 …` line),
+// `/CLIENT.BIN` (client seed for the probe). Seeds accept the same two
+// encodings as `ssh-auth`: 32 raw bytes or 64 hex digits.
+
+/// The sshd host-key seed on the volume.
+pub(crate) const SERVER_SEED_PATH: &str = "/HOST.BIN";
+/// The `authorized_keys` file on the volume (one ed25519 line).
+pub(crate) const AUTHORIZED_KEYS_PATH: &str = "/AUTH.KEY";
+/// The probe client's key seed (second VM of `smoke-ssh`).
+pub(crate) const CLIENT_SEED_PATH: &str = "/CLIENT.BIN";
+
+/// Largest `authorized_keys` file accepted (a handful of lines; the
+/// milestone uses exactly one).
+const AUTHORIZED_CAP: usize = 1024;
+
+/// What an sshd needs from its disk. `client_key` is the raw ed25519
+/// public key parsed out of the authorized-keys file at boot, so a
+/// malformed file means "no listener", never a listener that cannot
+/// authorize anyone.
+pub(crate) struct ServerConfig {
+    pub host_seed: [u8; 32],
+    pub client_key: [u8; 32],
+}
+
+/// Read the sshd configuration from `dev`, or `None` **silently** when
+/// the volume does not carry one. A file that is present but malformed
+/// prints one explanatory line and yields `None`: a typo must not look
+/// like "not configured", and it must not stop the boot either.
+pub(crate) fn server_config(dev: &ata::Drive) -> Option<ServerConfig> {
+    let disk = KeyDisk(dev);
+    let fs = fat::Fat16::mount(&disk).ok()?; // not FAT16 → not ours
+    let mut raw = [0u8; KEY_FILE_CAP];
+    let n = match fs.read_file(SERVER_SEED_PATH, &mut raw) {
+        Ok(n) => n,
+        Err(fat::Error::NotFound) => return None, // no server key → neutral
+        Err(e) => {
+            serial_println!("sshd: cannot read {SERVER_SEED_PATH} ({e:?})");
+            return None;
+        }
+    };
+    let host_seed = decode_seed(&raw[..n]);
+    raw.fill(0);
+    let Some(host_seed) = host_seed else {
+        serial_println!("sshd: {SERVER_SEED_PATH} is {n} bytes, not 32 raw or 64 hex digits");
+        return None;
+    };
+
+    let mut authorized = [0u8; AUTHORIZED_CAP];
+    let m = match fs.read_file(AUTHORIZED_KEYS_PATH, &mut authorized) {
+        Ok(m) => m,
+        Err(fat::Error::NotFound) => {
+            serial_println!("sshd: no {AUTHORIZED_KEYS_PATH} on the volume; not listening");
+            return None;
+        }
+        Err(e) => {
+            serial_println!("sshd: cannot read {AUTHORIZED_KEYS_PATH} ({e:?})");
+            return None;
+        }
+    };
+    let mut client_key = [0u8; 32];
+    if ssh_wire::parse_authorized_key(&authorized[..m], &mut client_key).is_err() {
+        serial_println!(
+            "sshd: {AUTHORIZED_KEYS_PATH} holds no valid ssh-ed25519 key; not listening"
+        );
+        return None;
+    }
+    serial_println!("sshd: server key and authorized key loaded from the volume");
+    Some(ServerConfig {
+        host_seed,
+        client_key,
+    })
+}
+
+/// Read the probe client's seed from `dev`, or `None` silently. The
+/// seed itself never reaches the log.
+pub(crate) fn client_seed(dev: &ata::Drive) -> Option<[u8; 32]> {
+    let disk = KeyDisk(dev);
+    let fs = fat::Fat16::mount(&disk).ok()?;
+    let mut raw = [0u8; KEY_FILE_CAP];
+    let n = match fs.read_file(CLIENT_SEED_PATH, &mut raw) {
+        Ok(n) => n,
+        Err(_) => return None, // absent (or unreadable) → no probe
+    };
+    let seed = decode_seed(&raw[..n]);
+    raw.fill(0);
+    if seed.is_none() {
+        serial_println!("sshd-probe: {CLIENT_SEED_PATH} is {n} bytes, not 32 raw or 64 hex digits");
+    }
+    seed
 }

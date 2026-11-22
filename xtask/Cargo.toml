@@ -10,5 +10,20 @@ publish.workspace = true
 # the VM ran) through the exact reader/writer the boot proofs use;
 # `gptwire` parses the GPT the kernel wrote (installer I1's host-side
 # independent check — docs/installer.md §7.3).
+# Review (S5, docs/git-ssh-deps.md §B.4 row S5): the two-VM `smoke-ssh`
+# harness must generate ONE ed25519 keypair per run (client seed into
+# one disk image, its public blob into the other VM's authorized_keys)
+# and encode the RFC4251 key blob / base64 line. `ed25519-dalek` is the
+# same audited, RustSec-clean, no_std crate the kernel already ships
+# (§B.1, S2 review) — host tooling only, never in the OS image; xtask
+# never prints the seed. `ssh-wire` (zero-dependency, in-tree) supplies
+# the blob/base64 codecs so harness and kernel cannot drift.
+ssh-wire = { path = "../ssh-wire" }
+ed25519-dalek = { version = "3.0", default-features = false }
+# The xtask **binary** formats/verifies the smoke disks and parses the
+# GPT the kernel wrote (not just tests), so these are real dependencies,
+# not dev-dependencies: `fat` builds disk.img through the same reader/
+# writer the boot proofs use, `gptwire` is the host-side independent
+# check of installer I1.
 fat = { path = "../fat" }
 gptwire = { path = "../gptwire" }

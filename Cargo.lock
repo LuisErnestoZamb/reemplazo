@@ -1579,8 +1579,10 @@ dependencies = [
 name = "xtask"
 version = "0.1.0"
 dependencies = [
+ "ed25519-dalek",
  "fat",
  "gptwire",
+ "ssh-wire",
 ]
 
 [[package]]

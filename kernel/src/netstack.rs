@@ -276,7 +276,7 @@ pub struct LeaseInfo {
 /// sizes in docs/smoltcp-eval.md §1.6 — ~11 KiB, plus the seven extra
 /// TCP pairs the sequential smoke connections need ≈ +56 KiB).
 pub struct Storage {
-    pub slots: [SocketStorage<'static>; 11],
+    pub slots: [SocketStorage<'static>; 13],
     /// First connection (the plain-HTTP proof).
     pub tcp_rx: [u8; 4096],
     pub tcp_tx: [u8; 4096],
@@ -312,6 +312,15 @@ pub struct Storage {
     /// throughput, not a size limit.
     pub tcp8_rx: [u8; 4096],
     pub tcp8_tx: [u8; 4096],
+    /// Ninth connection (S5 sshd harness probe client, local port
+    /// 49167): the client VM dials the peer VM's sshd.
+    pub tcp9_rx: [u8; 4096],
+    pub tcp9_tx: [u8; 4096],
+    /// The sshd listener (S5): created closed, `listen(2222)` is called
+    /// only when a disk carries a server key — a diskless boot never
+    /// touches a port, so the 29-marker `smoke` chain is neutral.
+    pub tcp10_rx: [u8; 4096],
+    pub tcp10_tx: [u8; 4096],
     pub icmp_rx_pkts: [icmp::PacketMetadata; 1],
     pub icmp_rx: [u8; 256],
     pub icmp_tx_pkts: [icmp::PacketMetadata; 1],
@@ -323,7 +332,7 @@ pub struct Storage {
 impl Storage {
     pub const fn new() -> Self {
         Storage {
-            slots: [SocketStorage::EMPTY; 11],
+            slots: [SocketStorage::EMPTY; 13],
             tcp_rx: [0; 4096],
             tcp_tx: [0; 4096],
             tcp2_rx: [0; 4096],
@@ -340,6 +349,10 @@ impl Storage {
             tcp7_tx: [0; 4096],
             tcp8_rx: [0; 4096],
             tcp8_tx: [0; 4096],
+            tcp9_rx: [0; 4096],
+            tcp9_tx: [0; 4096],
+            tcp10_rx: [0; 4096],
+            tcp10_tx: [0; 4096],
             icmp_rx_pkts: [icmp::PacketMetadata::EMPTY; 1],
             icmp_rx: [0; 256],
             icmp_tx_pkts: [icmp::PacketMetadata::EMPTY; 1],
@@ -375,6 +388,11 @@ pub struct Stack {
     /// local port 49166 — like every sequential smoke connection it
     /// needs its own socket (TIME-WAIT).
     pub tcp8_handle: SocketHandle,
+    /// S5 sshd harness probe client (local port 49167).
+    pub tcp9_handle: SocketHandle,
+    /// S5 sshd listener: a socket that stays `Closed` until
+    /// [`Stack::listen_ssh`] puts it in `Listen`.
+    pub listen_handle: SocketHandle,
     pub icmp_handle: SocketHandle,
     pub dns_handle: SocketHandle,
     /// Added only after PING_OK (R7 — see module docs).
@@ -412,6 +430,10 @@ impl Stack {
             tcp7_tx,
             tcp8_rx,
             tcp8_tx,
+            tcp9_rx,
+            tcp9_tx,
+            tcp10_rx,
+            tcp10_tx,
             icmp_rx_pkts,
             icmp_rx,
             icmp_tx_pkts,
@@ -464,6 +486,14 @@ impl Stack {
             tcp::SocketBuffer::new(&mut tcp8_rx[..]),
             tcp::SocketBuffer::new(&mut tcp8_tx[..]),
         ));
+        let tcp9_handle = sockets.add(tcp::Socket::new(
+            tcp::SocketBuffer::new(&mut tcp9_rx[..]),
+            tcp::SocketBuffer::new(&mut tcp9_tx[..]),
+        ));
+        let listen_handle = sockets.add(tcp::Socket::new(
+            tcp::SocketBuffer::new(&mut tcp10_rx[..]),
+            tcp::SocketBuffer::new(&mut tcp10_tx[..]),
+        ));
         let icmp_handle = sockets.add(icmp::Socket::new(
             icmp::PacketBuffer::new(&mut icmp_rx_pkts[..], &mut icmp_rx[..]),
             icmp::PacketBuffer::new(&mut icmp_tx_pkts[..], &mut icmp_tx[..]),
@@ -478,6 +508,7 @@ impl Stack {
             tcp6_handle,
             tcp7_handle,
             tcp8_handle,
+            tcp9_handle,
         ] {
             // With `socket-tcp-reno` enabled Reno is already the
             // default; setting it documents the choice (cubic is f64
@@ -502,11 +533,32 @@ impl Stack {
             tcp6_handle,
             tcp7_handle,
             tcp8_handle,
+            tcp9_handle,
+            listen_handle,
             icmp_handle,
             dns_handle,
             dhcp_handle: None,
             lease: None,
         }
+    }
+
+    /// Put the pre-created listener socket into `Listen` on `port`
+    /// (S5). Called only when the attached disk carries a server key;
+    /// until then the socket is `Closed` and the stack never answers a
+    /// SYN — the diskless `smoke` neutrality requirement.
+    ///
+    /// smoltcp gives a listening socket to exactly one connection at a
+    /// time: after the sshd closes it, the socket is `Closed`/`TimeWait`
+    /// and a later `listen_ssh` would need it reset first. The milestone
+    /// therefore serves **one** connection per boot (documented in
+    /// `kernel/src/sshd.rs`).
+    pub fn listen_ssh(&mut self, port: u16) -> bool {
+        let sock = self.sockets.get_mut::<tcp::Socket>(self.listen_handle);
+        if sock.is_open() {
+            sock.abort();
+        }
+        sock.set_timeout(Some(Duration::from_secs(20)));
+        sock.listen(port).is_ok()
     }
 
     /// Run one stack iteration: ingress, egress, timers. Every phase

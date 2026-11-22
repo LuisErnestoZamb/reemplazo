@@ -1,4 +1,4 @@
-//! SSH milestones S2+S3 (docs/git-ssh-deps.md §B.4): full key exchange
+//! SSH milestones S2+S3 (+ S5's harness client) (docs/git-ssh-deps.md §B.4): full key exchange
 //! over **one** TCP connection against `github.com:22` — banners →
 //! `SSH_MSG_KEXINIT` negotiation (the smoke's `SSH_KEXINIT_OK`, at
 //! the same point as S1) → `curve25519-sha256` KEX → `ssh-ed25519`
@@ -55,6 +55,17 @@
 //!    out, and `USERAUTH_SUCCESS` follows (the same code path the
 //!    manual `ssh-auth` builtin drives with a real key).
 //!
+//! S5 adds the **client half of the two-VM sshd proof**:
+//! [`probe_server`] dials a peer `sshd` at the slirp gateway
+//! (`10.0.2.2:2222`, QEMU `hostfwd`), trusts that peer's host key
+//! **for the session only** (TOFU — the signature is verified against
+//! the presented key and the key plus its SHA-256 fingerprint are
+//! printed, but nothing is persisted), authenticates with the seed on
+//! this VM's disk and execs one command on a `session` channel,
+//! printing `SSHD_OK` and `SSHD_EXEC_OK` when the bytes come back.
+//! A persisted `known_hosts` and the "host key changed" warning need
+//! the filesystem milestone.
+//!
 //! Refused lines/packets/MACs print `FATAL: ssh: …` and halt: an SSH
 //! client that skips a malformed byte — or accepts a bad tag — is a
 //! client that lies about what the server said. Key material (the
@@ -83,6 +94,14 @@ use x25519_dalek::{PublicKey, StaticSecret};
 const LOCAL_PORT: u16 = 49162;
 /// The IANA `ssh` port.
 const REMOTE_PORT: u16 = 22;
+/// The sshd harness' guest-side listener port (S5).
+const SSHD_PROBE_PORT: u16 = 2222;
+/// Local port of the S5 probe connection: its own socket (TIME-WAIT),
+/// like every sequential connection here.
+const PROBE_LOCAL_PORT: u16 = 49167;
+/// How long the S5 probe keeps retrying while the peer VM's sshd is
+/// still booting (`cargo xtask smoke-ssh` starts both VMs at once).
+const PROBE_RETRY_MS: u64 = 20_000;
 /// Receive buffer for the whole connection: every server packet
 /// (plaintext or encrypted) is accumulated here, bounded — GitHub's
 /// packets are all well under 1 KiB, a declared packet that could not
@@ -132,7 +151,7 @@ fn fatal(msg: &str) -> ! {
 
 /// Copy `bytes` into `buf` as printable ASCII, returning the str —
 /// raw wire bytes never reach the serial log (or the VGA mirror).
-fn sanitize<'a>(bytes: &[u8], buf: &'a mut [u8]) -> &'a str {
+pub(crate) fn sanitize<'a>(bytes: &[u8], buf: &'a mut [u8]) -> &'a str {
     let n = bytes.len().min(buf.len());
     for (slot, &b) in buf[..n].iter_mut().zip(&bytes[..n]) {
         *slot = if b.is_ascii_graphic() || b == b' ' {
@@ -156,7 +175,7 @@ fn choice_bytes(choice: Option<&'static str>) -> &'static [u8] {
 }
 
 /// What one bounded read attempt saw.
-enum Chunk {
+pub(crate) enum Chunk {
     /// `n` bytes copied into the caller's destination.
     Ready(usize),
     /// The peer closed (FIN with nothing queued) or reset — the
@@ -169,7 +188,7 @@ enum Chunk {
 /// One stack poll + whatever the socket has ready for `dst`. Every
 /// network wait in this module goes through it, so every wait is
 /// bounded by a deadline check in the caller's loop.
-fn recv_ready(stack: &mut Stack, handle: SocketHandle, dst: &mut [u8]) -> Chunk {
+pub(crate) fn recv_ready(stack: &mut Stack, handle: SocketHandle, dst: &mut [u8]) -> Chunk {
     stack.poll();
     let (can_recv, may_recv, queued, closed) = {
         let sock = stack.sockets.get::<tcp::Socket>(handle);
@@ -219,7 +238,7 @@ fn send_all(stack: &mut Stack, handle: SocketHandle, data: &[u8]) {
 /// (RFC4253 §6: padding "SHOULD be random" — a hard requirement once
 /// it rides inside the ciphertext). S1's KEXINIT encoder still
 /// zero-fills: that packet is plaintext and carries no secrets.
-fn fill_random(buf: &mut [u8]) {
+pub(crate) fn fill_random(buf: &mut [u8]) {
     for chunk in buf.chunks_mut(4) {
         let word = crate::entropy::boot_entropy().to_le_bytes();
         chunk.copy_from_slice(&word[..chunk.len()]);
@@ -229,7 +248,7 @@ fn fill_random(buf: &mut [u8]) {
 /// Feed `bytes` into the exchange hash as an RFC4251 `string`
 /// (uint32 length prefix + bytes). The impossible length overflow is
 /// fail-closed — never an unwrap.
-fn hash_string(hasher: &mut Sha256, bytes: &[u8]) {
+pub(crate) fn hash_string(hasher: &mut Sha256, bytes: &[u8]) {
     let Ok(n) = u32::try_from(bytes.len()) else {
         fatal("string too long for the exchange hash");
     };
@@ -242,7 +261,7 @@ fn hash_string(hasher: &mut Sha256, bytes: &[u8]) {
 /// packet to the next, so it is never re-created per packet) plus the
 /// HMAC-SHA256 key. `aes128-ctr` and `aes256-ctr` are both negotiable
 /// (§B.3), hence the two arms.
-enum AesCtr {
+pub(crate) enum AesCtr {
     C128(Ctr128BE<Aes128>),
     C256(Ctr128BE<Aes256>),
 }
@@ -269,7 +288,7 @@ impl AesCtr {
 }
 
 /// One direction's live keys (RFC4253 §7.2 output + §6.4 MAC).
-struct Direction {
+pub(crate) struct Direction {
     ctr: AesCtr,
     mac_key: [u8; 32],
 }
@@ -277,7 +296,7 @@ struct Direction {
 /// Build a [`Direction`] from its derived key/IV, or `fatal` — every
 /// length here comes from our own KDF, so a rejection is a bug, not a
 /// wire condition, but it still halts instead of unwrapping.
-fn direction(key: &[u8], iv: &[u8], mac_key: [u8; 32]) -> Direction {
+pub(crate) fn direction(key: &[u8], iv: &[u8], mac_key: [u8; 32]) -> Direction {
     let ctr = match AesCtr::new(key, iv) {
         Some(ctr) => ctr,
         None => fatal("AES-CTR rejected the derived key/IV length"),
@@ -314,15 +333,15 @@ impl PacketProtector for Direction {
 /// per-direction cipher-key lengths (`aes128-ctr` = 16,
 /// `aes256-ctr` = 32; IVs are always the 16-byte AES block, MAC keys
 /// always the 32-byte HMAC-SHA256 output).
-struct Derived {
-    iv_c2s: [u8; 16],
-    iv_s2c: [u8; 16],
-    key_c2s: [u8; 32],
-    key_s2c: [u8; 32],
-    mac_c2s: [u8; 32],
-    mac_s2c: [u8; 32],
-    key_len_c2s: usize,
-    key_len_s2c: usize,
+pub(crate) struct Derived {
+    pub(crate) iv_c2s: [u8; 16],
+    pub(crate) iv_s2c: [u8; 16],
+    pub(crate) key_c2s: [u8; 32],
+    pub(crate) key_s2c: [u8; 32],
+    pub(crate) mac_c2s: [u8; 32],
+    pub(crate) mac_s2c: [u8; 32],
+    pub(crate) key_len_c2s: usize,
+    pub(crate) key_len_s2c: usize,
 }
 
 /// RFC4253 §7.2 with `HASH = SHA-256`, fed to the audited `sha2`
@@ -338,6 +357,24 @@ fn kdf_or_fatal(letter: u8, k: &[u8], h: &[u8], out: &mut [u8]) {
         serial_println!("ssh: key derivation refused: {e:?}");
         crate::halt();
     }
+}
+
+/// The same derivation without the client's halt policy, so the
+/// server (which drops a connection instead of dying) can share it.
+/// A refusal here can only be a bug on our side — every input comes
+/// from our own KDF call sites.
+pub(crate) fn kdf_checked(
+    letter: u8,
+    k: &[u8],
+    h: &[u8],
+    out: &mut [u8],
+) -> Result<(), ssh_wire::KdfError> {
+    let hash = |data: &[u8]| -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        hasher.finalize().into()
+    };
+    ssh_wire::kdf(hash, k, h, letter, h, out)
 }
 
 /// Wait for the next **plaintext** (pre-`NEWKEYS`) packet; returns the
@@ -506,7 +543,11 @@ fn handle_ext_info(payload: &[u8]) {
 /// ephemeral, so the auth verdict is `USERAUTH_FAILURE` (see
 /// [`AuthKey`]); the manual `ssh-auth` path passes a real seed.
 pub fn kex_smoke(stack: &mut Stack, ip: Ipv4Address) {
-    session(stack, ip, AuthKey::Ephemeral, true)
+    let ep = Endpoint::github(ip, stack.tcp4_handle);
+    if let Err(e) = connect(stack, &ep) {
+        fatal(e);
+    }
+    session(stack, &ep, AuthKey::Ephemeral, true, None)
 }
 
 /// Manual S3 path (`ssh-auth <seed>` in the shell): authenticate to
@@ -523,7 +564,150 @@ pub fn auth_cmd(stack: &mut Stack, seed: [u8; 32]) {
         serial_println!("ssh-auth: no DNS answer for github.com (network up?)");
         return;
     };
-    session(stack, ip, AuthKey::Seed(seed), false);
+    let ep = Endpoint::github(ip, stack.tcp4_handle);
+    if let Err(e) = connect(stack, &ep) {
+        serial_println!(
+            "ssh-auth: {e} (a previous connection may still be in TIME-WAIT, retry in ~10 s)"
+        );
+        return;
+    }
+    session(stack, &ep, AuthKey::Seed(seed), false, None);
+}
+
+/// The SSH server proof harness' client (docs/git-ssh-deps.md §B.4 row
+/// S5): connect to the peer VM's sshd at the slirp gateway
+/// (`10.0.2.2:2222` — QEMU's `hostfwd` on the container loopback
+/// forwards it to the server VM's guest :2222), authenticate with the
+/// key on this VM's disk, `exec echo SSHD_EXEC_OK` and print the
+/// returned bytes. Prints `SSHD_OK` once authenticated and
+/// `SSHD_EXEC_OK` once the exec output came back intact — the
+/// `cargo xtask smoke-ssh` markers.
+///
+/// Connect is **retried** for up to [`PROBE_RETRY_MS`]: both VMs boot
+/// concurrently, so the server may still be a few seconds away from
+/// `listen()`. Everything after the TCP handshake keeps S2/S3's
+/// fail-closed `FATAL` policy — a broken handshake must fail the
+/// smoke loudly, not be retried.
+pub fn probe_server(stack: &mut Stack, seed: [u8; 32]) {
+    let ep = Endpoint::loopback_sshd(stack.tcp9_handle);
+    let deadline = clock::now_ms() + PROBE_RETRY_MS;
+    loop {
+        match connect(stack, &ep) {
+            Ok(()) => break,
+            Err(e) => {
+                if clock::now_ms() > deadline {
+                    serial_println!("sshd-probe: {e} (peer sshd never came up)");
+                    fatal("timeout connecting to the peer sshd");
+                }
+                serial_println!("sshd-probe: {e}; retrying");
+                // Bounded: the retry loop is the whole point of the
+                // deadline above. A short pause keeps the log readable.
+                let pause = clock::now_ms() + 500;
+                while clock::now_ms() < pause {
+                    stack.poll();
+                }
+            }
+        }
+    }
+    session(
+        stack,
+        &ep,
+        AuthKey::Seed(seed),
+        false,
+        Some(b"echo SSHD_EXEC_OK"),
+    );
+}
+
+/// Where a session connects and what host-key policy it applies. The
+/// boot/manual GitHub paths pin; only the two-VM sshd harness accepts a
+/// key it has never seen (see [`HostKey::Tofu`]).
+struct Endpoint {
+    ip: Ipv4Address,
+    port: u16,
+    local_port: u16,
+    host_key: HostKey,
+    handle: SocketHandle,
+}
+
+/// Host-key policy for one connection.
+enum HostKey {
+    /// The raw ed25519 key must equal this pin (github.com).
+    Pinned([u8; 32]),
+    /// Trust-on-first-use **for this session only**: the signature is
+    /// verified against the key the server presented (so the peer
+    /// proved possession of the private half), the key and its
+    /// fingerprint are printed so the operator sees what was trusted,
+    /// and nothing is persisted. A `known_hosts` file plus the
+    /// "host key changed!" warning needs the filesystem milestone —
+    /// see docs/git-ssh-deps.md §B.4 row S5.
+    Tofu,
+}
+
+impl Endpoint {
+    fn github(ip: Ipv4Address, handle: SocketHandle) -> Self {
+        Endpoint {
+            ip,
+            port: REMOTE_PORT,
+            local_port: LOCAL_PORT,
+            host_key: HostKey::Pinned(GITHUB_ED25519_KEY),
+            handle,
+        }
+    }
+
+    /// The sshd harness peer: QEMU's slirp gateway is the container's
+    /// loopback, where the server VM's `hostfwd` listens on :2222.
+    fn loopback_sshd(handle: SocketHandle) -> Self {
+        Endpoint {
+            ip: Ipv4Address::new(
+                net::SLIRP_GATEWAY[0],
+                net::SLIRP_GATEWAY[1],
+                net::SLIRP_GATEWAY[2],
+                net::SLIRP_GATEWAY[3],
+            ),
+            port: SSHD_PROBE_PORT,
+            local_port: PROBE_LOCAL_PORT,
+            host_key: HostKey::Tofu,
+            handle,
+        }
+    }
+}
+
+/// Once per connect attempt: reset a stale socket, dial and wait for
+/// `Established`. Every failure is a bounded, printable reason — the
+/// caller decides whether that is fatal (boot/manual) or retryable
+/// (the two-VM probe).
+fn connect(stack: &mut Stack, ep: &Endpoint) -> Result<(), &'static str> {
+    {
+        let sock = stack.sockets.get_mut::<tcp::Socket>(ep.handle);
+        if sock.is_open() {
+            sock.abort(); // RST: no TIME-WAIT, so the retry is immediate
+        }
+        if sock
+            .connect(stack.iface.context(), (ep.ip, ep.port), ep.local_port)
+            .is_err()
+        {
+            return Err("tcp connect rejected (local port busy?)");
+        }
+    }
+    let deadline = clock::now_ms() + OP_DEADLINE_MS;
+    loop {
+        stack.poll();
+        match stack.sockets.get::<tcp::Socket>(ep.handle).state() {
+            tcp::State::Established => {
+                serial_println!("ssh: connected to {}:{}", ep.ip, ep.port);
+                return Ok(());
+            }
+            tcp::State::Closed if clock::now_ms() + 50 < deadline => {
+                // A RST (peer not listening yet) closes the socket;
+                // report it rather than spin to the deadline.
+                return Err("tcp connection reset before establishment");
+            }
+            _ => {}
+        }
+        if clock::now_ms() > deadline {
+            return Err("tcp connect timeout");
+        }
+    }
 }
 
 /// Where the ed25519 seed for the S3 `publickey` exchange comes from.
@@ -552,41 +736,8 @@ enum AuthKey {
     Seed([u8; 32]),
 }
 
-fn session(stack: &mut Stack, ip: Ipv4Address, keys: AuthKey, markers: bool) {
-    let handle = stack.tcp4_handle;
-
-    // 1. Connect (plain_get_smoke's deadline loop: bounded, no panic).
-    //    The manual path fails soft here: a previous connection's
-    //    TIME-WAIT can hold the local port for ~10 s, and that is a
-    //    "try again", not a broken stack.
-    {
-        let sock = stack.sockets.get_mut::<tcp::Socket>(handle);
-        if let Err(e) = sock.connect(stack.iface.context(), (ip, REMOTE_PORT), LOCAL_PORT) {
-            if markers {
-                serial_println!("ssh: connect rejected: {e:?}");
-                crate::halt();
-            }
-            serial_println!(
-                "ssh-auth: connect rejected (a previous connection may still be in TIME-WAIT, retry in ~10 s)"
-            );
-            return;
-        }
-    }
-    let deadline = clock::now_ms() + OP_DEADLINE_MS;
-    loop {
-        stack.poll();
-        if stack.sockets.get::<tcp::Socket>(handle).state() == tcp::State::Established {
-            break;
-        }
-        if clock::now_ms() > deadline {
-            if markers {
-                fatal("tcp connect timeout");
-            }
-            serial_println!("ssh-auth: connect timed out");
-            return;
-        }
-    }
-    serial_println!("ssh: connected to {ip}:{REMOTE_PORT}");
+fn session(stack: &mut Stack, ep: &Endpoint, keys: AuthKey, markers: bool, exec: Option<&[u8]>) {
+    let handle = ep.handle;
 
     // SAFETY: single-use static (see `RX`); single core and the IRQ0
     // handler never touch it.
@@ -816,10 +967,21 @@ fn session(stack: &mut Stack, ip: Ipv4Address, keys: AuthKey, markers: bool) {
         if vk.verify(&h, &Signature::from_bytes(&sig_arr)).is_err() {
             fatal("host key signature does not verify over the exchange hash");
         }
-        if hk_arr != GITHUB_ED25519_KEY {
-            fatal("server host key does not match the pinned github.com key");
+        match ep.host_key {
+            HostKey::Pinned(key) => {
+                if hk_arr != key {
+                    fatal("server host key does not match the pinned github.com key");
+                }
+                serial_println!("ssh: host key verified (ssh-ed25519, pinned)");
+            }
+            HostKey::Tofu => {
+                // The signature was verified against the presented
+                // key, so the peer proved possession of the private
+                // half. Print what we accepted — never persist it.
+                serial_println!("ssh: host key verified (ssh-ed25519, TOFU)");
+                print_public_key("ssh: TOFU host key (session only)", reply.host_key);
+            }
         }
-        serial_println!("ssh: host key verified (ssh-ed25519, pinned)");
 
         // RFC4253 §7.2: six derivations, session_id = H for the
         // first (only) key set.
@@ -997,19 +1159,29 @@ fn session(stack: &mut Stack, ip: Ipv4Address, keys: AuthKey, markers: bool) {
     // 10. S3: the `publickey` exchange (RFC4252 §7). Boot path: an
     //     ephemeral key → the expected `USERAUTH_FAILURE`. Manual path:
     //     an operator key → `PK_OK` → signed request → `SUCCESS`.
-    {
-        let mut wire = AuthWire {
-            handle,
-            tx_dir: &mut tx_dir,
-            rx_dir: &mut rx_dir,
-            enc_rx: &mut enc_rx,
-            seq_tx: &mut seq_tx,
-            seq_rx: &mut seq_rx,
-        };
-        publickey_step(stack, &mut wire, &session_id, &keys);
+    let mut wire = AuthWire {
+        handle,
+        tx_dir: &mut tx_dir,
+        rx_dir: &mut rx_dir,
+        enc_rx: &mut enc_rx,
+        seq_tx: &mut seq_tx,
+        seq_rx: &mut seq_rx,
+    };
+    let authenticated = publickey_step(stack, &mut wire, &session_id, &keys);
+
+    // 11. S5: the two-VM sshd proof continues past the auth verdict.
+    //     `SSHD_OK` is printed only on the harness path (an `exec`
+    //     command was asked for), never on the GitHub paths.
+    if let Some(command) = exec {
+        if !authenticated {
+            fatal("sshd probe: authentication was refused");
+        }
+        // machine-checked by `cargo xtask smoke-ssh`
+        serial_println!("SSHD_OK");
+        exec_step(stack, &mut wire, command);
     }
 
-    // 11. Orderly teardown (plain_get_smoke's close proof): FIN, then
+    // 12. Orderly teardown (plain_get_smoke's close proof): FIN, then
     //     require the socket to reach TimeWait or Closed.
     stack.sockets.get_mut::<tcp::Socket>(handle).close();
     let deadline = clock::now_ms() + OP_DEADLINE_MS;
@@ -1108,7 +1280,7 @@ impl AuthWire<'_, '_> {
 /// key material that ever reaches the log. `key_blob` is public by
 /// construction (RFC4252 §7: the blob is sent on the wire in the clear
 /// to every server).
-fn print_public_key(key_blob: &[u8]) {
+pub(crate) fn print_public_key(prefix: &str, key_blob: &[u8]) {
     let mut hasher = Sha256::new();
     hasher.update(key_blob);
     let digest: [u8; 32] = hasher.finalize().into();
@@ -1124,7 +1296,7 @@ fn print_public_key(key_blob: &[u8]) {
         Some(m) => core::str::from_utf8(&b64[..m]).unwrap_or("?"),
         None => "?",
     };
-    serial_println!("ssh: publickey ssh-ed25519 {text64} ({text})");
+    serial_println!("{prefix} ssh-ed25519 {text64} ({text})");
 }
 
 /// S3 (docs/git-ssh-deps.md §B.4): probe-then-sign `publickey` auth.
@@ -1147,7 +1319,7 @@ fn publickey_step(
     wire: &mut AuthWire<'_, '_>,
     session_id: &[u8; 32],
     keys: &AuthKey,
-) {
+) -> bool {
     // The seed never outlives this function: `SigningKey` keeps its
     // own copy of the scalar.
     let mut seed = match keys {
@@ -1171,7 +1343,7 @@ fn publickey_step(
         Some(n) => n,
         None => fatal("public key blob does not fit its buffer"),
     };
-    print_public_key(&key_blob[..blob_len]);
+    print_public_key("ssh: publickey", &key_blob[..blob_len]);
 
     // 1. The probe: "would this key be acceptable?" — the bytes the
     //    signed request will sign, minus the session-id prefix.
@@ -1244,18 +1416,29 @@ fn publickey_step(
     if !wants_signature {
         // The expected boot outcome: the encoding was accepted, the key
         // is not registered on any account. Not an error — and not a
-        // marker (the chain stays at 27; see docs/git-ssh-deps.md
+        // marker (the chain stays at 29; see docs/git-ssh-deps.md
         // §B.4 row S3).
         serial_println!("ssh: publickey refused (key not registered on the account)");
-        return;
+        return false;
     }
 
-    // 2. The signed request: ed25519 over `session_id || probe`
-    //    (RFC4252 §7 — the boolean in the signed data is FALSE, which
-    //    is exactly the probe we just sent).
+    // 2. The signed request: ed25519 over `session_id || request`
+    //    where `request` is the signed form (boolean TRUE) with its
+    //    signature field omitted — RFC4252 §7. Signing the probe
+    //    (boolean FALSE) is *not* what the RFC specifies and no server
+    //    accepts it; `userauth_signed_prefix` builds the exact bytes.
+    let mut prefix = [0u8; 256];
+    let prefix_len = match ssh_wire::userauth_signed_prefix(
+        ssh_wire::AUTH_USER,
+        &key_blob[..blob_len],
+        &mut prefix,
+    ) {
+        Some(n) => n,
+        None => fatal("signed-request prefix does not fit"),
+    };
     let mut signed = [0u8; 256];
     let signed_len =
-        match ssh_wire::userauth_signed_data(session_id, &probe[..probe_len], &mut signed) {
+        match ssh_wire::userauth_signed_data(session_id, &prefix[..prefix_len], &mut signed) {
             Some(n) => n,
             None => fatal("signed-data buffer is too small"),
         };
@@ -1278,6 +1461,7 @@ fn publickey_step(
     wire.send(stack, &request[..request_len]);
 
     let (s, e) = wire.recv_answer(stack);
+    let mut ok = false;
     {
         let bytes = wire.bytes();
         let Some(p) = bytes.get(s..e) else {
@@ -1292,9 +1476,8 @@ fn publickey_step(
                     serial_println!("ssh: malformed USERAUTH_SUCCESS: {err:?}");
                     crate::halt();
                 }
-                // S4 continues from here with a session channel and
-                // `exec` (git-upload-pack); S3 stops at the verdict.
                 serial_println!("ssh: authenticated with publickey (ssh-ed25519)");
+                ok = true;
             }
             ssh_wire::SSH_MSG_USERAUTH_FAILURE => {
                 // A registered-but-unauthorized key, or GitHub's
@@ -1322,4 +1505,180 @@ fn publickey_step(
         }
     }
     wire.consume();
+    ok
+}
+
+/// S5b (docs/git-ssh-deps.md §B.4 row S5): the harness' `exec` leg.
+/// Open a `session` channel, send `exec <command>`, collect the
+/// returned channel data (bounded), read `exit-status` and the close,
+/// then print the output and the `SSHD_EXEC_OK` marker **only when**
+/// the expected token came back with status 0. Any other shape is
+/// fail-closed (`FATAL`) — this leg exists to prove bytes crossed the
+/// channel, not to be lenient about what crossed it.
+fn exec_step(stack: &mut Stack, wire: &mut AuthWire<'_, '_>, command: &[u8]) {
+    /// Our sender channel id (the only client channel we open).
+    const CLIENT_CHANNEL: u32 = 0;
+    const WINDOW: u32 = 64 * 1024;
+    const MAX_PACKET: u32 = 32 * 1024;
+    const OUT_CAP: usize = 1024;
+
+    let mut buf = [0u8; 512];
+    let n = match ssh_wire::channel_open_session_payload(
+        CLIENT_CHANNEL,
+        WINDOW,
+        MAX_PACKET,
+        &mut buf,
+    ) {
+        Some(n) => n,
+        None => fatal("CHANNEL_OPEN does not fit the buffer"),
+    };
+    wire.send(stack, &buf[..n]);
+
+    let (s, e) = wire.recv_answer(stack);
+    let server_channel = {
+        let bytes = wire.bytes();
+        let Some(p) = bytes.get(s..e) else {
+            fatal("channel payload range out of bounds");
+        };
+        let Some(&msg) = p.first() else {
+            fatal("empty channel payload");
+        };
+        match msg {
+            ssh_wire::SSH_MSG_CHANNEL_OPEN_CONFIRMATION => {
+                let conf = match ssh_wire::parse_channel_open_confirmation(p) {
+                    Ok(conf) => conf,
+                    Err(err) => {
+                        serial_println!("ssh: malformed CHANNEL_OPEN_CONFIRMATION: {err:?}");
+                        crate::halt();
+                    }
+                };
+                if conf.recipient_channel != CLIENT_CHANNEL {
+                    fatal("CHANNEL_OPEN_CONFIRMATION names another channel");
+                }
+                serial_println!(
+                    "ssh: session channel open (server channel {})",
+                    conf.sender_channel
+                );
+                conf.sender_channel
+            }
+            ssh_wire::SSH_MSG_CHANNEL_OPEN_FAILURE => fatal("server refused the session channel"),
+            other => {
+                serial_println!("ssh: unexpected message {other} for CHANNEL_OPEN");
+                crate::halt();
+            }
+        }
+    };
+    wire.consume();
+
+    let n = match ssh_wire::channel_request_exec_payload(server_channel, command, true, &mut buf) {
+        Some(n) => n,
+        None => fatal("exec CHANNEL_REQUEST does not fit the buffer"),
+    };
+    wire.send(stack, &buf[..n]);
+
+    let mut out = [0u8; OUT_CAP];
+    let mut out_len = 0usize;
+    let mut exit_status = None;
+    loop {
+        let (s, e) = wire.recv_answer(stack);
+        let close = {
+            let bytes = wire.bytes();
+            let Some(p) = bytes.get(s..e) else {
+                fatal("channel payload range out of bounds");
+            };
+            let Some(&msg) = p.first() else {
+                fatal("empty channel payload");
+            };
+            match msg {
+                ssh_wire::SSH_MSG_CHANNEL_SUCCESS => {
+                    let channel = match ssh_wire::parse_channel_number(
+                        p,
+                        ssh_wire::SSH_MSG_CHANNEL_SUCCESS,
+                    ) {
+                        Ok(channel) => channel,
+                        Err(err) => {
+                            serial_println!("ssh: malformed CHANNEL_SUCCESS: {err:?}");
+                            crate::halt();
+                        }
+                    };
+                    if channel != server_channel {
+                        fatal("CHANNEL_SUCCESS names another channel");
+                    }
+                    serial_println!("ssh: exec request accepted");
+                    false
+                }
+                ssh_wire::SSH_MSG_CHANNEL_FAILURE => fatal("server refused the exec request"),
+                ssh_wire::SSH_MSG_CHANNEL_DATA => {
+                    let (channel, data) = match ssh_wire::parse_channel_data(p) {
+                        Ok(pair) => pair,
+                        Err(err) => {
+                            serial_println!("ssh: malformed CHANNEL_DATA: {err:?}");
+                            crate::halt();
+                        }
+                    };
+                    if channel != server_channel {
+                        fatal("CHANNEL_DATA names another channel");
+                    }
+                    let Some(space) = out.get_mut(out_len..out_len + data.len()) else {
+                        fatal("exec output exceeds the receive buffer");
+                    };
+                    space.copy_from_slice(data);
+                    out_len += data.len();
+                    false
+                }
+                ssh_wire::SSH_MSG_CHANNEL_EOF => false,
+                ssh_wire::SSH_MSG_CHANNEL_WINDOW_ADJUST => false,
+                ssh_wire::SSH_MSG_CHANNEL_REQUEST => match ssh_wire::parse_channel_exit_status(p) {
+                    Ok((channel, status)) if channel == server_channel => {
+                        exit_status = Some(status);
+                        false
+                    }
+                    Ok(_) => fatal("exit-status names another channel"),
+                    Err(err) => {
+                        serial_println!("ssh: malformed channel request: {err:?}");
+                        crate::halt();
+                    }
+                },
+                ssh_wire::SSH_MSG_CHANNEL_CLOSE => true,
+                other => {
+                    serial_println!("ssh: unexpected message {other} on the session channel");
+                    crate::halt();
+                }
+            }
+        };
+        wire.consume();
+        if close {
+            // RFC4254 §5.3: answer the peer's close with ours.
+            let n = match ssh_wire::channel_number_payload(
+                ssh_wire::SSH_MSG_CHANNEL_CLOSE,
+                server_channel,
+                &mut buf,
+            ) {
+                Some(n) => n,
+                None => fatal("CHANNEL_CLOSE does not fit the buffer"),
+            };
+            wire.send(stack, &buf[..n]);
+            break;
+        }
+    }
+
+    let mut sbuf = [0u8; SANITIZE_CAP];
+    let text = sanitize(&out[..out_len], &mut sbuf);
+    serial_println!("ssh: exec output: {text}");
+    match exit_status {
+        Some(0) => {}
+        Some(status) => {
+            serial_println!("ssh: exec exit-status {status}");
+            crate::halt();
+        }
+        None => fatal("exec closed without an exit-status"),
+    }
+    if !out[..out_len]
+        .windows(b"SSHD_EXEC_OK".len())
+        .any(|w| w == b"SSHD_EXEC_OK")
+    {
+        fatal("exec output does not contain SSHD_EXEC_OK");
+    }
+    // machine-checked by `cargo xtask smoke-ssh`
+    serial_println!("SSHD_EXEC_OK");
 }

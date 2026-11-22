@@ -79,6 +79,8 @@ All in Rust, all in this workspace:
 cargo xtask check   # fmt + clippy (host and kernel target) + tests + cross-build
 cargo xtask smoke   # build ISO, boot headless, assert serial markers in order
 cargo xtask smoke-install  # two IDE disks (FAT16 source + blank target); assert BLK_OK + FAT_OK + FS_WRITE_OK + FS_TREE_OK + INST_OK + GIT_CHECKOUT_OK + NETINST_OK
+cargo xtask smoke-install  # same + FAT16 IDE disk; assert BLK_OK + FAT_OK + FS_WRITE_OK + GIT_CHECKOUT_OK
+cargo xtask smoke-ssh  # two VMs: our sshd (one disk) ↔ our client (other disk) — SSHD_OK + SSHD_EXEC_OK
 cargo xtask run     # interactive boot in QEMU (Ctrl-C quits)
 cargo test -p mbi <name>   # single test
 ```
@@ -117,6 +119,24 @@ everything back byte-exact. When QEMU exits, xtask re-verifies
 `target.img` on the host — GPT + FAT + the installed kernel byte-exact
 against the built binary.
 
+
+`cargo xtask smoke-ssh` is the **ssh server**'s end-to-end proof. It
+runs two QEMUs in one container: the first boots with a FAT16 disk
+carrying `/HOST.BIN` (a generated ed25519 host-key seed) and
+`/AUTH.KEY` (the client key's `ssh-ed25519 <blob>` line), starts
+`sshd` on guest `:2222` and prints `SSHD_LISTEN_OK` … `SSHD_SESSION_OK`;
+the second boots with the matching `/CLIENT.BIN` seed and, after its
+normal boot chain, dials `10.0.2.2:2222` — the first VM publishes its
+guest `:2222` with QEMU's `hostfwd` on the container loopback, which is
+exactly where slirp's gateway leads — authenticates with `publickey`,
+execs `echo SSHD_EXEC_OK` and prints `SSHD_OK` + `SSHD_EXEC_OK`. The
+keypair is generated per run into those two disk images only (never
+printed, never committed), and a disk without `/HOST.BIN`/`/AUTH.KEY`
+gets no listener at all — the 29-marker `smoke` and `smoke-install`
+chains are untouched. The peer is trusted on first use **for the
+session** (its key and fingerprint are printed); a persisted
+`known_hosts` with change detection is pending with the filesystem
+milestone.
 
 **Notes:**
 
@@ -167,6 +187,7 @@ Milestones landed so far (see `git log` for details):
 - [x] git over HTTPS — smart-HTTP `ls-remote` advertisement (GIT_LSREMOTE_OK), depth-1 `fetch` via v0 `want`/`deepen 1`/`done` → `git-pack` decode → iterative tree walk (GIT_FETCH_OK), and a **full-tree** checkout into FAT16 — directories, long names, every blob — with a re-mount read-back (GIT_CHECKOUT_OK, `smoke-install`)
 - [x] Shell — serial-console REPL with minimal builtins (ping, resolve, netinfo, …)
 - [x] Keyboard — polled i8042 + set-1 decode feeding the shell's line discipline (QEMU `sendkey` → `KEYBOARD_OK`; MacBook needs UHCI/HID)
+- [x] SSH server (S5) — ed25519 host key + `authorized_keys` read from a FAT16 volume, listener on `:2222`, KEX as responder, encrypted `publickey` auth, one `session` channel with `exec`; `cargo xtask smoke-ssh` proves our client → our server across two QEMUs (`SSHD_OK` + `SSHD_EXEC_OK`). One connection per boot; TOFU only for the harness peer. S4 (git-over-ssh's `git-upload-pack`) and multi-connection accept are still open.
 - [ ] sky2 driver (real hardware only)
 - [ ] git, ssh, browser, AI client + editor
 - [ ] ISO installer + network installer

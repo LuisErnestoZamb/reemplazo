@@ -10,6 +10,9 @@
 //!           assert BLK_OK + FAT_OK + FS_WRITE_OK + FS_TREE_OK + INST_OK
 //!           + GIT_CHECKOUT_OK + NETINST_OK, then re-verify target.img
 //!           on the host
+//!   smoke-ssh  boot TWO VMs in one container: the first runs the sshd
+//!           from its disk, the second authenticates and execs through
+//!           QEMU's hostfwd (SSHD_OK + SSHD_EXEC_OK)
 //!   run     build + iso + boot interactively (serial on stdio; keys
 //!           can also be injected via the printed monitor address)
 //!
@@ -73,7 +76,13 @@ fn vm_container(root: &Path, kind: &str) -> String {
 /// published by Docker (`-p 127.0.0.1:PORT:PORT`) and used by
 /// [`type_echo_command`] to connect.
 fn monitor_port(root: &Path) -> u16 {
-    49152 + (checkout_hash(root) % 16384) as u16
+    monitor_port_n(root, 0)
+}
+
+/// The same port with an offset — the two-VM harness gives each QEMU
+/// its own monitor (only the client VM's is published to the host).
+fn monitor_port_n(root: &Path, n: u64) -> u16 {
+    49152 + ((checkout_hash(root).wrapping_add(n)) % 16384) as u16
 }
 
 fn main() {
@@ -92,9 +101,10 @@ fn main() {
         "iso" => iso(&root),
         "smoke" => smoke(&root),
         "smoke-install" => smoke_install(&root),
+        "smoke-ssh" => smoke_ssh(&root),
         "run" => run(&root),
         _ => {
-            eprintln!("usage: cargo xtask <check|build|iso|smoke|smoke-install|run>");
+            eprintln!("usage: cargo xtask <check|build|iso|smoke|smoke-install|smoke-ssh|run>");
             false
         }
     };
@@ -309,7 +319,21 @@ fn iso(root: &Path) -> bool {
 /// service on the container's loopback is unreachable via `-p`),
 /// while a host QEMU binds `127.0.0.1` directly.
 fn qemu_std_args(iso: &str, monitor: &str) -> Vec<String> {
-    vec![
+    qemu_std_args_ex(iso, monitor, "stdio", None)
+}
+
+/// [`qemu_std_args`] with the serial destination and an optional
+/// `hostfwd` rule (S5's two-VM harness: the server VM publishes guest
+/// :2222 on the container's loopback, so the client VM's slirp gateway
+/// `10.0.2.2:2222` reaches it). `serial` is a QEMU chardev spec —
+/// `stdio` for the observed VM, `file:/path` for the background one.
+fn qemu_std_args_ex(
+    iso: &str,
+    monitor: &str,
+    serial: &str,
+    hostfwd: Option<(&str, u16, u16)>,
+) -> Vec<String> {
+    let args = vec![
         "-m".into(),
         "256M".into(),
         "-cdrom".into(),
@@ -326,7 +350,7 @@ fn qemu_std_args(iso: &str, monitor: &str) -> Vec<String> {
         "-boot".into(),
         "order=dc".into(),
         "-serial".into(),
-        "stdio".into(),
+        serial.into(),
         "-monitor".into(),
         monitor.into(),
         "-display".into(),
@@ -336,7 +360,12 @@ fn qemu_std_args(iso: &str, monitor: &str) -> Vec<String> {
         // peer that answers ARP (gateway 10.0.2.2). Explicit device
         // (with fixed MAC) instead of relying on QEMU's implicit default.
         "-netdev".into(),
-        "user,id=net0".into(),
+        match hostfwd {
+            Some((host, host_port, guest_port)) => {
+                format!("user,id=net0,hostfwd=tcp:{host}:{host_port}-:{guest_port}")
+            }
+            None => "user,id=net0".into(),
+        },
         "-device".into(),
         "e1000,netdev=net0,mac=52:54:00:12:34:56".into(),
         // USB HID keyboard milestone: `-usb` creates QEMU's PIIX3 UHCI
@@ -353,7 +382,8 @@ fn qemu_std_args(iso: &str, monitor: &str) -> Vec<String> {
         "-usb".into(),
         "-device".into(),
         "usb-kbd".into(),
-    ]
+    ];
+    args
 }
 
 fn host_qemu() -> bool {
@@ -935,6 +965,326 @@ fn smoke_install(root: &Path) -> bool {
     verify_installed_image(&target)
 }
 
+/// S5: the two-VM sshd proof (`cargo xtask smoke-ssh`).
+///
+/// One container, two QEMUs started together:
+///
+/// - **VM1 (server)** boots with a FAT16 disk carrying `/HOST.BIN` (a
+///   generated ed25519 host-key seed) and `/AUTH.KEY` (the *client*
+///   key's `ssh-ed25519 <blob>` line). Its kernel starts the sshd on
+///   guest :2222 and waits one connection.
+/// - **VM2 (client)** boots with a disk carrying `/CLIENT.BIN` (the
+///   matching seed). After its normal boot chain it connects to
+///   `10.0.2.2:2222` — slirp's gateway is the container's loopback,
+///   where VM1's `-netdev user,...,hostfwd=tcp:0.0.0.0:2222-:2222`
+///   listens — authenticates with `publickey`, execs
+///   `echo SSHD_EXEC_OK` and prints `SSHD_OK` / `SSHD_EXEC_OK`.
+///
+/// VM1's serial goes to `target/iso-root/sshd-server-serial.log` (the
+/// bind mount at `/iso`, so the host can read it); VM2's serial is the
+/// container's stdout, drained exactly like `boot_assert`'s. Both VMs
+/// die with the container (`docker rm -f`), on every exit path.
+///
+/// Keys are generated per run (from `/dev/urandom`), live only inside
+/// the two disk images `iso()` wipes on the next build, and are never
+/// printed or committed — only the fingerprint the kernels log.
+fn smoke_ssh(root: &Path) -> bool {
+    if !iso(root) {
+        return false;
+    }
+    let iso_dir = root.join("target/iso-root");
+    let server_disk = iso_dir.join("sshd-server.img");
+    let client_disk = iso_dir.join("sshd-client.img");
+
+    let mut client_seed = [0u8; 32];
+    let mut server_seed = [0u8; 32];
+    let mut authorized = Vec::new();
+    if let Err(e) = generate_ssh_smoke_keys(&mut client_seed, &mut server_seed, &mut authorized) {
+        eprintln!("xtask: smoke-ssh: cannot generate the keypair: {e}");
+        return false;
+    }
+
+    let written = write_fat16_image(
+        &server_disk,
+        &[
+            ("README.TXT", README_CONTENT),
+            ("HOST.BIN", &server_seed[..]),
+            ("AUTH.KEY", &authorized[..]),
+        ],
+    )
+    .and_then(|()| {
+        write_fat16_image(
+            &client_disk,
+            &[
+                ("README.TXT", README_CONTENT),
+                ("CLIENT.BIN", &client_seed[..]),
+            ],
+        )
+    });
+    // The seeds only ever needed to exist in those two images.
+    client_seed.fill(0);
+    server_seed.fill(0);
+    if let Err(e) = written {
+        eprintln!("xtask: smoke-ssh: cannot create the disk images: {e}");
+        return false;
+    }
+
+    run_two_vm_ssh(root, &iso_dir, &server_disk, &client_disk)
+}
+
+/// The client VM's chain: its normal boot still resolves/fetches GitHub
+/// (DNS_OK, SSH_KEX_OK), then the S5 leg prints SSHD_OK after auth and
+/// SSHD_EXEC_OK after the exec output came back.
+const SSH_CLIENT_MARKERS: [&str; 4] = ["DNS_OK", "SSH_KEX_OK", "SSHD_OK", "SSHD_EXEC_OK"];
+/// The server VM's chain, asserted from its serial file.
+const SSH_SERVER_MARKERS: [&str; 3] = ["SSHD_LISTEN_OK", "SSHD_KEXINIT_OK", "SSHD_SESSION_OK"];
+/// Budget for the whole two-VM exchange (both boots + KEX + auth +
+/// exec). The client's own boot chain (GitHub TLS/git/ssh) is the bulk.
+const SSH_SMOKE_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// One ed25519 keypair for the harness: client seed, server (host-key)
+/// seed, and the `authorized_keys` line holding the client's **public**
+/// half. `ed25519-dalek` is xtask-only (review in `xtask/Cargo.toml`);
+/// the seed bytes come straight from `/dev/urandom` — no RNG crate.
+fn generate_ssh_smoke_keys(
+    client_seed: &mut [u8; 32],
+    server_seed: &mut [u8; 32],
+    authorized: &mut Vec<u8>,
+) -> std::io::Result<()> {
+    use ed25519_dalek::SigningKey;
+    use std::io::{Error, Read};
+
+    let mut bytes = [0u8; 64];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    client_seed.copy_from_slice(&bytes[..32]);
+    server_seed.copy_from_slice(&bytes[32..]);
+    bytes.fill(0);
+
+    let client = SigningKey::from_bytes(client_seed);
+    let mut blob = [0u8; ssh_wire::ED25519_KEY_BLOB_LEN];
+    let n = ssh_wire::ed25519_key_blob(&client.verifying_key().to_bytes(), &mut blob)
+        .ok_or_else(|| Error::other("key blob does not fit"))?;
+    let mut b64 = [0u8; 96];
+    let m = ssh_wire::base64_encode(&blob[..n], true, &mut b64)
+        .ok_or_else(|| Error::other("base64 does not fit"))?;
+    authorized.clear();
+    authorized.extend_from_slice(b"ssh-ed25519 ");
+    authorized.extend_from_slice(&b64[..m]);
+    authorized.extend_from_slice(b" reemplazo-smoke\n");
+    Ok(())
+}
+
+/// Build and run the two QEMUs in one container; assert the client's
+/// markers on stdout and the server's on its serial file. Every exit
+/// path kills the container (the orphan discipline).
+fn run_two_vm_ssh(root: &Path, iso_dir: &Path, server_disk: &Path, client_disk: &Path) -> bool {
+    if host_qemu() {
+        // Two VMs need a shared `hostfwd` on :2222; the documented
+        // backend for the smokes is the tools container (AGENTS.md).
+        eprintln!(
+            "xtask: smoke-ssh runs the two VMs inside {TOOLS_IMAGE}; \
+             the host-QEMU backend is not supported for this mode"
+        );
+        return false;
+    }
+    if let Err(e) = write_chat_mock(iso_dir) {
+        eprintln!("xtask: smoke-ssh: cannot write the chat mock: {e}");
+        return false;
+    }
+    let container = vm_container(root, "smoke-ssh");
+    rm_container(&container); // stale VM from a killed session
+    if !sh(root, "docker", &["build", "-t", TOOLS_IMAGE, "tools"]) {
+        return false;
+    }
+
+    let server_log = iso_dir.join("sshd-server-serial.log");
+    let _ = std::fs::remove_file(&server_log);
+
+    let server_name = match server_disk.file_name().and_then(|n| n.to_str()) {
+        Some(name) => name,
+        None => return false,
+    };
+    let client_name = match client_disk.file_name().and_then(|n| n.to_str()) {
+        Some(name) => name,
+        None => return false,
+    };
+
+    // VM1: serial to the bind-mounted iso dir, guest :2222 published on
+    // the container's loopback (VM2's slirp gateway).
+    let mut server_args = qemu_std_args_ex(
+        "/iso/os.iso",
+        &format!("tcp:0.0.0.0:{},server,nowait", monitor_port_n(root, 1)),
+        "file:/iso/sshd-server-serial.log",
+        Some(("0.0.0.0", 2222, 2222)),
+    );
+    server_args.push("-drive".into());
+    server_args.push(format!("file=/iso/{server_name},if=ide,format=raw"));
+
+    // VM2: serial on the container's stdout (the markers xtask reads).
+    let mut client_args = qemu_std_args_ex(
+        "/iso/os.iso",
+        &format!("tcp:127.0.0.1:{},server,nowait", monitor_port(root)),
+        "stdio",
+        None,
+    );
+    client_args.push("-drive".into());
+    client_args.push(format!("file=/iso/{client_name},if=ide,format=raw"));
+
+    let server_cmd = format!("qemu-system-x86_64 {}", join_shell_args(&server_args));
+    let script = format!(
+        "{} {} >/dev/null 2>&1 & exec qemu-system-x86_64 \"$@\"",
+        MOCK_LOOP_PREFIX, server_cmd
+    );
+
+    let mut docker_args: Vec<String> = vec![
+        "run".into(),
+        "--rm".into(),
+        "-i".into(),
+        "--name".into(),
+        container.clone(),
+        "-v".into(),
+        format!("{}:/iso", iso_dir.display()),
+        TOOLS_IMAGE.into(),
+        "sh".into(),
+        "-c".into(),
+        script,
+        "qemu-system-x86_64".into(),
+    ];
+    docker_args.extend(client_args.iter().cloned());
+
+    let mut child = match Command::new("docker")
+        .args(&docker_args)
+        .current_dir(root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            eprintln!("xtask: smoke-ssh: cannot start docker: {e}");
+            rm_container(&container);
+            return false;
+        }
+    };
+    let rx = spawn_line_reader(&mut child);
+
+    let mut next_marker = 0usize;
+    let mut collected: Vec<String> = Vec::new();
+    let client_ok = wait_for_markers(
+        &rx,
+        &SSH_CLIENT_MARKERS,
+        &mut next_marker,
+        &mut collected,
+        SSH_CLIENT_MARKERS.len(),
+        Instant::now() + SSH_SMOKE_TIMEOUT,
+        false,
+    );
+
+    let mut no_mock = None;
+    stop_vm(&mut child, Some(&container), &mut no_mock);
+
+    // The server's serial is a host-visible file (bind mount). Its last
+    // marker may still be in flight when the client finishes, so poll
+    // briefly before judging.
+    let server_ok = wait_for_file_markers(
+        &server_log,
+        &SSH_SERVER_MARKERS,
+        Instant::now() + Duration::from_secs(5),
+    );
+
+    if client_ok && server_ok {
+        println!(
+            "smoke-ssh: PASS — client {}; server {}",
+            SSH_CLIENT_MARKERS.join(" + "),
+            SSH_SERVER_MARKERS.join(" + ")
+        );
+        true
+    } else {
+        if !client_ok {
+            let missing = SSH_CLIENT_MARKERS[next_marker..].join(" + ");
+            eprintln!("smoke-ssh: FAIL — client missing {missing} within {SSH_SMOKE_TIMEOUT:?}");
+        }
+        if !server_ok {
+            eprintln!(
+                "smoke-ssh: FAIL — server did not print {} in order",
+                SSH_SERVER_MARKERS.join(" + ")
+            );
+        }
+        for line in &collected {
+            eprintln!("smoke-ssh| {line}");
+        }
+        if let Ok(log) = std::fs::read_to_string(&server_log) {
+            for line in log.lines() {
+                eprintln!("smoke-ssh|srv| {line}");
+            }
+        }
+        false
+    }
+}
+
+/// The A3/A5 chat mock without the `exec` tail: the two-VM script needs
+/// it in the background beside the server VM (same five connections,
+/// same `/iso` response file — VM2 is the only VM that posts).
+const MOCK_LOOP_PREFIX: &str = "for i in 1 2 3 4 5; do \
+     nc -l -s 127.0.0.1 -p 8099 < /iso/chat-mock-response.txt > /dev/null 2>&1 || true; \
+     done &";
+
+/// Join already-space-free QEMU arguments into one `sh -c` word list.
+/// Every argument this harness builds is a path/flag with no spaces
+/// (asserted), so a plain join is exact — no shell quoting ambiguity.
+fn join_shell_args(args: &[String]) -> String {
+    debug_assert!(
+        args.iter().all(|a| !a.contains(char::is_whitespace)),
+        "qemu args must be space-free for the two-VM shell command"
+    );
+    args.join(" ")
+}
+
+/// Drain a child's stdout+stderr into a line channel (the same reader
+/// `boot_assert` uses).
+fn spawn_line_reader(child: &mut Child) -> mpsc::Receiver<String> {
+    let (tx, rx) = mpsc::channel::<String>();
+    let mut pipes: Vec<Box<dyn std::io::Read + Send>> = Vec::new();
+    if let Some(out) = child.stdout.take() {
+        pipes.push(Box::new(out));
+    }
+    if let Some(err) = child.stderr.take() {
+        pipes.push(Box::new(err));
+    }
+    for pipe in pipes {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(pipe).lines().map_while(Result::ok) {
+                let _ = tx.send(line);
+            }
+        });
+    }
+    drop(tx);
+    rx
+}
+
+/// Read `path` until every marker appears in order (or the deadline
+/// passes). Used for the background server VM's serial file.
+fn wait_for_file_markers(path: &Path, markers: &[&str], deadline: Instant) -> bool {
+    loop {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            let mut next = 0usize;
+            for line in text.lines() {
+                if next < markers.len() && line.contains(markers[next]) {
+                    next += 1;
+                }
+            }
+            if next == markers.len() {
+                return true;
+            }
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// Fixed installer-smoke disk size: 64 MiB is plenty for the installer
 /// milestones (payload ≈1 MB) and cheap to (re)create every run — and
 /// both images share it, so source and target differ only in content.
@@ -1050,6 +1400,154 @@ fn write_disk_image(path: &Path) -> std::io::Result<()> {
             .map_err(|e| std::io::Error::other(format!("fat::write_file: {e:?}")))?;
     }
     std::fs::write(path, &*img.0.borrow())
+}
+
+// --- FAT16 geometry of the smoke disk ------------------------------------
+//
+// Fixed on purpose: `write_disk_image` writes these regions
+// back-to-back (boot, FAT0, FAT1, root, data), and the kernel's
+// `fs::prove` re-derives every offset from the BPB it reads back — so
+// the two sides are a contract, not a coincidence. `FAT_CLUSTERS` is
+// never written to the disk (FAT16 has no cluster-count field); the
+// const asserts below pin the invariants the reader enforces.
+const SECTOR_SIZE: usize = 512;
+const FAT_RESERVED: u32 = 1;
+const FAT_COUNT: u32 = 2;
+const FAT_SECTORS: u32 = 64;
+const FAT_ROOT_ENTRIES: u32 = 512;
+const FAT_ROOT_SECTORS: u32 = FAT_ROOT_ENTRIES * 32 / SECTOR_SIZE as u32;
+const FAT_SPC: u32 = 8; // sectors/cluster → 4 KiB clusters
+const FAT_TOTAL_SECTORS: u32 = (DISK_IMAGE_BYTES / SECTOR_SIZE as u64) as u32;
+const FAT_DATA_START: u32 = FAT_RESERVED + FAT_COUNT * FAT_SECTORS + FAT_ROOT_SECTORS;
+const FAT_CLUSTERS: u32 = (FAT_TOTAL_SECTORS - FAT_DATA_START) / FAT_SPC;
+
+/// The reader refuses volumes outside the FAT16 cluster window, and the
+/// FAT must physically fit its reserved sectors — a geometry change
+/// that breaks either fails the *build*, not a 40 s QEMU run.
+const _: () = assert!(FAT_CLUSTERS >= 4085 && FAT_CLUSTERS <= 65524);
+const _: () = assert!(FAT_CLUSTERS + 2 <= FAT_SECTORS * (SECTOR_SIZE as u32 / 2));
+
+/// Cluster `/README.TXT` starts in (first data cluster).
+const README_CLUSTER: u32 = 2;
+
+fn write_fat16_image(path: &Path, files: &[(&str, &[u8])]) -> std::io::Result<()> {
+    use std::io::ErrorKind;
+    if files.len() > FAT_ROOT_ENTRIES as usize {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "too many root entries for the fixed FAT16 root",
+        ));
+    }
+    let cluster_bytes = FAT_SPC as usize * SECTOR_SIZE;
+    let mut f = std::fs::File::create(path)?;
+    f.set_len(DISK_IMAGE_BYTES)?; // sparse zeros first; the prefix is written below
+
+    // Boot sector: a spec-shaped BPB (every field `fat::Fat16::mount`
+    // validates is set here), magic in the bootstrap area.
+    let mut boot = [0u8; SECTOR_SIZE];
+    boot[0..3].copy_from_slice(&[0xEB, 0x3C, 0x90]); // jump over the BPB
+    boot[3..11].copy_from_slice(b"MSDOS5.0"); // OEM name
+    boot[11..13].copy_from_slice(&(SECTOR_SIZE as u16).to_le_bytes());
+    boot[13] = FAT_SPC as u8;
+    boot[14..16].copy_from_slice(&(FAT_RESERVED as u16).to_le_bytes());
+    boot[16] = FAT_COUNT as u8;
+    boot[17..19].copy_from_slice(&(FAT_ROOT_ENTRIES as u16).to_le_bytes());
+    // total16 (19..21) stays 0: 131072 sectors needs the 32-bit field.
+    boot[21] = 0xF8; // media descriptor (fixed disk)
+    boot[22..24].copy_from_slice(&(FAT_SECTORS as u16).to_le_bytes());
+    boot[24..26].copy_from_slice(&63u16.to_le_bytes()); // sectors/track
+    boot[26..28].copy_from_slice(&255u16.to_le_bytes()); // heads
+    // hidden (28..32) stays 0: the volume starts at LBA0.
+    boot[32..36].copy_from_slice(&FAT_TOTAL_SECTORS.to_le_bytes());
+    boot[36] = 0x80; // drive number
+    boot[38] = 0x29; // extended boot signature → next three fields valid
+    boot[39..43].copy_from_slice(&0x2026_1121u32.to_le_bytes()); // volume id
+    boot[43..54].copy_from_slice(b"REEMPLAZO  ");
+    boot[54..62].copy_from_slice(b"FAT16   ");
+    boot[DISK_MAGIC_OFFSET..DISK_MAGIC_OFFSET + DISK_MAGIC.len()].copy_from_slice(DISK_MAGIC);
+    boot[DISK_MAGIC_OFFSET + DISK_MAGIC.len()] = magic_checksum();
+    boot[510] = 0x55; // signature: the last thing `mount` checks
+    boot[511] = 0xAA;
+    f.write_all(&boot)?;
+
+    // Two identical FATs: media/end-of-chain bookkeeping plus one
+    // contiguous chain per file, in allocation order from cluster 2.
+    let mut fat = vec![0u8; FAT_SECTORS as usize * SECTOR_SIZE];
+    fat[0..2].copy_from_slice(&0xFFF8u16.to_le_bytes()); // cluster 0: media
+    fat[2..4].copy_from_slice(&0xFFFFu16.to_le_bytes()); // cluster 1: reserved
+
+    let mut root = vec![0u8; FAT_ROOT_SECTORS as usize * SECTOR_SIZE];
+    let mut data: Vec<u8> = Vec::new();
+    let mut next_cluster = README_CLUSTER;
+    for (i, (name, content)) in files.iter().enumerate() {
+        let (base, ext) = split_8_3(name)?;
+        let clusters = content.len().max(1).div_ceil(cluster_bytes);
+        let last = next_cluster as usize + clusters;
+        if last > FAT_CLUSTERS as usize + 2 {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                "files do not fit the FAT16 data region",
+            ));
+        }
+        for c in 0..clusters {
+            let cluster = next_cluster + c as u32;
+            let value = if c + 1 == clusters {
+                0xFFFFu16 // end of chain
+            } else {
+                (cluster + 1) as u16
+            };
+            let at = cluster as usize * 2;
+            fat[at..at + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        let entry = &mut root[i * 32..i * 32 + 32];
+        entry[0..8].copy_from_slice(&base);
+        entry[8..11].copy_from_slice(&ext);
+        entry[11] = 0x20; // archive
+        entry[26..28].copy_from_slice(&(next_cluster as u16).to_le_bytes());
+        entry[28..32].copy_from_slice(&(content.len() as u32).to_le_bytes());
+
+        data.extend_from_slice(content);
+        data.resize(data.len() + clusters * cluster_bytes - content.len(), 0);
+        next_cluster += clusters as u32;
+    }
+    f.write_all(&fat)?;
+    f.write_all(&fat)?;
+    f.write_all(&root)?;
+    f.write_all(&data)?;
+    f.sync_all()?;
+    Ok(())
+}
+
+/// `"NAME.EXT"` → the fixed 8+3 bytes a FAT root entry holds (upper
+/// case, space padded). Anything else is refused: this writer never
+/// invents an LFN entry.
+fn split_8_3(name: &str) -> std::io::Result<([u8; 8], [u8; 3])> {
+    use std::io::ErrorKind;
+    let (base, ext) = match name.split_once('.') {
+        Some((base, ext)) => (base, ext),
+        None => (name, ""),
+    };
+    if base.is_empty()
+        || base.len() > 8
+        || ext.len() > 3
+        || base.contains('.')
+        || !base.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        || !ext.bytes().all(|b| b.is_ascii_alphanumeric())
+    {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("{name} is not 8.3-encodable"),
+        ));
+    }
+    let mut out_base = [b' '; 8];
+    let mut out_ext = [b' '; 3];
+    for (slot, byte) in out_base.iter_mut().zip(base.bytes()) {
+        *slot = byte.to_ascii_uppercase();
+    }
+    for (slot, byte) in out_ext.iter_mut().zip(ext.bytes()) {
+        *slot = byte.to_ascii_uppercase();
+    }
+    Ok((out_base, out_ext))
 }
 
 /// Create the 64 MiB **blank target** image: all zeros except the

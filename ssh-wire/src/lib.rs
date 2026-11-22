@@ -471,44 +471,7 @@ pub const KEXINIT_WIRE_MAX: usize = 512;
 /// encoder grows a caller-provided random-padding input — no RNG in
 /// this zero-dependency codec).
 pub fn encode_kexinit(cookie: &[u8; 16], out: &mut [u8]) -> Option<usize> {
-    // Payload: type + cookie + ten (len, list) pairs + bool + reserved.
-    let payload_length = 1 + 16 + 10 * 4 + OUR_LISTS.iter().map(|l| l.len()).sum::<usize>() + 1 + 4;
-    // Bytes on the wire before padding: length field + padding_length
-    // byte + payload.
-    let unpadded = 4 + 1 + payload_length;
-    let mut padding = (BLOCK_SIZE - unpadded % BLOCK_SIZE) % BLOCK_SIZE;
-    if padding < MIN_PADDING {
-        padding += BLOCK_SIZE;
-    }
-    let packet_length = 1 + payload_length + padding;
-    let total = 4 + packet_length;
-    if total > out.len() || total > KEXINIT_WIRE_MAX {
-        return None;
-    }
-    let dst = out.get_mut(..total)?;
-    let mut w = 0usize;
-    dst[w..w + 4].copy_from_slice(&u32::try_from(packet_length).ok()?.to_be_bytes());
-    w += 4;
-    dst[w] = u8::try_from(padding).ok()?;
-    w += 1;
-    dst[w] = SSH_MSG_KEXINIT;
-    w += 1;
-    dst[w..w + 16].copy_from_slice(cookie);
-    w += 16;
-    for list in OUR_LISTS {
-        dst[w..w + 4].copy_from_slice(&u32::try_from(list.len()).ok()?.to_be_bytes());
-        w += 4;
-        dst[w..w + list.len()].copy_from_slice(list.as_bytes());
-        w += list.len();
-    }
-    dst[w] = 0; // first_kex_packet_follows = false
-    w += 1;
-    dst[w..w + 4].copy_from_slice(&0u32.to_be_bytes()); // reserved = 0
-    // Zero the padding explicitly: `out` may hold caller garbage.
-    for byte in dst[w..].iter_mut() {
-        *byte = 0;
-    }
-    Some(total)
+    encode_kexinit_lists(OUR_LISTS, cookie, out)
 }
 
 /// Does the comma-separated name-list `list` contain `name`?
@@ -1032,6 +995,12 @@ pub enum UserAuthError {
     /// `SSH_MSG_USERAUTH_PK_OK` echoed a blob that is not a
     /// well-formed `ssh-ed25519` public key.
     BadKey,
+    /// A `publickey` request carried a signature blob that is not
+    /// `string "ssh-ed25519" || string` of 64 bytes.
+    BadSignature,
+    /// A well-formed request for an auth method this server does not
+    /// implement (anything but `none`/`publickey`).
+    UnsupportedMethod,
 }
 
 /// Parse a complete `SSH_MSG_USERAUTH_FAILURE` **payload** (message
@@ -1186,6 +1155,8 @@ pub enum KeyError {
     BadHexLength,
     /// A hex seed contains a non-hex-digit byte.
     NotHex,
+    /// An `authorized_keys` base64 body is not strict RFC4648 base64.
+    NotBase64,
 }
 
 /// Encode `string "ssh-ed25519" || string <key>` — the public-key blob
@@ -1260,14 +1231,36 @@ pub fn parse_ed25519_signature_blob(blob: &[u8]) -> Result<[u8; ED25519_SIGNATUR
 /// ```
 ///
 /// With `signature = None` this is the **probe** — "would you accept
-/// this key?" — and its bytes are *exactly* the request the signed form
-/// signs (prefixed by the session identifier): see
-/// [`userauth_signed_data`]. Both the key blob and (when present) the
-/// signature blob are parsed back first, so a malformed blob can never
-/// reach the wire with a `TRUE` boolean claiming it is signed.
+/// this key?" — which is *not* what the signature covers: RFC4252 §7
+/// signs the signed form (boolean TRUE) with the signature field
+/// omitted, i.e. [`userauth_signed_prefix`] prefixed by the session
+/// identifier ([`userauth_signed_data`]). Both the key blob and (when
+/// present) the signature blob are parsed back first, so a malformed
+/// blob can never reach the wire with a `TRUE` boolean claiming it is
+/// signed.
 pub fn userauth_publickey_payload(
     user: &[u8],
     key_blob: &[u8],
+    signature: Option<&[u8]>,
+    out: &mut [u8],
+) -> Option<usize> {
+    let signed = signature.is_some();
+    userauth_publickey_payload_inner(user, key_blob, signed, signature, out)
+}
+
+/// The `SSH_MSG_USERAUTH_REQUEST` prefix a `publickey` **signature**
+/// covers (RFC4252 §7): the request with `boolean TRUE` and **no**
+/// signature field — i.e. the signed request as sent, minus its last
+/// `string signature`. Signing the probe (boolean FALSE) is a common
+/// mistake and no server accepts it.
+pub fn userauth_signed_prefix(user: &[u8], key_blob: &[u8], out: &mut [u8]) -> Option<usize> {
+    userauth_publickey_payload_inner(user, key_blob, true, None, out)
+}
+
+fn userauth_publickey_payload_inner(
+    user: &[u8],
+    key_blob: &[u8],
+    signed: bool,
     signature: Option<&[u8]>,
     out: &mut [u8],
 ) -> Option<usize> {
@@ -1276,6 +1269,9 @@ pub fn userauth_publickey_payload(
     }
     // Fail closed on anything but a well-formed ed25519 key blob.
     let _key = parse_ed25519_key_blob(key_blob).ok()?;
+    if signature.is_some() && !signed {
+        return None;
+    }
     let sig_len = match signature {
         Some(sig) => {
             let _raw = parse_ed25519_signature_blob(sig).ok()?;
@@ -1304,7 +1300,7 @@ pub fn userauth_publickey_payload(
     w += encode_string(user, &mut dst[w..])?;
     w += encode_string(AUTH_SERVICE, &mut dst[w..])?;
     w += encode_string(AUTH_METHOD_PUBLICKEY, &mut dst[w..])?;
-    dst[w] = u8::from(sig_len.is_some());
+    dst[w] = u8::from(signed);
     w += 1;
     w += encode_string(ED25519, &mut dst[w..])?;
     w += encode_string(key_blob, &mut dst[w..])?;
@@ -1318,9 +1314,9 @@ pub fn userauth_publickey_payload(
 
 /// The data an ed25519 `publickey` signature covers (RFC4252 §7 with
 /// RFC4253 §8's "session identifier"): `session_id || request`, where
-/// `request` is the `SSH_MSG_USERAUTH_REQUEST` payload **without** the
-/// signature field — i.e. exactly the bytes
-/// [`userauth_publickey_payload`] produced for the probe.
+/// `request` is the signed `SSH_MSG_USERAUTH_REQUEST` payload **without**
+/// its signature field — [`userauth_signed_prefix`], *not* the probe
+/// (the probe carries boolean FALSE, the signed form TRUE).
 pub fn userauth_signed_data(
     session_id: &[u8],
     request_without_signature: &[u8],
@@ -1857,6 +1853,792 @@ impl<'a> EncryptedRx<'a> {
             return Ok(None);
         }
     }
+}
+
+// ---- S5: server side (KEX responder, user auth, session channels) ----
+//
+// The mirror image of the client glue above. Same rules: pure wire
+// layout, caller-provided buffers, no primitive and no allocation. Every
+// parser is fail-closed — the kernel turns an `Err` into "drop the
+// connection with a bounded reason", never into a retry or a guess.
+
+/// The server's cipher list: exactly the one cipher the sshd
+/// implements (docs/git-ssh-deps.md §B.4 row S5). Our client lists
+/// `aes128-ctr` first, so the intersection stays there.
+pub const SERVER_ENCRYPTION_ALGORITHMS: &str = "aes128-ctr";
+
+/// The ten name-lists the server sends (RFC4253 §7.1 wire order).
+/// `ext-info-s` is deliberately absent: we never send EXT_INFO.
+pub const SERVER_LISTS: [&str; 10] = [
+    SERVER_KEX_ALGORITHMS,
+    HOST_KEY_ALGORITHMS,
+    SERVER_ENCRYPTION_ALGORITHMS,
+    SERVER_ENCRYPTION_ALGORITHMS,
+    MAC_ALGORITHMS,
+    MAC_ALGORITHMS,
+    COMPRESSION_ALGORITHMS,
+    COMPRESSION_ALGORITHMS,
+    "",
+    "",
+];
+
+/// The kex list a server sends. As a responder the server must not
+/// advertise the client-only `ext-info-c` signal.
+pub const SERVER_KEX_ALGORITHMS: &str = "curve25519-sha256";
+
+/// Encode any ten name-lists as one framed `SSH_MSG_KEXINIT` (the two
+/// public wrappers below pick the client's or the server's fixed set).
+fn encode_kexinit_lists(lists: [&str; 10], cookie: &[u8; 16], out: &mut [u8]) -> Option<usize> {
+    let payload_length = 1 + 16 + 10 * 4 + lists.iter().map(|l| l.len()).sum::<usize>() + 1 + 4;
+    let unpadded = 4 + 1 + payload_length;
+    let mut padding = (BLOCK_SIZE - unpadded % BLOCK_SIZE) % BLOCK_SIZE;
+    if padding < MIN_PADDING {
+        padding += BLOCK_SIZE;
+    }
+    let packet_length = 1 + payload_length + padding;
+    let total = 4 + packet_length;
+    if total > out.len() || total > KEXINIT_WIRE_MAX {
+        return None;
+    }
+    let dst = out.get_mut(..total)?;
+    let mut w = 0usize;
+    dst[w..w + 4].copy_from_slice(&u32::try_from(packet_length).ok()?.to_be_bytes());
+    w += 4;
+    dst[w] = u8::try_from(padding).ok()?;
+    w += 1;
+    dst[w] = SSH_MSG_KEXINIT;
+    w += 1;
+    dst[w..w + 16].copy_from_slice(cookie);
+    w += 16;
+    for list in lists {
+        dst[w..w + 4].copy_from_slice(&u32::try_from(list.len()).ok()?.to_be_bytes());
+        w += 4;
+        dst[w..w + list.len()].copy_from_slice(list.as_bytes());
+        w += list.len();
+    }
+    dst[w] = 0; // first_kex_packet_follows = false
+    w += 1;
+    dst[w..w + 4].copy_from_slice(&0u32.to_be_bytes()); // reserved = 0
+    for byte in dst[w..].iter_mut() {
+        *byte = 0;
+    }
+    Some(total)
+}
+
+/// Encode the **server's** `SSH_MSG_KEXINIT` (S5) as a ready-to-send
+/// plaintext packet. Same framing rules as [`encode_kexinit`].
+pub fn encode_kexinit_server(cookie: &[u8; 16], out: &mut [u8]) -> Option<usize> {
+    encode_kexinit_lists(SERVER_LISTS, cookie, out)
+}
+
+/// Intersect a **client's** KEXINIT with the server's fixed lists —
+/// the mirror of [`intersect`]. RFC4253 §7.1 still gives the client's
+/// ordering the choice; the server's lists are single-entry, so this
+/// is "does the client offer what we implement".
+pub fn intersect_as_server(client: &KexInit<'_>) -> Negotiated {
+    // The server's lists are single-entry, so the negotiated value is
+    // always *our* static name (never a string borrowed from the
+    // client's packet) — `Negotiated`'s `'static` fields stay honest.
+    let has =
+        |list: &[u8], ours: &'static str| namelist_contains(list, ours.as_bytes()).then_some(ours);
+    Negotiated {
+        kex: has(client.kex_algorithms, SERVER_KEX_ALGORITHMS),
+        host_key: has(client.server_host_key_algorithms, HOST_KEY_ALGORITHMS),
+        enc_c2s: has(
+            client.encryption_algorithms_c2s,
+            SERVER_ENCRYPTION_ALGORITHMS,
+        ),
+        enc_s2c: has(
+            client.encryption_algorithms_s2c,
+            SERVER_ENCRYPTION_ALGORITHMS,
+        ),
+        mac_c2s: has(client.mac_algorithms_c2s, MAC_ALGORITHMS),
+        mac_s2c: has(client.mac_algorithms_s2c, MAC_ALGORITHMS),
+        comp_c2s: has(client.compression_algorithms_c2s, COMPRESSION_ALGORITHMS),
+        comp_s2c: has(client.compression_algorithms_s2c, COMPRESSION_ALGORITHMS),
+    }
+}
+
+/// Parse a `SSH_MSG_KEXDH_INIT` payload (RFC8731 §3): message byte +
+/// `string` of exactly 32 X25519 bytes, not all-zero.
+pub fn parse_kexdh_init(payload: &[u8]) -> Result<[u8; ED25519_KEY_LEN], KexDhError> {
+    let read = |_: KexError| KexDhError::Truncated;
+    let mut r = Reader {
+        buf: payload,
+        pos: 0,
+    };
+    if r.u8().map_err(read)? != SSH_MSG_KEXDH_INIT {
+        return Err(KexDhError::WrongMessage);
+    }
+    let len = r.u32().map_err(read)?;
+    if len != 32 {
+        return Err(KexDhError::BadPublicKey);
+    }
+    let e = r.take(32).map_err(read)?;
+    if e.iter().all(|&b| b == 0) {
+        return Err(KexDhError::ZeroPublicKey);
+    }
+    if r.pos != payload.len() {
+        return Err(KexDhError::TrailingGarbage);
+    }
+    <[u8; 32]>::try_from(e).map_err(|_| KexDhError::BadPublicKey)
+}
+
+/// Encode a `SSH_MSG_KEXDH_REPLY` payload (RFC4253 §8 / RFC8731 §3):
+/// `K_S`, the server's 32-byte ephemeral value `f`, and the ed25519
+/// signature blob over the exchange hash. Both blobs are re-validated
+/// first, so a malformed key can never be signed for or sent.
+pub fn kexdh_reply_payload(
+    host_key_blob: &[u8],
+    f: &[u8; 32],
+    signature_blob: &[u8],
+    out: &mut [u8],
+) -> Option<usize> {
+    let _ = parse_ed25519_key_blob(host_key_blob).ok()?;
+    let _ = parse_ed25519_signature_blob(signature_blob).ok()?;
+    let total = 1usize
+        .checked_add(4)?
+        .checked_add(host_key_blob.len())?
+        .checked_add(4)?
+        .checked_add(32)?
+        .checked_add(4)?
+        .checked_add(signature_blob.len())?;
+    let dst = out.get_mut(..total)?;
+    let mut w = 0usize;
+    dst[w] = SSH_MSG_KEXDH_REPLY;
+    w += 1;
+    w += encode_string(host_key_blob, &mut dst[w..])?;
+    w += encode_string(f, &mut dst[w..])?;
+    w += encode_string(signature_blob, &mut dst[w..])?;
+    Some(w)
+}
+
+/// Parse a `SSH_MSG_SERVICE_REQUEST` payload, returning the service
+/// name (the caller checks it is `"ssh-userauth"`).
+pub fn parse_service_request(payload: &[u8]) -> Result<&[u8], ServiceError> {
+    let read = |_: KexError| ServiceError::Truncated;
+    let mut r = Reader {
+        buf: payload,
+        pos: 0,
+    };
+    if r.u8().map_err(read)? != SSH_MSG_SERVICE_REQUEST {
+        return Err(ServiceError::WrongMessage);
+    }
+    let nlen = r.u32().map_err(read)?;
+    let nlen = usize::try_from(nlen).map_err(|_| ServiceError::Truncated)?;
+    let name = r.take(nlen).map_err(read)?;
+    if r.pos != payload.len() {
+        return Err(ServiceError::TrailingGarbage);
+    }
+    Ok(name)
+}
+
+/// Encode `SSH_MSG_SERVICE_ACCEPT` for `name` (RFC4253 §10).
+pub fn service_accept_payload(name: &[u8], out: &mut [u8]) -> Option<usize> {
+    let total = 1usize.checked_add(4)?.checked_add(name.len())?;
+    let dst = out.get_mut(..total)?;
+    dst[0] = SSH_MSG_SERVICE_ACCEPT;
+    Some(1 + encode_string(name, &mut dst[1..])?)
+}
+
+/// A parsed `SSH_MSG_USERAUTH_REQUEST` (RFC4252 §5/§7). Slices point
+/// into the caller's payload; nothing is copied. For methods other
+/// than `publickey` the key/signature fields are empty and
+/// `signed_prefix` is unused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UserAuthRequest<'a> {
+    pub user: &'a [u8],
+    pub service: &'a [u8],
+    pub method: &'a [u8],
+    /// `TRUE` when a signature follows (publickey method).
+    pub has_signature: bool,
+    /// `ssh-ed25519` for a publickey request.
+    pub algorithm: &'a [u8],
+    /// The `string "ssh-ed25519" || string key` blob as sent.
+    pub key_blob: &'a [u8],
+    /// The signature blob as sent (empty when `has_signature` is false).
+    pub signature: &'a [u8],
+    /// The request payload **without** the signature field — the piece
+    /// the client's signature covers, prefixed by the session id
+    /// (RFC4252 §7). Includes the `TRUE` boolean.
+    pub signed_prefix: &'a [u8],
+}
+
+/// Parse a complete `SSH_MSG_USERAUTH_REQUEST` **payload** (message
+/// byte included). Only the `none` and `publickey` methods are
+/// understood — anything else is refused, so an unsupported method
+/// never reaches the auth decision.
+pub fn parse_userauth_request(payload: &[u8]) -> Result<UserAuthRequest<'_>, UserAuthError> {
+    let read = |e: KexError| match e {
+        KexError::Truncated => UserAuthError::Truncated,
+        _ => UserAuthError::Truncated,
+    };
+    let mut r = Reader {
+        buf: payload,
+        pos: 0,
+    };
+    if r.u8().map_err(read)? != SSH_MSG_USERAUTH_REQUEST {
+        return Err(UserAuthError::WrongMessage);
+    }
+    let ulen = r.u32().map_err(read)?;
+    let ulen = usize::try_from(ulen).map_err(|_| UserAuthError::Truncated)?;
+    let user = r.take(ulen).map_err(read)?;
+    if user.is_empty() {
+        return Err(UserAuthError::Truncated);
+    }
+    let slen = r.u32().map_err(read)?;
+    let slen = usize::try_from(slen).map_err(|_| UserAuthError::Truncated)?;
+    let service = r.take(slen).map_err(read)?;
+    let mlen = r.u32().map_err(read)?;
+    let mlen = usize::try_from(mlen).map_err(|_| UserAuthError::Truncated)?;
+    let method = r.take(mlen).map_err(read)?;
+    if method == b"none" {
+        if r.pos != payload.len() {
+            return Err(UserAuthError::TrailingGarbage);
+        }
+        return Ok(UserAuthRequest {
+            user,
+            service,
+            method,
+            has_signature: false,
+            algorithm: &[],
+            key_blob: &[],
+            signature: &[],
+            signed_prefix: payload,
+        });
+    }
+    if method != AUTH_METHOD_PUBLICKEY {
+        return Err(UserAuthError::UnsupportedMethod);
+    }
+    let has_signature = match r.u8().map_err(read)? {
+        0 => false,
+        1 => true,
+        _ => return Err(UserAuthError::BadBoolean),
+    };
+    let alen = r.u32().map_err(read)?;
+    let alen = usize::try_from(alen).map_err(|_| UserAuthError::Truncated)?;
+    let algorithm = r.take(alen).map_err(read)?;
+    if algorithm != ED25519 {
+        return Err(UserAuthError::WrongAlgorithm);
+    }
+    let klen = r.u32().map_err(read)?;
+    let klen = usize::try_from(klen).map_err(|_| UserAuthError::Truncated)?;
+    let key_blob = r.take(klen).map_err(read)?;
+    if parse_ed25519_key_blob(key_blob).is_err() {
+        return Err(UserAuthError::BadKey);
+    }
+    if !has_signature {
+        if r.pos != payload.len() {
+            return Err(UserAuthError::TrailingGarbage);
+        }
+        return Ok(UserAuthRequest {
+            user,
+            service,
+            method,
+            has_signature,
+            algorithm,
+            key_blob,
+            signature: &[],
+            signed_prefix: payload,
+        });
+    }
+    let signed_prefix = payload.get(..r.pos).ok_or(UserAuthError::Truncated)?;
+    let siglen = r.u32().map_err(read)?;
+    let siglen = usize::try_from(siglen).map_err(|_| UserAuthError::Truncated)?;
+    let signature = r.take(siglen).map_err(read)?;
+    if parse_ed25519_signature_blob(signature).is_err() {
+        return Err(UserAuthError::BadSignature);
+    }
+    if r.pos != payload.len() {
+        return Err(UserAuthError::TrailingGarbage);
+    }
+    Ok(UserAuthRequest {
+        user,
+        service,
+        method,
+        has_signature,
+        algorithm,
+        key_blob,
+        signature,
+        signed_prefix,
+    })
+}
+
+/// Encode `SSH_MSG_USERAUTH_FAILURE` (RFC4252 §5.1 field order:
+/// name-list then boolean).
+pub fn userauth_failure_payload(
+    methods: &[u8],
+    partial_success: bool,
+    out: &mut [u8],
+) -> Option<usize> {
+    validate_namelist(methods).ok()?;
+    let total = 1usize
+        .checked_add(4)?
+        .checked_add(methods.len())?
+        .checked_add(1)?;
+    let dst = out.get_mut(..total)?;
+    dst[0] = SSH_MSG_USERAUTH_FAILURE;
+    let n = encode_string(methods, &mut dst[1..])?;
+    dst[1 + n] = u8::from(partial_success);
+    Some(total)
+}
+
+/// Encode `SSH_MSG_USERAUTH_SUCCESS` — a bare message byte.
+pub fn userauth_success_payload(out: &mut [u8]) -> Option<usize> {
+    *out.first_mut()? = SSH_MSG_USERAUTH_SUCCESS;
+    Some(1)
+}
+
+/// Encode `SSH_MSG_USERAUTH_PK_OK` (RFC4252 §7): the algorithm and the
+/// key blob echoed back, telling the client to send its signature.
+pub fn userauth_pk_ok_payload(key_blob: &[u8], out: &mut [u8]) -> Option<usize> {
+    let _ = parse_ed25519_key_blob(key_blob).ok()?;
+    let total = 1usize
+        .checked_add(4)?
+        .checked_add(ED25519.len())?
+        .checked_add(4)?
+        .checked_add(key_blob.len())?;
+    let dst = out.get_mut(..total)?;
+    dst[0] = SSH_MSG_USERAUTH_PK_OK;
+    let mut w = 1usize;
+    w += encode_string(ED25519, &mut dst[w..])?;
+    w += encode_string(key_blob, &mut dst[w..])?;
+    Some(w)
+}
+
+/// Strict standard-alphabet base64 decoder (RFC4648 §4): `=` padding
+/// required for a final group, ASCII whitespace at both ends ignored,
+/// anything else refused. Used for `authorized_keys` bodies; `None`
+/// when the output does not fit or the text is malformed.
+pub fn base64_decode(text: &[u8], out: &mut [u8]) -> Option<usize> {
+    fn value(b: u8) -> Option<u8> {
+        match b {
+            b'A'..=b'Z' => Some(b - b'A'),
+            b'a'..=b'z' => Some(b - b'a' + 26),
+            b'0'..=b'9' => Some(b - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let is_space = |b: &u8| matches!(b, b' ' | b'\t' | b'\r' | b'\n');
+    let start = text.iter().take_while(|b| is_space(b)).count();
+    let end = text
+        .iter()
+        .rposition(|b| !is_space(b))
+        .map_or(start, |i| i + 1);
+    let text = text.get(start..end)?;
+    if !text.len().is_multiple_of(4) {
+        return None;
+    }
+    let mut w = 0usize;
+    for (i, group) in text.chunks(4).enumerate() {
+        let last = i == text.len() / 4 - 1;
+        let pad = group.iter().rev().take_while(|&&b| b == b'=').count();
+        if pad > 2 {
+            return None;
+        }
+        let mut acc = 0u32;
+        for (j, &b) in group.iter().enumerate() {
+            let v = if b == b'=' {
+                // Padding is only legal in the final group's last two
+                // positions, and implies the omitted bytes are zero.
+                if !last || j < 4 - pad {
+                    return None;
+                }
+                0
+            } else {
+                value(b)?
+            };
+            acc = (acc << 6) | u32::from(v);
+        }
+        let n = 3 - pad;
+        let bytes = acc.to_be_bytes();
+        // `acc` holds 24 bits in the low three bytes.
+        let src = &bytes[1..4];
+        let dst = out.get_mut(w..w.checked_add(n)?)?;
+        dst.copy_from_slice(&src[..n]);
+        w += n;
+    }
+    Some(w)
+}
+
+/// Parse one `authorized_keys` line: `[whitespace] "ssh-ed25519" SP
+/// <base64 blob> [comment]`. Blank lines and `#` comments are skipped,
+/// other key types are skipped line by line, and the first valid
+/// ed25519 line wins. Fail-closed: a malformed *ed25519* line is an
+/// error, never silently skipped (a typo must not look like "no key").
+pub fn parse_authorized_key(text: &[u8], out: &mut [u8; ED25519_KEY_LEN]) -> Result<(), KeyError> {
+    let mut line_start = 0usize;
+    while line_start < text.len() {
+        let line_end = text[line_start..]
+            .iter()
+            .position(|&b| b == b'\n' || b == b'\r')
+            .map_or(text.len(), |i| line_start + i);
+        let mut line = text.get(line_start..line_end).unwrap_or(&[]);
+        line_start = line_end;
+        while line_start < text.len() && matches!(text[line_start], b'\n' | b'\r') {
+            line_start += 1;
+        }
+        // Trim ASCII space/tab.
+        let trim = |b: &u8| *b == b' ' || *b == b'\t';
+        let s = line.iter().take_while(|b| trim(b)).count();
+        let e = line.iter().rposition(|b| !trim(b)).map_or(s, |i| i + 1);
+        line = line.get(s..e).unwrap_or(&[]);
+        if line.is_empty() || line[0] == b'#' {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix(ED25519) {
+            let Some(rest) = rest.strip_prefix(b" ") else {
+                return Err(KeyError::WrongAlgorithm);
+            };
+            let rest = rest.trim_ascii_start();
+            let body_len = rest
+                .iter()
+                .position(|&b| b == b' ' || b == b'\t')
+                .unwrap_or(rest.len());
+            let body = rest.get(..body_len).unwrap_or(&[]);
+            if body.is_empty() {
+                return Err(KeyError::Truncated);
+            }
+            // 51-byte blob → 68 base64 characters.
+            let mut blob = [0u8; 96];
+            let n = base64_decode(body, &mut blob).ok_or(KeyError::NotBase64)?;
+            let key = parse_ed25519_key_blob(blob.get(..n).unwrap_or(&[]))?;
+            *out = key;
+            return Ok(());
+        }
+        // A different key type: not ours, skip the line.
+    }
+    Err(KeyError::Truncated)
+}
+
+// --- S5b: session channels (`ssh-connection`, RFC4254 §5/§6) ---
+
+pub const SSH_MSG_CHANNEL_OPEN: u8 = 90;
+pub const SSH_MSG_CHANNEL_OPEN_CONFIRMATION: u8 = 91;
+pub const SSH_MSG_CHANNEL_OPEN_FAILURE: u8 = 92;
+pub const SSH_MSG_CHANNEL_WINDOW_ADJUST: u8 = 93;
+pub const SSH_MSG_CHANNEL_DATA: u8 = 94;
+pub const SSH_MSG_CHANNEL_EXTENDED_DATA: u8 = 95;
+pub const SSH_MSG_CHANNEL_EOF: u8 = 96;
+pub const SSH_MSG_CHANNEL_CLOSE: u8 = 97;
+pub const SSH_MSG_CHANNEL_REQUEST: u8 = 98;
+pub const SSH_MSG_CHANNEL_SUCCESS: u8 = 99;
+pub const SSH_MSG_CHANNEL_FAILURE: u8 = 100;
+
+/// Bound on an `exec` command string the server will accept (the
+/// internal handler is a toy; a real shell milestone grows this).
+pub const EXEC_COMMAND_MAX: usize = 256;
+
+/// Why a channel message was refused. Fail-closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelError {
+    /// Not the expected channel message type.
+    WrongMessage,
+    /// A field runs past the payload.
+    Truncated,
+    /// `want_reply` is not 0 or 1.
+    BadBoolean,
+    /// The channel type is not `"session"` (the only one we open).
+    UnsupportedType,
+    /// An `exec` request with an empty or over-long command.
+    BadCommand,
+    /// Bytes after the last field.
+    TrailingGarbage,
+}
+
+/// A parsed `SSH_MSG_CHANNEL_OPEN` (RFC4254 §5.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChannelOpen<'a> {
+    pub channel_type: &'a [u8],
+    pub sender_channel: u32,
+    pub initial_window: u32,
+    pub max_packet: u32,
+}
+
+/// Parse a complete `SSH_MSG_CHANNEL_OPEN` **payload**.
+pub fn parse_channel_open(payload: &[u8]) -> Result<ChannelOpen<'_>, ChannelError> {
+    let read = |_: KexError| ChannelError::Truncated;
+    let mut r = Reader {
+        buf: payload,
+        pos: 0,
+    };
+    if r.u8().map_err(read)? != SSH_MSG_CHANNEL_OPEN {
+        return Err(ChannelError::WrongMessage);
+    }
+    let tlen = r.u32().map_err(read)?;
+    let tlen = usize::try_from(tlen).map_err(|_| ChannelError::Truncated)?;
+    let channel_type = r.take(tlen).map_err(read)?;
+    let sender_channel = r.u32().map_err(read)?;
+    let initial_window = r.u32().map_err(read)?;
+    let max_packet = r.u32().map_err(read)?;
+    if r.pos != payload.len() {
+        return Err(ChannelError::TrailingGarbage);
+    }
+    Ok(ChannelOpen {
+        channel_type,
+        sender_channel,
+        initial_window,
+        max_packet,
+    })
+}
+
+/// Encode `SSH_MSG_CHANNEL_OPEN` for a `session` channel.
+pub fn channel_open_session_payload(
+    sender_channel: u32,
+    initial_window: u32,
+    max_packet: u32,
+    out: &mut [u8],
+) -> Option<usize> {
+    const TYPE: &[u8] = b"session";
+    let total = 1usize + 4 + TYPE.len() + 12;
+    let dst = out.get_mut(..total)?;
+    dst[0] = SSH_MSG_CHANNEL_OPEN;
+    let mut w = 1usize;
+    w += encode_string(TYPE, &mut dst[w..])?;
+    dst[w..w + 4].copy_from_slice(&sender_channel.to_be_bytes());
+    dst[w + 4..w + 8].copy_from_slice(&initial_window.to_be_bytes());
+    dst[w + 8..w + 12].copy_from_slice(&max_packet.to_be_bytes());
+    Some(total)
+}
+
+/// A parsed `SSH_MSG_CHANNEL_OPEN_CONFIRMATION` (RFC4254 §5.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChannelOpenConfirmation {
+    pub recipient_channel: u32,
+    pub sender_channel: u32,
+    pub initial_window: u32,
+    pub max_packet: u32,
+}
+
+/// Parse a complete `SSH_MSG_CHANNEL_OPEN_CONFIRMATION` **payload**.
+pub fn parse_channel_open_confirmation(
+    payload: &[u8],
+) -> Result<ChannelOpenConfirmation, ChannelError> {
+    let read = |_: KexError| ChannelError::Truncated;
+    let mut r = Reader {
+        buf: payload,
+        pos: 0,
+    };
+    if r.u8().map_err(read)? != SSH_MSG_CHANNEL_OPEN_CONFIRMATION {
+        return Err(ChannelError::WrongMessage);
+    }
+    let recipient_channel = r.u32().map_err(read)?;
+    let sender_channel = r.u32().map_err(read)?;
+    let initial_window = r.u32().map_err(read)?;
+    let max_packet = r.u32().map_err(read)?;
+    if r.pos != payload.len() {
+        return Err(ChannelError::TrailingGarbage);
+    }
+    Ok(ChannelOpenConfirmation {
+        recipient_channel,
+        sender_channel,
+        initial_window,
+        max_packet,
+    })
+}
+
+/// Encode `SSH_MSG_CHANNEL_OPEN_CONFIRMATION`.
+pub fn channel_open_confirmation_payload(
+    recipient_channel: u32,
+    sender_channel: u32,
+    initial_window: u32,
+    max_packet: u32,
+    out: &mut [u8],
+) -> Option<usize> {
+    let dst = out.get_mut(..17)?;
+    dst[0] = SSH_MSG_CHANNEL_OPEN_CONFIRMATION;
+    dst[1..5].copy_from_slice(&recipient_channel.to_be_bytes());
+    dst[5..9].copy_from_slice(&sender_channel.to_be_bytes());
+    dst[9..13].copy_from_slice(&initial_window.to_be_bytes());
+    dst[13..17].copy_from_slice(&max_packet.to_be_bytes());
+    Some(17)
+}
+
+/// A parsed `SSH_MSG_CHANNEL_REQUEST` (RFC4254 §5.4): only `exec` is
+/// understood; `exec_command` is empty for any other request type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChannelRequest<'a> {
+    pub recipient_channel: u32,
+    pub request_type: &'a [u8],
+    pub want_reply: bool,
+    pub exec_command: &'a [u8],
+}
+
+/// Parse a complete `SSH_MSG_CHANNEL_REQUEST` **payload**. An `exec`
+/// request must carry a non-empty command within [`EXEC_COMMAND_MAX`].
+pub fn parse_channel_request(payload: &[u8]) -> Result<ChannelRequest<'_>, ChannelError> {
+    let read = |_: KexError| ChannelError::Truncated;
+    let mut r = Reader {
+        buf: payload,
+        pos: 0,
+    };
+    if r.u8().map_err(read)? != SSH_MSG_CHANNEL_REQUEST {
+        return Err(ChannelError::WrongMessage);
+    }
+    let recipient_channel = r.u32().map_err(read)?;
+    let tlen = r.u32().map_err(read)?;
+    let tlen = usize::try_from(tlen).map_err(|_| ChannelError::Truncated)?;
+    let request_type = r.take(tlen).map_err(read)?;
+    let want_reply = match r.u8().map_err(read)? {
+        0 => false,
+        1 => true,
+        _ => return Err(ChannelError::BadBoolean),
+    };
+    let exec_command = if request_type == b"exec" {
+        let clen = r.u32().map_err(read)?;
+        let clen = usize::try_from(clen).map_err(|_| ChannelError::Truncated)?;
+        if clen == 0 || clen > EXEC_COMMAND_MAX {
+            return Err(ChannelError::BadCommand);
+        }
+        r.take(clen).map_err(read)?
+    } else {
+        &[]
+    };
+    if r.pos != payload.len() {
+        return Err(ChannelError::TrailingGarbage);
+    }
+    Ok(ChannelRequest {
+        recipient_channel,
+        request_type,
+        want_reply,
+        exec_command,
+    })
+}
+
+/// Encode `SSH_MSG_CHANNEL_REQUEST` for `exec`.
+pub fn channel_request_exec_payload(
+    recipient_channel: u32,
+    command: &[u8],
+    want_reply: bool,
+    out: &mut [u8],
+) -> Option<usize> {
+    if command.is_empty() || command.len() > EXEC_COMMAND_MAX {
+        return None;
+    }
+    let total = 1usize + 4 + 4 + 4 + 1 + 4 + command.len();
+    let dst = out.get_mut(..total)?;
+    dst[0] = SSH_MSG_CHANNEL_REQUEST;
+    dst[1..5].copy_from_slice(&recipient_channel.to_be_bytes());
+    let mut w = 5usize;
+    w += encode_string(b"exec", &mut dst[w..])?;
+    dst[w] = u8::from(want_reply);
+    w += 1;
+    w += encode_string(command, &mut dst[w..])?;
+    Some(w)
+}
+
+/// Parse the single channel number of `CHANNEL_SUCCESS`/`FAILURE`/
+/// `EOF`/`CLOSE`/`WINDOW_ADJUST`.
+pub fn parse_channel_number(payload: &[u8], expected: u8) -> Result<u32, ChannelError> {
+    let read = |_: KexError| ChannelError::Truncated;
+    let mut r = Reader {
+        buf: payload,
+        pos: 0,
+    };
+    if r.u8().map_err(read)? != expected {
+        return Err(ChannelError::WrongMessage);
+    }
+    let channel = r.u32().map_err(read)?;
+    if r.pos != payload.len() {
+        return Err(ChannelError::TrailingGarbage);
+    }
+    Ok(channel)
+}
+
+/// Encode a one-channel message (`CHANNEL_SUCCESS`, `CHANNEL_FAILURE`,
+/// `CHANNEL_EOF`, `CHANNEL_CLOSE`).
+pub fn channel_number_payload(msg: u8, channel: u32, out: &mut [u8]) -> Option<usize> {
+    if !matches!(
+        msg,
+        SSH_MSG_CHANNEL_SUCCESS
+            | SSH_MSG_CHANNEL_FAILURE
+            | SSH_MSG_CHANNEL_EOF
+            | SSH_MSG_CHANNEL_CLOSE
+    ) {
+        return None;
+    }
+    let dst = out.get_mut(..5)?;
+    dst[0] = msg;
+    dst[1..5].copy_from_slice(&channel.to_be_bytes());
+    Some(5)
+}
+
+/// Parse `SSH_MSG_CHANNEL_DATA`: recipient channel + `string` data.
+pub fn parse_channel_data(payload: &[u8]) -> Result<(u32, &[u8]), ChannelError> {
+    let read = |_: KexError| ChannelError::Truncated;
+    let mut r = Reader {
+        buf: payload,
+        pos: 0,
+    };
+    if r.u8().map_err(read)? != SSH_MSG_CHANNEL_DATA {
+        return Err(ChannelError::WrongMessage);
+    }
+    let channel = r.u32().map_err(read)?;
+    let dlen = r.u32().map_err(read)?;
+    let dlen = usize::try_from(dlen).map_err(|_| ChannelError::Truncated)?;
+    let data = r.take(dlen).map_err(read)?;
+    if r.pos != payload.len() {
+        return Err(ChannelError::TrailingGarbage);
+    }
+    Ok((channel, data))
+}
+
+/// Encode `SSH_MSG_CHANNEL_DATA`.
+pub fn channel_data_payload(channel: u32, data: &[u8], out: &mut [u8]) -> Option<usize> {
+    let total = 1usize
+        .checked_add(4)?
+        .checked_add(4)?
+        .checked_add(data.len())?;
+    let dst = out.get_mut(..total)?;
+    dst[0] = SSH_MSG_CHANNEL_DATA;
+    dst[1..5].copy_from_slice(&channel.to_be_bytes());
+    let n = encode_string(data, &mut dst[5..])?;
+    Some(5 + n)
+}
+
+/// Encode the `exit-status` channel request (RFC4254 §6.10) — no reply
+/// is wanted, the channel is ending either way.
+pub fn channel_exit_status_payload(channel: u32, status: u32, out: &mut [u8]) -> Option<usize> {
+    let total = 1usize + 4 + 4 + 11 + 1 + 4;
+    let dst = out.get_mut(..total)?;
+    dst[0] = SSH_MSG_CHANNEL_REQUEST;
+    dst[1..5].copy_from_slice(&channel.to_be_bytes());
+    let mut w = 5usize;
+    w += encode_string(b"exit-status", &mut dst[w..])?;
+    dst[w] = 0; // want_reply = false
+    w += 1;
+    dst[w..w + 4].copy_from_slice(&status.to_be_bytes());
+    Some(w + 4)
+}
+
+/// Parse an `exit-status` channel request: `(recipient, status)`.
+pub fn parse_channel_exit_status(payload: &[u8]) -> Result<(u32, u32), ChannelError> {
+    let read = |_: KexError| ChannelError::Truncated;
+    let mut r = Reader {
+        buf: payload,
+        pos: 0,
+    };
+    if r.u8().map_err(read)? != SSH_MSG_CHANNEL_REQUEST {
+        return Err(ChannelError::WrongMessage);
+    }
+    let channel = r.u32().map_err(read)?;
+    let tlen = r.u32().map_err(read)?;
+    if tlen != 11 {
+        return Err(ChannelError::WrongMessage);
+    }
+    if r.take(11).map_err(read)? != b"exit-status" {
+        return Err(ChannelError::WrongMessage);
+    }
+    if r.u8().map_err(read)? > 1 {
+        return Err(ChannelError::BadBoolean);
+    }
+    let status = r.u32().map_err(read)?;
+    if r.pos != payload.len() {
+        return Err(ChannelError::TrailingGarbage);
+    }
+    Ok((channel, status))
 }
 
 #[cfg(test)]
@@ -4061,5 +4843,386 @@ mod tests {
             Some(FINGERPRINT_LEN)
         );
         assert_eq!(&fp[..7], b"SHA256:");
+    }
+
+    // ---- S5: server-side glue ------------------------------------
+
+    /// A valid `ssh-ed25519` key blob for `seed` (any 32 bytes are a
+    /// syntactically valid ed25519 public key here — only the blob
+    /// shape is under test).
+    fn key_blob_for(seed: u8) -> Vec<u8> {
+        let mut blob = [0u8; ED25519_KEY_BLOB_LEN];
+        let n = ed25519_key_blob(&[seed; ED25519_KEY_LEN], &mut blob).expect("blob fits");
+        assert_eq!(n, ED25519_KEY_BLOB_LEN);
+        blob.to_vec()
+    }
+
+    #[test]
+    fn server_kexinit_is_a_legal_responder_packet() {
+        let mut wire = [0u8; KEXINIT_WIRE_MAX];
+        let n = encode_kexinit_server(&[0x5A; 16], &mut wire).expect("fits");
+        let payload = match decode_packet(&wire[..n]) {
+            PacketStep::Done { payload, .. } => payload,
+            other => panic!("server KEXINIT does not decode: {other:?}"),
+        };
+        let server = parse_kexinit(payload).expect("parses");
+        assert_eq!(server.cookie, &[0x5A; 16]);
+        assert!(namelist_contains(
+            server.kex_algorithms,
+            b"curve25519-sha256"
+        ));
+        // A responder must not advertise the client-only signal.
+        assert!(!namelist_contains(server.kex_algorithms, b"ext-info-c"));
+        assert!(!namelist_contains(server.kex_algorithms, b"ext-info-s"));
+        assert_eq!(server.server_host_key_algorithms, b"ssh-ed25519");
+        assert_eq!(server.encryption_algorithms_c2s, b"aes128-ctr");
+        assert_eq!(server.encryption_algorithms_s2c, b"aes128-ctr");
+        assert_eq!(server.mac_algorithms_c2s, b"hmac-sha2-256");
+        assert_eq!(server.compression_algorithms_c2s, b"none");
+        assert_eq!(server.language_c2s, b"");
+        assert!(!server.first_kex_packet_follows);
+    }
+
+    #[test]
+    fn server_intersection_takes_the_clients_first_choice() {
+        // The client's ordering decides (RFC4253 §7.1) among the
+        // names the server also lists; the server's list is the
+        // selection set. aes128 is the only cipher we implement.
+        let lists = [
+            b"curve25519-sha256,ext-info-c".as_slice(),
+            b"ssh-ed25519",
+            b"aes256-ctr,aes128-ctr",
+            b"aes128-ctr,aes256-ctr",
+            b"hmac-sha2-256",
+            b"hmac-sha2-256",
+            b"none",
+            b"none",
+            b"",
+            b"",
+        ];
+        let p = payload(lists, 0, 0, SSH_MSG_KEXINIT);
+        let client = parse_kexinit(&p).expect("parses");
+        let n = intersect_as_server(&client);
+        assert_eq!(
+            n,
+            Negotiated {
+                kex: Some("curve25519-sha256"),
+                host_key: Some("ssh-ed25519"),
+                enc_c2s: Some("aes128-ctr"),
+                enc_s2c: Some("aes128-ctr"),
+                mac_c2s: Some("hmac-sha2-256"),
+                mac_s2c: Some("hmac-sha2-256"),
+                comp_c2s: Some("none"),
+                comp_s2c: Some("none"),
+            }
+        );
+        assert_eq!(check_must_have(&n), Ok(()));
+
+        // A client without curve25519: no agreement, and the gate says
+        // which field failed.
+        let lists = [
+            b"diffie-hellman-group14-sha256".as_slice(),
+            b"ssh-ed25519",
+            b"aes128-ctr",
+            b"aes128-ctr",
+            b"hmac-sha2-256",
+            b"hmac-sha2-256",
+            b"none",
+            b"none",
+            b"",
+            b"",
+        ];
+        let p = payload(lists, 0, 0, SSH_MSG_KEXINIT);
+        let client = parse_kexinit(&p).expect("parses");
+        let n = intersect_as_server(&client);
+        assert_eq!(n.kex, None);
+        assert_eq!(check_must_have(&n), Err(Missing::Kex));
+    }
+
+    #[test]
+    fn kexdh_init_and_reply_roundtrip() {
+        let mut init = [0u8; 64];
+        let n = kexdh_init_payload(&[7u8; 32], &mut init).expect("fits");
+        assert_eq!(parse_kexdh_init(&init[..n]), Ok([7u8; 32]));
+
+        // All-zero e is a small-order point: refused.
+        let mut zero = [0u8; 64];
+        let n = kexdh_init_payload(&[0u8; 32], &mut zero).expect("fits");
+        assert_eq!(parse_kexdh_init(&zero[..n]), Err(KexDhError::ZeroPublicKey));
+        // Wrong length, wrong message, trailing garbage.
+        assert_eq!(
+            parse_kexdh_init(&[SSH_MSG_KEXDH_INIT, 0, 0, 0, 31]),
+            Err(KexDhError::BadPublicKey)
+        );
+        assert_eq!(
+            parse_kexdh_init(&[SSH_MSG_KEXDH_REPLY]),
+            Err(KexDhError::WrongMessage)
+        );
+
+        let host = key_blob_for(0x11);
+        let sig = {
+            let mut s = [0u8; ED25519_SIG_BLOB_LEN];
+            let n = ed25519_signature_blob(&[0x22; 64], &mut s).expect("fits");
+            assert_eq!(n, ED25519_SIG_BLOB_LEN);
+            s.to_vec()
+        };
+        // `kexdh_reply_payload` above is the encoder under test; the
+        // test module's helper of the same name builds the *bytes*
+        // independently, and the two must agree.
+        let mut wire = [0u8; 256];
+        let n = crate::kexdh_reply_payload(&host, &[9u8; 32], &sig, &mut wire).expect("fits");
+        assert_eq!(
+            &wire[..n],
+            &kexdh_reply_payload(&host, &[9u8; 32], &sig)[..]
+        );
+        let parsed = parse_kexdh_reply(&wire[..n]).expect("parses");
+        assert_eq!(parsed.host_key, &host[..]);
+        assert_eq!(parsed.f, &[9u8; 32]);
+        assert_eq!(parsed.signature, &sig[..]);
+    }
+
+    #[test]
+    fn server_encode_of_auth_answers_matches_the_client_parsers() {
+        let mut buf = [0u8; 256];
+        let n = userauth_failure_payload(b"publickey", false, &mut buf).expect("fits");
+        let f = parse_userauth_failure(&buf[..n]).expect("parses");
+        assert_eq!(f.methods, b"publickey");
+        assert!(!f.partial_success);
+
+        let n = userauth_success_payload(&mut buf).expect("fits");
+        assert_eq!(n, 1);
+        assert_eq!(parse_userauth_success(&buf[..n]), Ok(()));
+
+        let blob = key_blob_for(0x33);
+        let n = userauth_pk_ok_payload(&blob, &mut buf).expect("fits");
+        let ok = parse_userauth_pk_ok(&buf[..n]).expect("parses");
+        assert_eq!(ok.algorithm, ED25519);
+        assert_eq!(ok.key_blob, &blob[..]);
+
+        let n = service_accept_payload(b"ssh-userauth", &mut buf).expect("fits");
+        assert_eq!(parse_service_accept(&buf[..n]), Ok(&b"ssh-userauth"[..]));
+        assert_eq!(
+            parse_service_accept(&buf[..n]).expect("parses"),
+            b"ssh-userauth"
+        );
+    }
+
+    #[test]
+    fn auth_request_parses_probe_signed_and_none() {
+        let blob = key_blob_for(0x44);
+        let mut buf = [0u8; 512];
+        // Probe.
+        let n = userauth_publickey_payload(AUTH_USER, &blob, None, &mut buf).expect("fits");
+        let req = parse_userauth_request(&buf[..n]).expect("probe parses");
+        assert_eq!(req.user, AUTH_USER);
+        assert_eq!(req.service, AUTH_SERVICE);
+        assert_eq!(req.method, AUTH_METHOD_PUBLICKEY);
+        assert!(!req.has_signature);
+        assert_eq!(req.algorithm, ED25519);
+        assert_eq!(req.key_blob, &blob[..]);
+        assert!(req.signature.is_empty());
+
+        // The probe must be kept: the signed request overwrites `buf`.
+        let probe = buf[..n].to_vec();
+
+        // Signed: `signed_prefix` is the signed form (boolean TRUE)
+        // without the signature field — one byte off from the probe.
+        let mut sig_blob = [0u8; ED25519_SIG_BLOB_LEN];
+        ed25519_signature_blob(&[0x55; 64], &mut sig_blob).expect("fits");
+        let signed_len =
+            userauth_publickey_payload(AUTH_USER, &blob, Some(&sig_blob), &mut buf).expect("fits");
+        let req = parse_userauth_request(&buf[..signed_len]).expect("signed parses");
+        assert!(req.has_signature);
+        assert_eq!(req.signed_prefix.len(), probe.len());
+        let changed: Vec<usize> = (0..probe.len())
+            .filter(|&i| probe[i] != req.signed_prefix[i])
+            .collect();
+        assert_eq!(changed.len(), 1, "only the boolean differs");
+        assert_eq!(req.signed_prefix[changed[0]], 1);
+        assert_eq!(probe[changed[0]], 0);
+        assert_eq!(parse_ed25519_signature_blob(req.signature), Ok([0x55; 64]));
+
+        // `none`.
+        let n = userauth_none_payload(&mut buf).expect("fits");
+        let req = parse_userauth_request(&buf[..n]).expect("none parses");
+        assert_eq!(req.method, b"none");
+        assert!(!req.has_signature);
+        assert!(req.key_blob.is_empty());
+
+        // Fail-closed: trailing garbage after `none`, unsupported
+        // method, a bad signature blob, a wrong algorithm.
+        let mut extra = Vec::from(&buf[..n]);
+        extra.push(0);
+        assert_eq!(
+            parse_userauth_request(&extra),
+            Err(UserAuthError::TrailingGarbage)
+        );
+        let mut p = Vec::new();
+        p.push(SSH_MSG_USERAUTH_REQUEST);
+        p.extend_from_slice(&4u32.to_be_bytes());
+        p.extend_from_slice(b"git!");
+        p.extend_from_slice(&14u32.to_be_bytes());
+        p.extend_from_slice(AUTH_SERVICE);
+        p.extend_from_slice(&8u32.to_be_bytes());
+        p.extend_from_slice(b"password");
+        assert_eq!(
+            parse_userauth_request(&p),
+            Err(UserAuthError::UnsupportedMethod)
+        );
+        let mut bad = Vec::from(&buf[..signed_len]);
+        let cut = bad.len() - ED25519_SIG_BLOB_LEN;
+        bad[cut + 4 + 11] ^= 0xFF; // corrupt the inner signature length
+        assert!(parse_userauth_request(&bad).is_err());
+    }
+
+    #[test]
+    fn signed_prefix_is_the_signed_request_minus_its_signature() {
+        let blob = key_blob_for(0x77);
+        let mut probe = [0u8; 256];
+        let pn = userauth_publickey_payload(AUTH_USER, &blob, None, &mut probe).expect("fits");
+        let mut prefix = [0u8; 256];
+        let xn = userauth_signed_prefix(AUTH_USER, &blob, &mut prefix).expect("fits");
+        // Same length, and exactly one byte differs: the boolean.
+        assert_eq!(pn, xn);
+        let different: Vec<usize> = (0..pn).filter(|&i| probe[i] != prefix[i]).collect();
+        assert_eq!(different.len(), 1);
+        assert_eq!(prefix[different[0]], 1);
+        assert_eq!(probe[different[0]], 0);
+
+        // The signed request's own bytes start with that prefix.
+        let mut sig = [0u8; ED25519_SIG_BLOB_LEN];
+        ed25519_signature_blob(&[9u8; 64], &mut sig).expect("fits");
+        let mut signed = [0u8; 512];
+        let sn =
+            userauth_publickey_payload(AUTH_USER, &blob, Some(&sig), &mut signed).expect("fits");
+        assert_eq!(&signed[..xn], &prefix[..xn]);
+        assert_eq!(sn, xn + 4 + ED25519_SIG_BLOB_LEN);
+    }
+
+    #[test]
+    fn base64_decode_is_strict_and_inverts_the_encoder() {
+        let mut enc = [0u8; 400];
+        let mut dec = [0u8; 300];
+        for len in 0..=200usize {
+            let input: Vec<u8> = (0..len).map(|i| (i * 37 + 11) as u8).collect();
+            let n = base64_encode(&input, true, &mut enc).expect("fits");
+            let m = base64_decode(&enc[..n], &mut dec).expect("decodes");
+            assert_eq!(&dec[..m], &input[..], "len {len}");
+        }
+        // Whitespace is trimmed; internal whitespace is not.
+        assert_eq!(base64_decode(b"  QUJD\n", &mut dec), Some(3));
+        assert_eq!(&dec[..3], b"ABC");
+        assert_eq!(base64_decode(b"QU JD", &mut dec), None);
+        // Padding rules.
+        assert_eq!(base64_decode(b"QQ==", &mut dec), Some(1));
+        assert_eq!(base64_decode(b"QUI=", &mut dec), Some(2));
+        assert_eq!(base64_decode(b"Q", &mut dec), None);
+        assert_eq!(base64_decode(b"QQ=", &mut dec), None);
+        assert_eq!(base64_decode(b"Q===", &mut dec), None);
+        assert_eq!(base64_decode(b"=QQ=", &mut dec), None);
+        assert_eq!(base64_decode(b"QUJD", &mut dec[..2]), None);
+    }
+
+    #[test]
+    fn authorized_key_line_parses_one_ed25519_entry() {
+        let blob = key_blob_for(0x66);
+        let mut b64 = [0u8; 200];
+        let n = base64_encode(&blob, true, &mut b64).expect("fits");
+        let mut line = Vec::from(&b"# a comment\r\nssh-rsa AAAAjunk\r\n"[..]);
+        line.extend_from_slice(b"  ssh-ed25519 ");
+        line.extend_from_slice(&b64[..n]);
+        line.extend_from_slice(b" test@host\r\n");
+        let mut out = [0u8; 32];
+        assert_eq!(parse_authorized_key(&line, &mut out), Ok(()));
+        assert_eq!(out, [0x66; 32]);
+
+        // No ed25519 line at all.
+        assert_eq!(
+            parse_authorized_key(b"ssh-rsa AAAA\n# nothing\n", &mut out),
+            Err(KeyError::Truncated)
+        );
+        // A malformed ed25519 line must not be skipped silently.
+        assert_eq!(
+            parse_authorized_key(b"ssh-ed25519 !!!not-base64!!!\n", &mut out),
+            Err(KeyError::NotBase64)
+        );
+        // The blob must be an ed25519 key blob (right algorithm).
+        let mut wrong = [0u8; 200];
+        let w = base64_encode(&[0u8; ED25519_KEY_BLOB_LEN], true, &mut wrong).expect("fits");
+        let mut bad = Vec::from(&b"ssh-ed25519 "[..]);
+        bad.extend_from_slice(&wrong[..w]);
+        assert_eq!(
+            parse_authorized_key(&bad, &mut out),
+            Err(KeyError::WrongAlgorithm)
+        );
+    }
+
+    #[test]
+    fn channel_open_and_confirmation_roundtrip() {
+        let mut buf = [0u8; 128];
+        let n = channel_open_session_payload(3, 65536, 32768, &mut buf).expect("fits");
+        let open = parse_channel_open(&buf[..n]).expect("parses");
+        assert_eq!(open.channel_type, b"session");
+        assert_eq!(
+            (open.sender_channel, open.initial_window, open.max_packet),
+            (3, 65536, 32768)
+        );
+
+        let n = channel_open_confirmation_payload(3, 0, 65536, 32768, &mut buf).expect("fits");
+        let conf = parse_channel_open_confirmation(&buf[..n]).expect("parses");
+        assert_eq!((conf.recipient_channel, conf.sender_channel), (3, 0));
+        assert_eq!((conf.initial_window, conf.max_packet), (65536, 32768));
+
+        // A truncated channel type and trailing garbage are refused.
+        assert_eq!(
+            parse_channel_open(&[SSH_MSG_CHANNEL_OPEN, 0, 0, 0]),
+            Err(ChannelError::Truncated)
+        );
+        let mut extra = Vec::from(&buf[..n]);
+        extra.push(0);
+        assert_eq!(
+            parse_channel_open_confirmation(&extra),
+            Err(ChannelError::TrailingGarbage)
+        );
+    }
+
+    #[test]
+    fn channel_exec_request_data_eof_and_exit_status() {
+        let mut buf = [0u8; 256];
+        let n =
+            channel_request_exec_payload(7, b"echo SSHD_EXEC_OK", true, &mut buf).expect("fits");
+        let req = parse_channel_request(&buf[..n]).expect("parses");
+        assert_eq!(req.recipient_channel, 7);
+        assert_eq!(req.request_type, b"exec");
+        assert!(req.want_reply);
+        assert_eq!(req.exec_command, b"echo SSHD_EXEC_OK");
+        // Empty and over-long commands never reach the wire/parser.
+        assert_eq!(channel_request_exec_payload(7, b"", true, &mut buf), None);
+        let long = [b'x'; EXEC_COMMAND_MAX + 1];
+        assert_eq!(channel_request_exec_payload(7, &long, true, &mut buf), None);
+
+        let n = channel_data_payload(0, b"SSHD_EXEC_OK\n", &mut buf).expect("fits");
+        assert_eq!(
+            parse_channel_data(&buf[..n]),
+            Ok((0, &b"SSHD_EXEC_OK\n"[..]))
+        );
+
+        let n = channel_number_payload(SSH_MSG_CHANNEL_EOF, 0, &mut buf).expect("fits");
+        assert_eq!(parse_channel_number(&buf[..n], SSH_MSG_CHANNEL_EOF), Ok(0));
+        let n = channel_number_payload(SSH_MSG_CHANNEL_CLOSE, 0, &mut buf).expect("fits");
+        assert_eq!(
+            parse_channel_number(&buf[..n], SSH_MSG_CHANNEL_CLOSE),
+            Ok(0)
+        );
+        // A different message type is refused, not reinterpreted.
+        assert_eq!(
+            parse_channel_number(&buf[..n], SSH_MSG_CHANNEL_EOF),
+            Err(ChannelError::WrongMessage)
+        );
+
+        let n = channel_exit_status_payload(0, 0, &mut buf).expect("fits");
+        assert_eq!(parse_channel_exit_status(&buf[..n]), Ok((0, 0)));
+        let n = channel_exit_status_payload(0, 127, &mut buf).expect("fits");
+        assert_eq!(parse_channel_exit_status(&buf[..n]), Ok((0, 127)));
     }
 }
