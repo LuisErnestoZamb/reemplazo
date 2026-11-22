@@ -66,6 +66,15 @@ linked_list_allocator = { version = "0.10.6", default-features = false }
 # prefixes and Shift/CapsLock; the i8042 port layer is ours (keyboard.rs).
 pc-keyboard = "0.9.0"
 
+# USB descriptor + HID boot-keyboard wire logic (UHCI/HID milestone,
+# kernel/src/usb.rs): from-scratch under dependency-policy exception (a)
+# — no maintained `no_std` host-side USB configuration-descriptor parser
+# exists (verified by search; the `usb-device` ecosystem targets device
+# stacks, `hid-report-parser` parses report descriptors — neither does
+# fail-closed host enumeration), zero deps, `forbid(unsafe_code)`,
+# adversarially host-tested in `usbwire/tests/hostile.rs`.
+usbwire = { path = "../usbwire" }
+
 # TUI screen layer (A1 of docs/ai-client.md §4): official no_std —
 # `default-features = false` drops crossterm/serde/std backends; we
 # supply a custom Backend over the VGA text buffer. PROBE.

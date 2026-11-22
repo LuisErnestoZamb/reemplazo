@@ -38,6 +38,7 @@ mod shell;
 mod sky2;
 mod ssh;
 mod tls;
+mod usb;
 mod vga;
 
 // The network chain runs on smoltcp (docs/smoltcp-eval.md — M2):
@@ -94,6 +95,13 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
     report_rtc(); // pure port I/O: no PCI needed, and RTC_OK precedes PCI_OK
     let scan = crate::pci::scan();
     crate::pci::selftest(&scan);
+    // USB HID keyboard milestone (USB_KBD_OK, between PCI_OK and
+    // E1000_OK): probe the UHCI companion(s), enumerate and configure
+    // the boot keyboard, prove one live interrupt-IN poll. Prints
+    // nothing at all when no UHCI exists (the QEMU default before
+    // xtask added `-usb -device usb-kbd` — the marker chain there is
+    // untouched); `FATAL: usb:` + halt when one is present but broken.
+    crate::usb::init(&scan);
     // Installer milestone BLK_OK: prints only when a drive on the legacy
     // primary channel answers IDENTIFY *and* LBA0 carries the installer
     // magic — the main smoke has no disk, so its marker chain is untouched.
