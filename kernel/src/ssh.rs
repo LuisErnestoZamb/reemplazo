@@ -1,4 +1,4 @@
-//! SSH milestone S2 (docs/git-ssh-deps.md §B.4): full key exchange
+//! SSH milestones S2+S3 (docs/git-ssh-deps.md §B.4): full key exchange
 //! over **one** TCP connection against `github.com:22` — banners →
 //! `SSH_MSG_KEXINIT` negotiation (the smoke's `SSH_KEXINIT_OK`, at
 //! the same point as S1) → `curve25519-sha256` KEX → `ssh-ed25519`
@@ -7,7 +7,11 @@
 //! `hmac-sha2-256` → `SSH_MSG_SERVICE_REQUEST`/`ACCEPT` → a
 //! `publickey`-method `none` auth probe whose
 //! `SSH_MSG_USERAUTH_FAILURE` proves the whole path — the smoke's
-//! `SSH_KEX_OK` — then a clean close.
+//! `SSH_KEX_OK` — then (S3) the `publickey` exchange itself:
+//! `SSH_MSG_USERAUTH_REQUEST` with an ed25519 key, first as the
+//! RFC4252 §7 *probe* (boolean FALSE) and, when the server answers
+//! `SSH_MSG_USERAUTH_PK_OK`, as the signed request (`session_id ||
+//! probe`, ed25519) — then a clean close.
 //!
 //! All wire parsing/encoding lives in the `ssh-wire` crate
 //! (from-scratch under dependency-policy exception (a) — justified in
@@ -42,13 +46,21 @@
 //!    sealed: MAC over the *plaintext* packet with the sequence
 //!    number, AES-CTR keystream continuous across packets (§6.3),
 //! 8. tolerate `SSH_MSG_EXT_INFO` (RFC8308 — we offer `ext-info-c`),
-//!    then service request/accept and the `none` auth probe.
+//!    then service request/accept and the `none` auth probe,
+//! 9. S3: the `publickey` probe with a per-boot ed25519 key (see
+//!    [`AuthKey`]) — GitHub answers `USERAUTH_FAILURE` because that
+//!    key is not registered anywhere, which is the expected boot
+//!    outcome and still exercises the full request/blob/framing path;
+//!    a registered key gets `USERAUTH_PK_OK`, the signed request goes
+//!    out, and `USERAUTH_SUCCESS` follows (the same code path the
+//!    manual `ssh-auth` builtin drives with a real key).
 //!
 //! Refused lines/packets/MACs print `FATAL: ssh: …` and halt: an SSH
 //! client that skips a malformed byte — or accepts a bad tag — is a
 //! client that lies about what the server said. Key material (the
-//! shared secret `K`, every derived key, the private scalar) is never
-//! printed or logged.
+//! shared secret `K`, every derived key, the private scalar, the
+//! ed25519 seed) is never printed or logged; only public blobs and
+//! their SHA-256 fingerprints are.
 
 use crate::clock;
 use crate::netstack::{OP_DEADLINE_MS, Stack};
@@ -56,7 +68,7 @@ use aes::cipher::{KeyIvInit, StreamCipher};
 use aes::{Aes128, Aes256};
 use core::ptr::addr_of_mut;
 use ctr::Ctr128BE;
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 use smoltcp::iface::SocketHandle;
@@ -80,6 +92,10 @@ const RX_CAP: usize = 4096;
 /// Wire bytes reaching the log are copied through this as printable
 /// ASCII first (same log-injection reasoning as `git.rs::sanitize`).
 const SANITIZE_CAP: usize = 200;
+/// How many `SSH_MSG_USERAUTH_BANNER` packets an auth step tolerates
+/// before the real answer (RFC4252 §5.4 has no limit; a server that
+/// sends more than this is not answering).
+const AUTH_BANNER_MAX: usize = 4;
 
 /// Single-use connection receive buffer (the `READ_STORAGE` idiom:
 /// written once by `kex_smoke` on a single core; IRQ0 never touches
@@ -482,19 +498,78 @@ fn handle_ext_info(payload: &[u8]) {
     }
 }
 
-/// SSH S2: one connection, every phase bounded, every refusal fatal.
+/// SSH S2/S3: one connection, every phase bounded, every refusal fatal.
 /// Prints `SSH_KEXINIT_OK` at the S1 point (negotiation agreed) and
 /// `SSH_KEX_OK` once the `none` auth probe has come back as
-/// `SSH_MSG_USERAUTH_FAILURE` over the encrypted channel.
+/// `SSH_MSG_USERAUTH_FAILURE` over the encrypted channel — then runs
+/// the S3 `publickey` exchange and closes. The boot smoke's key is
+/// ephemeral, so the auth verdict is `USERAUTH_FAILURE` (see
+/// [`AuthKey`]); the manual `ssh-auth` path passes a real seed.
 pub fn kex_smoke(stack: &mut Stack, ip: Ipv4Address) {
+    session(stack, ip, AuthKey::Ephemeral, true)
+}
+
+/// Manual S3 path (`ssh-auth <seed>` in the shell): authenticate to
+/// github.com with an operator-supplied ed25519 seed. Same code as the
+/// boot path — the only differences are where the seed comes from and
+/// that no smoke markers are printed. A successful run prints
+/// `ssh: authenticated with publickey (ssh-ed25519)` and closes the
+/// connection (the session channel / `exec` is S4).
+///
+/// Fail-soft entry points only (no DNS answer → one line, return); the
+/// wire phases keep S2's fail-closed `FATAL` behaviour.
+pub fn auth_cmd(stack: &mut Stack, seed: [u8; 32]) {
+    let Some(ip) = stack.resolve("github.com") else {
+        serial_println!("ssh-auth: no DNS answer for github.com (network up?)");
+        return;
+    };
+    session(stack, ip, AuthKey::Seed(seed), false);
+}
+
+/// Where the ed25519 seed for the S3 `publickey` exchange comes from.
+///
+/// - [`AuthKey::Ephemeral`] (the boot path): a fresh key per boot from
+///   the kernel CSPRNG. It is deliberately **not** registered on
+///   GitHub, so GitHub answers `SSH_MSG_USERAUTH_FAILURE` — the
+///   expected, non-fatal verdict that still proves the request
+///   encoding, the blob shapes and the encrypted framing on every
+///   boot.
+/// - [`AuthKey::Seed`] (the manual `ssh-auth` builtin): a real key
+///   whose public half is registered on the account. GitHub then
+///   answers `SSH_MSG_USERAUTH_PK_OK`, the signed request
+///   (`session_id || probe`, ed25519 per RFC4252 §7) goes out, and
+///   `SSH_MSG_USERAUTH_SUCCESS` follows — the *same* code path, which
+///   is how full end-to-end auth is verified without embedding any
+///   secret in this repository.
+///
+/// The seed is secret key material: it is copied into a `SigningKey`
+/// and the local copy is scrubbed best-effort (a dead store LLVM is
+/// free to elide — the real guarantee is what *does* hold: the seed is
+/// never printed, formatted, hashed into a log line or stored anywhere
+/// outside the `SigningKey`).
+enum AuthKey {
+    Ephemeral,
+    Seed([u8; 32]),
+}
+
+fn session(stack: &mut Stack, ip: Ipv4Address, keys: AuthKey, markers: bool) {
     let handle = stack.tcp4_handle;
 
     // 1. Connect (plain_get_smoke's deadline loop: bounded, no panic).
+    //    The manual path fails soft here: a previous connection's
+    //    TIME-WAIT can hold the local port for ~10 s, and that is a
+    //    "try again", not a broken stack.
     {
         let sock = stack.sockets.get_mut::<tcp::Socket>(handle);
         if let Err(e) = sock.connect(stack.iface.context(), (ip, REMOTE_PORT), LOCAL_PORT) {
-            serial_println!("ssh: connect rejected: {e:?}");
-            crate::halt();
+            if markers {
+                serial_println!("ssh: connect rejected: {e:?}");
+                crate::halt();
+            }
+            serial_println!(
+                "ssh-auth: connect rejected (a previous connection may still be in TIME-WAIT, retry in ~10 s)"
+            );
+            return;
         }
     }
     let deadline = clock::now_ms() + OP_DEADLINE_MS;
@@ -504,7 +579,11 @@ pub fn kex_smoke(stack: &mut Stack, ip: Ipv4Address) {
             break;
         }
         if clock::now_ms() > deadline {
-            fatal("tcp connect timeout");
+            if markers {
+                fatal("tcp connect timeout");
+            }
+            serial_println!("ssh-auth: connect timed out");
+            return;
         }
     }
     serial_println!("ssh: connected to {ip}:{REMOTE_PORT}");
@@ -648,7 +727,10 @@ pub fn kex_smoke(stack: &mut Stack, ip: Ipv4Address) {
     consume_plain(rx, &mut got, consumed);
     seq_rx += 1;
 
-    serial_println!("SSH_KEXINIT_OK"); // machine-checked by `cargo xtask smoke`
+    if markers {
+        // machine-checked by `cargo xtask smoke`
+        serial_println!("SSH_KEXINIT_OK");
+    }
 
     // 5. SSH_MSG_KEXDH_INIT: a fresh X25519 keypair per connection
     //    from the boot CSPRNG (32 bytes = 8 draws — never
@@ -679,7 +761,7 @@ pub fn kex_smoke(stack: &mut Stack, ip: Ipv4Address) {
         _ => 16,
     };
     let (s, e, consumed) = recv_plain(stack, handle, rx, &mut got, ssh_wire::BLOCK_SIZE);
-    let derived = {
+    let (derived, session_id) = {
         let Some(payload) = rx.get(s..e) else {
             fatal("KEXDH_REPLY payload range out of bounds");
         };
@@ -758,7 +840,7 @@ pub fn kex_smoke(stack: &mut Stack, ip: Ipv4Address) {
         kdf_or_fatal(b'D', k, &h, &mut d.key_s2c[..key_len_s2c]);
         kdf_or_fatal(b'E', k, &h, &mut d.mac_c2s);
         kdf_or_fatal(b'F', k, &h, &mut d.mac_s2c);
-        d
+        (d, h)
     };
     consume_plain(rx, &mut got, consumed);
     seq_rx += 1;
@@ -865,6 +947,7 @@ pub fn kex_smoke(stack: &mut Stack, ip: Ipv4Address) {
         fatal("USERAUTH_REQUEST does not fit the buffer");
     };
     send_sealed(stack, handle, &payload[..plen], &mut tx_dir, seq_tx);
+    seq_tx += 1;
     let (s, e) = recv_enc(stack, handle, &mut enc_rx, &mut rx_dir, seq_rx);
     {
         let bytes = enc_rx.bytes();
@@ -900,12 +983,33 @@ pub fn kex_smoke(stack: &mut Stack, ip: Ipv4Address) {
         }
     }
     enc_rx.consume();
-    // seq_tx/seq_rx stop here: nothing follows the probe but the FIN
-    // (both counters would read one past their last packet).
+    // Both counters stay live: S3 sends `publickey` requests next, and
+    // every packet (bidirectional, encrypted or not) consumes one
+    // sequence number (RFC4253 §6.4) — including the `none` answer we
+    // just consumed.
+    seq_rx += 1;
 
-    serial_println!("SSH_KEX_OK"); // machine-checked by `cargo xtask smoke`
+    if markers {
+        // machine-checked by `cargo xtask smoke`
+        serial_println!("SSH_KEX_OK");
+    }
 
-    // 10. Orderly teardown (plain_get_smoke's close proof): FIN, then
+    // 10. S3: the `publickey` exchange (RFC4252 §7). Boot path: an
+    //     ephemeral key → the expected `USERAUTH_FAILURE`. Manual path:
+    //     an operator key → `PK_OK` → signed request → `SUCCESS`.
+    {
+        let mut wire = AuthWire {
+            handle,
+            tx_dir: &mut tx_dir,
+            rx_dir: &mut rx_dir,
+            enc_rx: &mut enc_rx,
+            seq_tx: &mut seq_tx,
+            seq_rx: &mut seq_rx,
+        };
+        publickey_step(stack, &mut wire, &session_id, &keys);
+    }
+
+    // 11. Orderly teardown (plain_get_smoke's close proof): FIN, then
     //     require the socket to reach TimeWait or Closed.
     stack.sockets.get_mut::<tcp::Socket>(handle).close();
     let deadline = clock::now_ms() + OP_DEADLINE_MS;
@@ -920,4 +1024,302 @@ pub fn kex_smoke(stack: &mut Stack, ip: Ipv4Address) {
             fatal("timeout closing connection (never reached TimeWait/Closed)");
         }
     }
+}
+
+/// The live wire state of an authenticated phase: per-direction keys,
+/// the shared receive buffer and both sequence counters. Grouped so a
+/// user-auth step borrows one value instead of six; the counters belong
+/// to the connection and are never reset (RFC4253 §6.4).
+struct AuthWire<'a, 'b> {
+    handle: SocketHandle,
+    tx_dir: &'a mut Direction,
+    rx_dir: &'a mut Direction,
+    enc_rx: &'a mut ssh_wire::EncryptedRx<'b>,
+    seq_tx: &'a mut u32,
+    seq_rx: &'a mut u32,
+}
+
+impl AuthWire<'_, '_> {
+    /// Seal and send one payload, advancing the transmit counter.
+    fn send(&mut self, stack: &mut Stack, payload: &[u8]) {
+        send_sealed(stack, self.handle, payload, self.tx_dir, *self.seq_tx);
+        *self.seq_tx += 1;
+    }
+
+    /// Receive one user-auth answer, skipping up to [`AUTH_BANNER_MAX`]
+    /// `SSH_MSG_USERAUTH_BANNER` packets first (RFC4252 §5.4 lets a
+    /// server send them at any point during authentication). Banners
+    /// are parsed, printed sanitized and bounded — never treated as an
+    /// answer.
+    ///
+    /// Returns the payload's range in [`Self::bytes`]; the caller reads
+    /// it, then calls [`Self::consume`]. The receive counter advances
+    /// for **every** packet received, the returned one included.
+    fn recv_answer(&mut self, stack: &mut Stack) -> (usize, usize) {
+        let mut banners = 0usize;
+        loop {
+            let (s, e) = recv_enc(stack, self.handle, self.enc_rx, self.rx_dir, *self.seq_rx);
+            *self.seq_rx += 1;
+            let bytes = self.enc_rx.bytes();
+            let Some(p) = bytes.get(s..e) else {
+                fatal("encrypted payload range out of bounds");
+            };
+            let Some(&msg) = p.first() else {
+                fatal("empty encrypted payload");
+            };
+            if msg != ssh_wire::SSH_MSG_USERAUTH_BANNER {
+                return (s, e);
+            }
+            if banners >= AUTH_BANNER_MAX {
+                fatal("too many USERAUTH_BANNER packets (auth answer never came)");
+            }
+            banners += 1;
+            match ssh_wire::parse_userauth_banner(p) {
+                Ok(banner) => {
+                    if !banner.message.is_empty() {
+                        // Wire bytes: sanitize before the macro (it
+                        // evaluates its arguments twice).
+                        let mut sbuf = [0u8; SANITIZE_CAP];
+                        let text = sanitize(banner.message, &mut sbuf);
+                        serial_println!("ssh: server banner: {text}");
+                    }
+                }
+                Err(err) => {
+                    serial_println!("ssh: malformed USERAUTH_BANNER: {err:?}");
+                    crate::halt();
+                }
+            }
+            self.enc_rx.consume();
+        }
+    }
+
+    /// The decrypted payload bytes of the last received packet.
+    fn bytes(&self) -> &[u8] {
+        self.enc_rx.bytes()
+    }
+
+    /// Release the last received packet.
+    fn consume(&mut self) {
+        self.enc_rx.consume();
+    }
+}
+
+/// Print an ed25519 public blob and its SHA-256 fingerprint — the only
+/// key material that ever reaches the log. `key_blob` is public by
+/// construction (RFC4252 §7: the blob is sent on the wire in the clear
+/// to every server).
+fn print_public_key(key_blob: &[u8]) {
+    let mut hasher = Sha256::new();
+    hasher.update(key_blob);
+    let digest: [u8; 32] = hasher.finalize().into();
+    let mut fp = [0u8; ssh_wire::FINGERPRINT_LEN];
+    let n = match ssh_wire::write_fingerprint(&digest, &mut fp) {
+        Some(n) => n,
+        None => return, // unreachable: the buffer is the exact size
+    };
+    let text = core::str::from_utf8(&fp[..n]).unwrap_or("?");
+
+    let mut b64 = [0u8; 96];
+    let text64 = match ssh_wire::base64_encode(key_blob, true, &mut b64) {
+        Some(m) => core::str::from_utf8(&b64[..m]).unwrap_or("?"),
+        None => "?",
+    };
+    serial_println!("ssh: publickey ssh-ed25519 {text64} ({text})");
+}
+
+/// S3 (docs/git-ssh-deps.md §B.4): probe-then-sign `publickey` auth.
+///
+/// 1. derive the ed25519 key from the seed ([`AuthKey`]),
+/// 2. send the RFC4252 §7 **probe** — `boolean FALSE`, no signature,
+/// 3. `SSH_MSG_USERAUTH_PK_OK` → sign `session_id || probe` (the probe
+///    bytes are exactly the signed request's prefix, boolean FALSE
+///    included — RFC4252 §7) and send the signed request; then
+///    `SUCCESS` (authenticated) or `FAILURE` (key registered nowhere),
+/// 4. `SSH_MSG_USERAUTH_FAILURE` → the boot path's expected verdict:
+///    the request encoding, blob shapes and framing were all accepted
+///    by the server, the key is simply not authorized.
+///
+/// Nothing here halts on a *verdict* — only on a message that is not a
+/// legal answer, a `PK_OK` for someone else's key, or an impossible
+/// `SUCCESS` without a signature.
+fn publickey_step(
+    stack: &mut Stack,
+    wire: &mut AuthWire<'_, '_>,
+    session_id: &[u8; 32],
+    keys: &AuthKey,
+) {
+    // The seed never outlives this function: `SigningKey` keeps its
+    // own copy of the scalar.
+    let mut seed = match keys {
+        AuthKey::Seed(seed) => *seed,
+        AuthKey::Ephemeral => {
+            let mut seed = [0u8; 32];
+            for chunk in seed.chunks_mut(4) {
+                chunk.copy_from_slice(&crate::entropy::boot_entropy().to_le_bytes());
+            }
+            seed
+        }
+    };
+    let signing = SigningKey::from_bytes(&seed);
+    // Best-effort scrub (see `AuthKey`'s docs for what is and is not
+    // guaranteed); the `SigningKey` already holds its own copy.
+    seed.fill(0);
+
+    let public = signing.verifying_key().to_bytes();
+    let mut key_blob = [0u8; ssh_wire::ED25519_KEY_BLOB_LEN];
+    let blob_len = match ssh_wire::ed25519_key_blob(&public, &mut key_blob) {
+        Some(n) => n,
+        None => fatal("public key blob does not fit its buffer"),
+    };
+    print_public_key(&key_blob[..blob_len]);
+
+    // 1. The probe: "would this key be acceptable?" — the bytes the
+    //    signed request will sign, minus the session-id prefix.
+    let mut probe = [0u8; 256];
+    let probe_len = match ssh_wire::userauth_publickey_payload(
+        ssh_wire::AUTH_USER,
+        &key_blob[..blob_len],
+        None,
+        &mut probe,
+    ) {
+        Some(n) => n,
+        None => fatal("USERAUTH_REQUEST/publickey probe does not fit"),
+    };
+    wire.send(stack, &probe[..probe_len]);
+
+    let (s, e) = wire.recv_answer(stack);
+    let wants_signature = {
+        let bytes = wire.bytes();
+        let Some(p) = bytes.get(s..e) else {
+            fatal("encrypted payload range out of bounds");
+        };
+        let Some(&msg) = p.first() else {
+            fatal("empty encrypted payload");
+        };
+        match msg {
+            ssh_wire::SSH_MSG_USERAUTH_PK_OK => {
+                let ok = match ssh_wire::parse_userauth_pk_ok(p) {
+                    Ok(ok) => ok,
+                    Err(err) => {
+                        serial_println!("ssh: malformed USERAUTH_PK_OK: {err:?}");
+                        crate::halt();
+                    }
+                };
+                if ok.key_blob != key_blob.get(..blob_len).unwrap_or(&[]) {
+                    // The server answered about a key we did not send:
+                    // refuse to sign anything for it.
+                    fatal("USERAUTH_PK_OK echoes a different public key");
+                }
+                serial_println!("ssh: server accepts the public key (PK_OK), signing");
+                true
+            }
+            ssh_wire::SSH_MSG_USERAUTH_FAILURE => {
+                match ssh_wire::parse_userauth_failure(p) {
+                    Ok(f) => {
+                        if f.partial_success {
+                            fatal("publickey probe returned partial_success");
+                        }
+                        let mut mbuf = [0u8; SANITIZE_CAP];
+                        let methods = sanitize(f.methods, &mut mbuf);
+                        serial_println!("ssh: auth methods offered: {methods}");
+                    }
+                    Err(err) => {
+                        serial_println!("ssh: malformed USERAUTH_FAILURE: {err:?}");
+                        crate::halt();
+                    }
+                }
+                false
+            }
+            ssh_wire::SSH_MSG_USERAUTH_SUCCESS => {
+                fatal("publickey probe succeeded without a signature (impossible)")
+            }
+            other => {
+                serial_println!("ssh: unexpected message {other} during publickey auth");
+                crate::halt();
+            }
+        }
+    };
+    wire.consume();
+
+    if !wants_signature {
+        // The expected boot outcome: the encoding was accepted, the key
+        // is not registered on any account. Not an error — and not a
+        // marker (the chain stays at 27; see docs/git-ssh-deps.md
+        // §B.4 row S3).
+        serial_println!("ssh: publickey refused (key not registered on the account)");
+        return;
+    }
+
+    // 2. The signed request: ed25519 over `session_id || probe`
+    //    (RFC4252 §7 — the boolean in the signed data is FALSE, which
+    //    is exactly the probe we just sent).
+    let mut signed = [0u8; 256];
+    let signed_len =
+        match ssh_wire::userauth_signed_data(session_id, &probe[..probe_len], &mut signed) {
+            Some(n) => n,
+            None => fatal("signed-data buffer is too small"),
+        };
+    let signature = signing.sign(&signed[..signed_len]);
+    let mut sig_blob = [0u8; ssh_wire::ED25519_SIG_BLOB_LEN];
+    let sig_len = match ssh_wire::ed25519_signature_blob(&signature.to_bytes(), &mut sig_blob) {
+        Some(n) => n,
+        None => fatal("signature blob does not fit its buffer"),
+    };
+    let mut request = [0u8; 512];
+    let request_len = match ssh_wire::userauth_publickey_payload(
+        ssh_wire::AUTH_USER,
+        &key_blob[..blob_len],
+        Some(&sig_blob[..sig_len]),
+        &mut request,
+    ) {
+        Some(n) => n,
+        None => fatal("signed USERAUTH_REQUEST does not fit"),
+    };
+    wire.send(stack, &request[..request_len]);
+
+    let (s, e) = wire.recv_answer(stack);
+    {
+        let bytes = wire.bytes();
+        let Some(p) = bytes.get(s..e) else {
+            fatal("encrypted payload range out of bounds");
+        };
+        let Some(&msg) = p.first() else {
+            fatal("empty encrypted payload");
+        };
+        match msg {
+            ssh_wire::SSH_MSG_USERAUTH_SUCCESS => {
+                if let Err(err) = ssh_wire::parse_userauth_success(p) {
+                    serial_println!("ssh: malformed USERAUTH_SUCCESS: {err:?}");
+                    crate::halt();
+                }
+                // S4 continues from here with a session channel and
+                // `exec` (git-upload-pack); S3 stops at the verdict.
+                serial_println!("ssh: authenticated with publickey (ssh-ed25519)");
+            }
+            ssh_wire::SSH_MSG_USERAUTH_FAILURE => {
+                // A registered-but-unauthorized key, or GitHub's
+                // attempt limit: the crypto path is correct either way.
+                match ssh_wire::parse_userauth_failure(p) {
+                    Ok(f) => {
+                        if f.partial_success {
+                            fatal("signed publickey request returned partial_success");
+                        }
+                        let mut mbuf = [0u8; SANITIZE_CAP];
+                        let methods = sanitize(f.methods, &mut mbuf);
+                        serial_println!("ssh: auth methods offered: {methods}");
+                    }
+                    Err(err) => {
+                        serial_println!("ssh: malformed USERAUTH_FAILURE: {err:?}");
+                        crate::halt();
+                    }
+                }
+                serial_println!("ssh: signed publickey request refused");
+            }
+            other => {
+                serial_println!("ssh: unexpected message {other} after the signed request");
+                crate::halt();
+            }
+        }
+    }
+    wire.consume();
 }

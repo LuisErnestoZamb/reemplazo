@@ -175,6 +175,16 @@ full tree checkout is the rest of G4).
 - **Key parsing: use `ssh-key` + `ssh-encoding`** (the big reuse win — OpenSSH private keys, `authorized_keys`, `known_hosts`, fingerprints). Pick **0.6.1 (stable)** by default per the battle-tested bar; switch to 0.7.0-rc.12 if duplicate dalek/p256 versions bother us — decide at integration, both are no_std+alloc. **Needs heap → the actual parsing milestone comes after the heap milestone.**
 - Rejected: `russh` (exception (a): no_std; plus advisory history), `purecrypto`-based stacks (unaudited crypto).
 
+**S3 probe result (2026-11-22, `ssh-key` least-viable question settled with measurements, `x86_64-unknown-none`, rust 1.98.1, the repo's exact `RUSTFLAGS` incl. `curve25519_dalek_backend="serial"`):**
+
+| Candidate | Result | Why |
+|---|---|---|
+| `ssh-key` **0.6.1**, `default-features = false, features = ["alloc","ed25519"]` | **fails as-is**; builds only with an extra `sha2 0.10` `force-soft` shim in our own manifest (feature unification) | `sha2 0.10.9` (its fingerprint dependency) compiles the x86 SHA-NI/AVX2 modules on this SSE-less target and rustc-LLVM aborts with *"Do not know how to split the result of this operator"* — the same class of failure as curve25519-dalek's SIMD backend (the `.cargo/config.toml` note). With the shim it builds, but drags a **second crypto generation** into ring 0: `ed25519-dalek 2.2`, `curve25519-dalek 4.1.3`, `rand_core 0.6`, `ssh-cipher 0.2`, `ssh-encoding 0.2`, plus `sha2 0.10` next to our 0.11. |
+| `ssh-key` **0.7.0-rc.12**, same features | **builds clean** (release, no shim) | Aligns: `ed25519-dalek 3.0.0`, `sha2 0.11.1`, `ssh-encoding 0.3.0` (all already in the tree); adds `ssh-cipher 0.3`, `rand_core 0.10`, `signature 3`, `ctutils`. But it is a **pre-release**, and §B.2's bar for adoption is the battle-tested stable line. |
+
+**Decision for S3:** do **not** adopt either yet. S3 needed no PEM parsing: the key enters as a **32-byte seed** (hex at the shell, or a raw/hex file on FAT — `kernel/src/keyfile.rs`), so the only `ssh-key` value (OpenSSH private-key strings) is exactly the part S3 defers. The three wire pieces S3 does need (`string "ssh-ed25519" ‖ string key`, the signature blob, the `session_id ‖ request` signing input) are RFC4251/RFC4252 encodings over `encode_string`, implemented in `ssh-wire` under exception (a) and host-tested byte-exact against `ssh-keygen` output (public halves only) — **no cryptography was written**: signing/verifying is `ed25519-dalek 3.0` (S2's reviewed crate). Adopt `ssh-key 0.7.0` (final, not rc) when PEM/`known_hosts` parsing actually lands; until then `openssl pkey -in ~/.ssh/id_ed25519 -text -noout` extracts the seed on the dev machine.
+
+
 ### B.3 GitHub compatibility — exact algorithm list
 
 Evidence: [Improving Git protocol security on GitHub, 2021-09-01](https://github.blog/security/application-security/improving-git-protocol-security-github/) (removed DSA, `hmac-sha1`, all CBC ciphers; added ECDSA+Ed25519 host keys; RSA SHA-1 cutoff) and [changelog 2022-03-15](https://github.blog/changelog/2022-03-15-removed-unencrypted-git-protocol-and-certain-ssh-keys/) (made permanent; unencrypted `git://` removed). Host keys listed at [github.com SSH fingerprints](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints).
@@ -202,11 +212,12 @@ Evidence: [Improving Git protocol security on GitHub, 2021-09-01](https://github
 | S1 | SSH banner + `SSH_MSG_KEXINIT` negotiation state machine (plaintext, algorithm intersection only) | serial marker **`SSH_KEXINIT_OK`** against `github.com:22` | `TCP_OK` |
 | S2 | KEX `curve25519-sha256`, host-key verify `ssh-ed25519` (TOFU/known_hosts pinning via `ssh-key`), RFC4253 key derivation, `NEWKEYS`, then encrypted `aes128-ctr` + `hmac-sha2-256` | **`SSH_KEX_OK`** (handshake completes; `SSH_MSG_USERAUTH_FAILURE` on `none` auth = success) | `x25519-dalek`, `ed25519-dalek`, in-tree AES/HMAC |
 | S3 | `publickey` user auth with an ed25519 key (key file via `ssh-key` — **post-heap**) | **`SSH_AUTH_OK`** (real GitHub account with registered key) | heap |
+| S3a | **landed 2026-11-22 (no marker — honest gate):** `ssh-ed25519` key/signature blobs, the RFC4252 §7 probe + signed request (`session_id ‖ probe`), `PK_OK`/`SUCCESS`/`FAILURE`/`BANNER` answers, the fingerprint/base64/hex-seed codecs (all in `ssh-wire`, host-tested), and the boot-phase exchange with a **per-boot ephemeral key** → `USERAUTH_FAILURE` (the expected verdict, proving the request/blob/framing path). Manual `ssh-auth <64-hex \| /path-on-fat>` drives the same code with a registered key. **Pending:** end-to-end `SSH_AUTH_OK` with an account key; OpenSSH **PEM** parsing (S3's original `ssh-key` dependency) — probe result in §B.2, deferred; S5 loopback will exercise `PK_OK → signed → SUCCESS` without an account. | — (chain stays 27: no marker until a registered key can be run in CI) | `ed25519-dalek` (S2), `kernel/src/keyfile.rs` |
 | S4 | Session channel + `exec` (`git-upload-pack`) → enables git-over-ssh | **`SSH_EXEC_OK`** (run `git ls-remote` over ssh) | S3 + G1 |
 | S5 | **ssh server**: host-key generation (ed25519), listener, KEX as responder, `authorized_keys` auth, exec → shell | **`SSHD_OK`** (our client → our server, loopback in QEMU) | S2–S4 primitives |
 | S6 | Hardening/interop: `ecdsa-sha2-nistp256`, `aes*-gcm@openssh.com` or `chacha20-poly1305@openssh.com`, `SSH_MSG_EXT_INFO` polish, rekeying | `SSH_INTEROP_OK` (`ssh -vvv` from OpenSSH shows clean negotiation) | S5 |
 
-Order rationale: S1–S2 are heap-free (fixed-size KEX state) and give the first network-visible win **before** any allocator exists; S3 is where the heap is first needed (key parsing).
+Order rationale: S1–S2 are heap-free (fixed-size KEX state) and give the first network-visible win **before** any allocator exists; S3 was expected to be where the heap is first needed (key parsing) — in the event, feeding a raw seed sidesteps the allocator entirely, and the heap is only needed when OpenSSH PEM/`known_hosts` parsing lands (S3a's "pending" line).
 
 ---
 

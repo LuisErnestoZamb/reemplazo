@@ -1,14 +1,16 @@
-//! SSH wire codec — milestones S1+S2 of docs/git-ssh-deps.md §B.4: the
+//! SSH wire codec — milestones S1+S2+S3 of docs/git-ssh-deps.md §B.4: the
 //! RFC4253 identification banner (§4.2), the binary packet framing
 //! (§6, plaintext and encrypted), `SSH_MSG_KEXINIT` parse/encode
 //! (§7.1) and algorithm intersection, the `curve25519-sha256` KEXDH
 //! message pair (RFC4253 §8 / RFC8731 §3), the RFC4253 §7.2 key
-//! derivation, `NEWKEYS`, `SSH_MSG_EXT_INFO` (RFC8308) and the
-//! service/`none`-auth probe messages. **No primitive lives here** —
-//! SHA-256, HMAC, AES-CTR, X25519 and Ed25519 all come from the
-//! audited crates the kernel (and, for tests only, this crate's
-//! dev-dependencies) already use; everything in this file is protocol
-//! glue over a wire format the RFCs specify byte for byte.
+//! derivation, `NEWKEYS`, `SSH_MSG_EXT_INFO` (RFC8308), the
+//! service/`none`-auth probe messages, and (S3) the `publickey`
+//! method's key/signature blobs, request payload, signing input and
+//! the `PK_OK`/`SUCCESS`/`BANNER` answers (RFC4252 §7). **No primitive
+//! lives here** — SHA-256, HMAC, AES-CTR, X25519 and Ed25519 all come
+//! from the audited crates the kernel (and, for tests only, this
+//! crate's dev-dependencies) already use; everything in this file is
+//! protocol glue over a wire format the RFCs specify byte for byte.
 //!
 //! From-scratch under the skill's dependency-policy exception (a),
 //! justified in docs/git-ssh-deps.md §B.2: `russh` is std-only
@@ -652,8 +654,17 @@ pub const SSH_MSG_KEXDH_INIT: u8 = 30;
 pub const SSH_MSG_KEXDH_REPLY: u8 = 31;
 /// `SSH_MSG_USERAUTH_REQUEST` (RFC4254 §5).
 pub const SSH_MSG_USERAUTH_REQUEST: u8 = 50;
-/// `SSH_MSG_USERAUTH_FAILURE` (RFC4254 §5).
+/// `SSH_MSG_USERAUTH_FAILURE` (RFC4252 §5.1 — field order: name-list,
+/// then the `partial success` boolean).
 pub const SSH_MSG_USERAUTH_FAILURE: u8 = 51;
+/// `SSH_MSG_USERAUTH_SUCCESS` (RFC4252 §5.1) — a bare message byte.
+pub const SSH_MSG_USERAUTH_SUCCESS: u8 = 52;
+/// `SSH_MSG_USERAUTH_BANNER` (RFC4252 §5.4) — may arrive at any point
+/// during authentication.
+pub const SSH_MSG_USERAUTH_BANNER: u8 = 53;
+/// `SSH_MSG_USERAUTH_PK_OK` (RFC4252 §7) — "this key would be
+/// acceptable, send the signature" (message number 60).
+pub const SSH_MSG_USERAUTH_PK_OK: u8 = 60;
 
 /// `hmac-sha2-256` tag length (RFC4253 §6.4 over SHA-256): every MAC
 /// on the wire is exactly this many bytes, in the clear after the
@@ -1004,7 +1015,7 @@ pub struct UserAuthFailure<'a> {
 /// Why a `SSH_MSG_USERAUTH_FAILURE` payload was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UserAuthError {
-    /// Not [`SSH_MSG_USERAUTH_FAILURE`].
+    /// Not the expected message type.
     WrongMessage,
     /// A field runs past the payload.
     Truncated,
@@ -1013,8 +1024,14 @@ pub enum UserAuthError {
     /// Illegal byte in the methods name-list (same rules as the
     /// KEXINIT lists).
     BadNameList,
-    /// Bytes after the boolean.
+    /// Bytes after the last field.
     TrailingGarbage,
+    /// A `publickey` answer names an algorithm other than
+    /// [`ED25519`] — we only ever send that one.
+    WrongAlgorithm,
+    /// `SSH_MSG_USERAUTH_PK_OK` echoed a blob that is not a
+    /// well-formed `ssh-ed25519` public key.
+    BadKey,
 }
 
 /// Parse a complete `SSH_MSG_USERAUTH_FAILURE` **payload** (message
@@ -1121,6 +1138,395 @@ pub fn userauth_none_payload(out: &mut [u8]) -> Option<usize> {
     w += encode_string(b"ssh-connection", &mut dst[w..])?;
     w += encode_string(b"none", &mut dst[w..])?;
     Some(w)
+}
+
+// --- S3: `publickey` authentication with `ssh-ed25519` (RFC4252 §7) ---
+//
+// Everything below is **encoding**, not cryptography: the blob shapes,
+// the request payload and the "session_id || request" signing input are
+// RFC4251/RFC4252 field layouts. The signature itself is produced and
+// verified by `ed25519-dalek` in the kernel (and, for the host tests
+// below, by the same audited crate as a dev-dependency) — this crate
+// never touches key material beyond copying bytes into caller buffers.
+
+/// The `publickey` method name (RFC4252 §7).
+pub const AUTH_METHOD_PUBLICKEY: &[u8] = b"publickey";
+/// The service every user-auth request names (RFC4252 §5).
+pub const AUTH_SERVICE: &[u8] = b"ssh-connection";
+/// The user this client authenticates as. GitHub identifies the
+/// account by the key, not by the user name (any name works); it is
+/// fixed so the signed request is reproducible and byte-tested.
+pub const AUTH_USER: &[u8] = b"git";
+/// The only public-key algorithm we negotiate, accept and sign with
+/// (docs/git-ssh-deps.md §B.3).
+pub const ED25519: &[u8] = b"ssh-ed25519";
+/// Raw ed25519 public keys and signatures are exactly these lengths.
+pub const ED25519_KEY_LEN: usize = 32;
+pub const ED25519_SIGNATURE_LEN: usize = 64;
+/// Wire length of `string "ssh-ed25519" || string <key>`, the public
+/// key *blob* (the same shape as `K_S` in RFC4253 §8).
+pub const ED25519_KEY_BLOB_LEN: usize = 4 + ED25519.len() + 4 + ED25519_KEY_LEN;
+/// Wire length of `string "ssh-ed25519" || string <signature>`.
+pub const ED25519_SIG_BLOB_LEN: usize = 4 + ED25519.len() + 4 + ED25519_SIGNATURE_LEN;
+
+/// Why a key/signature blob or a hex seed was refused. Fail-closed:
+/// every variant means "do not use this key".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyError {
+    /// A field runs past the blob (or the blob is empty).
+    Truncated,
+    /// The algorithm string is not [`ED25519`].
+    WrongAlgorithm,
+    /// The key/signature is not exactly 32/64 bytes.
+    BadLength,
+    /// Bytes after the last field — nothing legal follows it.
+    TrailingGarbage,
+    /// A hex seed is not exactly 64 hex digits (after ASCII whitespace
+    /// trimming).
+    BadHexLength,
+    /// A hex seed contains a non-hex-digit byte.
+    NotHex,
+}
+
+/// Encode `string "ssh-ed25519" || string <key>` — the public-key blob
+/// used as `K_S` (RFC4253 §8), in `authorized_keys`, and as the
+/// key-blob field of a `publickey` request. Callers that put it on the
+/// wire wrap it again in a `string`.
+pub fn ed25519_key_blob(key: &[u8; ED25519_KEY_LEN], out: &mut [u8]) -> Option<usize> {
+    let dst = out.get_mut(..ED25519_KEY_BLOB_LEN)?;
+    let w = encode_string(ED25519, dst)?;
+    Some(w + encode_string(key, &mut dst[w..])?)
+}
+
+/// Encode `string "ssh-ed25519" || string <signature>` — the signature
+/// blob of a signed `publickey` request (RFC4252 §7).
+pub fn ed25519_signature_blob(
+    signature: &[u8; ED25519_SIGNATURE_LEN],
+    out: &mut [u8],
+) -> Option<usize> {
+    let dst = out.get_mut(..ED25519_SIG_BLOB_LEN)?;
+    let w = encode_string(ED25519, dst)?;
+    Some(w + encode_string(signature, &mut dst[w..])?)
+}
+
+/// `string algorithm || string <N bytes>`, nothing else — the shared
+/// shape of the key and signature blobs.
+fn parse_ed25519_blob<const N: usize>(blob: &[u8]) -> Result<[u8; N], KeyError> {
+    let mut r = Reader { buf: blob, pos: 0 };
+    let alg_len = r.u32().map_err(|_| KeyError::Truncated)?;
+    let alg_len = usize::try_from(alg_len).map_err(|_| KeyError::Truncated)?;
+    let alg = r.take(alg_len).map_err(|_| KeyError::Truncated)?;
+    if alg != ED25519 {
+        return Err(KeyError::WrongAlgorithm);
+    }
+    let len = r.u32().map_err(|_| KeyError::Truncated)?;
+    let len = usize::try_from(len).map_err(|_| KeyError::Truncated)?;
+    if len != N {
+        return Err(KeyError::BadLength);
+    }
+    let body = r.take(N).map_err(|_| KeyError::Truncated)?;
+    if r.pos != blob.len() {
+        return Err(KeyError::TrailingGarbage);
+    }
+    <[u8; N]>::try_from(body).map_err(|_| KeyError::BadLength)
+}
+
+/// Parse a `string "ssh-ed25519" || string <32 bytes>` public-key blob
+/// back into the raw key — the fail-closed inverse of
+/// [`ed25519_key_blob`]. Refuses a wrong algorithm, a wrong key length,
+/// trailing bytes and every truncation.
+pub fn parse_ed25519_key_blob(blob: &[u8]) -> Result<[u8; ED25519_KEY_LEN], KeyError> {
+    parse_ed25519_blob(blob)
+}
+
+/// Parse a signature blob back into its raw 64-byte signature — the
+/// fail-closed inverse of [`ed25519_signature_blob`].
+pub fn parse_ed25519_signature_blob(blob: &[u8]) -> Result<[u8; ED25519_SIGNATURE_LEN], KeyError> {
+    parse_ed25519_blob(blob)
+}
+
+/// The `SSH_MSG_USERAUTH_REQUEST` payload for the `publickey` method
+/// (RFC4252 §7):
+///
+/// ```text
+/// byte      SSH_MSG_USERAUTH_REQUEST (50)
+/// string    user name                 ("git")
+/// string    service name              ("ssh-connection")
+/// string    method name               ("publickey")
+/// boolean   TRUE if a signature follows
+/// string    public key algorithm      ("ssh-ed25519")
+/// string    public key blob           (string "ssh-ed25519" || string key)
+/// string    signature                 (only when TRUE)
+/// ```
+///
+/// With `signature = None` this is the **probe** — "would you accept
+/// this key?" — and its bytes are *exactly* the request the signed form
+/// signs (prefixed by the session identifier): see
+/// [`userauth_signed_data`]. Both the key blob and (when present) the
+/// signature blob are parsed back first, so a malformed blob can never
+/// reach the wire with a `TRUE` boolean claiming it is signed.
+pub fn userauth_publickey_payload(
+    user: &[u8],
+    key_blob: &[u8],
+    signature: Option<&[u8]>,
+    out: &mut [u8],
+) -> Option<usize> {
+    if user.is_empty() {
+        return None;
+    }
+    // Fail closed on anything but a well-formed ed25519 key blob.
+    let _key = parse_ed25519_key_blob(key_blob).ok()?;
+    let sig_len = match signature {
+        Some(sig) => {
+            let _raw = parse_ed25519_signature_blob(sig).ok()?;
+            Some(sig.len())
+        }
+        None => None,
+    };
+    let mut total = 1usize;
+    total = total.checked_add(4)?.checked_add(user.len())?;
+    total = total.checked_add(4)?.checked_add(AUTH_SERVICE.len())?;
+    total = total
+        .checked_add(4)?
+        .checked_add(AUTH_METHOD_PUBLICKEY.len())?;
+    total = total
+        .checked_add(1)?
+        .checked_add(4)?
+        .checked_add(ED25519.len())?;
+    total = total.checked_add(4)?.checked_add(key_blob.len())?;
+    if let Some(n) = sig_len {
+        total = total.checked_add(4)?.checked_add(n)?;
+    }
+    let dst = out.get_mut(..total)?;
+    let mut w = 0usize;
+    dst[w] = SSH_MSG_USERAUTH_REQUEST;
+    w += 1;
+    w += encode_string(user, &mut dst[w..])?;
+    w += encode_string(AUTH_SERVICE, &mut dst[w..])?;
+    w += encode_string(AUTH_METHOD_PUBLICKEY, &mut dst[w..])?;
+    dst[w] = u8::from(sig_len.is_some());
+    w += 1;
+    w += encode_string(ED25519, &mut dst[w..])?;
+    w += encode_string(key_blob, &mut dst[w..])?;
+    if let Some(sig) = signature {
+        w += encode_string(sig, &mut dst[w..])?;
+    }
+    // `w == total` by construction (the precheck above sized the
+    // buffer); return what was actually written.
+    Some(w)
+}
+
+/// The data an ed25519 `publickey` signature covers (RFC4252 §7 with
+/// RFC4253 §8's "session identifier"): `session_id || request`, where
+/// `request` is the `SSH_MSG_USERAUTH_REQUEST` payload **without** the
+/// signature field — i.e. exactly the bytes
+/// [`userauth_publickey_payload`] produced for the probe.
+pub fn userauth_signed_data(
+    session_id: &[u8],
+    request_without_signature: &[u8],
+    out: &mut [u8],
+) -> Option<usize> {
+    if session_id.is_empty() || request_without_signature.is_empty() {
+        return None;
+    }
+    let total = session_id
+        .len()
+        .checked_add(request_without_signature.len())?;
+    let dst = out.get_mut(..total)?;
+    dst.get_mut(..session_id.len())?.copy_from_slice(session_id);
+    dst.get_mut(session_id.len()..)?
+        .copy_from_slice(request_without_signature);
+    Some(total)
+}
+
+/// A parsed `SSH_MSG_USERAUTH_PK_OK` (RFC4252 §7): the server will
+/// accept this key, send the signature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PkOk<'a> {
+    /// `public key algorithm` — validated to be [`ED25519`].
+    pub algorithm: &'a [u8],
+    /// The echo of our key blob — the caller must check it is **its**
+    /// blob (a server answering about another key is a protocol error).
+    pub key_blob: &'a [u8],
+}
+
+/// Parse a complete `SSH_MSG_USERAUTH_PK_OK` **payload** (message byte
+/// included). Refuses a wrong algorithm, a key blob that is not a
+/// well-formed ed25519 key, and trailing bytes.
+pub fn parse_userauth_pk_ok(payload: &[u8]) -> Result<PkOk<'_>, UserAuthError> {
+    let read = |e: KexError| match e {
+        KexError::Truncated => UserAuthError::Truncated,
+        _ => UserAuthError::Truncated,
+    };
+    let mut r = Reader {
+        buf: payload,
+        pos: 0,
+    };
+    if r.u8().map_err(read)? != SSH_MSG_USERAUTH_PK_OK {
+        return Err(UserAuthError::WrongMessage);
+    }
+    let alg_len = r.u32().map_err(read)?;
+    let alg_len = usize::try_from(alg_len).map_err(|_| UserAuthError::Truncated)?;
+    let algorithm = r.take(alg_len).map_err(read)?;
+    if algorithm != ED25519 {
+        return Err(UserAuthError::WrongAlgorithm);
+    }
+    let blob_len = r.u32().map_err(read)?;
+    let blob_len = usize::try_from(blob_len).map_err(|_| UserAuthError::Truncated)?;
+    let key_blob = r.take(blob_len).map_err(read)?;
+    if parse_ed25519_key_blob(key_blob).is_err() {
+        return Err(UserAuthError::BadKey);
+    }
+    if r.pos != payload.len() {
+        return Err(UserAuthError::TrailingGarbage);
+    }
+    Ok(PkOk {
+        algorithm,
+        key_blob,
+    })
+}
+
+/// Parse a `SSH_MSG_USERAUTH_SUCCESS` payload: the message byte and
+/// nothing else (RFC4252 §5.3).
+pub fn parse_userauth_success(payload: &[u8]) -> Result<(), UserAuthError> {
+    match payload.first() {
+        Some(&SSH_MSG_USERAUTH_SUCCESS) if payload.len() == 1 => Ok(()),
+        Some(&SSH_MSG_USERAUTH_SUCCESS) => Err(UserAuthError::TrailingGarbage),
+        Some(_) => Err(UserAuthError::WrongMessage),
+        None => Err(UserAuthError::Truncated),
+    }
+}
+
+/// A parsed `SSH_MSG_USERAUTH_BANNER` (RFC4252 §5.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UserAuthBanner<'a> {
+    /// Free text the server wants shown to the user (US-ASCII or
+    /// UTF-8 per the RFC) — sanitize before printing it anywhere.
+    pub message: &'a [u8],
+    /// RFC3066 language tag (may be empty).
+    pub language: &'a [u8],
+}
+
+/// Parse a complete `SSH_MSG_USERAUTH_BANNER` **payload** (message byte
+/// included). A server may send it at any point during authentication,
+/// so the client tolerates (bounded) banners before the real answer.
+pub fn parse_userauth_banner(payload: &[u8]) -> Result<UserAuthBanner<'_>, UserAuthError> {
+    let read = |_: KexError| UserAuthError::Truncated;
+    let mut r = Reader {
+        buf: payload,
+        pos: 0,
+    };
+    if r.u8().map_err(read)? != SSH_MSG_USERAUTH_BANNER {
+        return Err(UserAuthError::WrongMessage);
+    }
+    let msg_len = r.u32().map_err(read)?;
+    let msg_len = usize::try_from(msg_len).map_err(|_| UserAuthError::Truncated)?;
+    let message = r.take(msg_len).map_err(read)?;
+    let lang_len = r.u32().map_err(read)?;
+    let lang_len = usize::try_from(lang_len).map_err(|_| UserAuthError::Truncated)?;
+    let language = r.take(lang_len).map_err(read)?;
+    if r.pos != payload.len() {
+        return Err(UserAuthError::TrailingGarbage);
+    }
+    Ok(UserAuthBanner { message, language })
+}
+
+/// Parse a 32-byte ed25519 seed from hex text (the manual `ssh-auth`
+/// path, docs §B.4 row S3): ASCII whitespace at both ends is trimmed
+/// (a file written by an editor usually ends in a newline), the rest
+/// must be exactly 64 hex digits. Both cases are accepted. The seed is
+/// secret key material — callers must never log it.
+pub fn parse_seed_hex(text: &[u8], out: &mut [u8; ED25519_KEY_LEN]) -> Result<(), KeyError> {
+    let is_space = |b: &u8| matches!(b, b' ' | b'\t' | b'\r' | b'\n');
+    let start = text.iter().take_while(|b| is_space(b)).count();
+    let end = text
+        .iter()
+        .rposition(|b| !is_space(b))
+        .map_or(start, |i| i + 1);
+    let hex = text.get(start..end).unwrap_or(&[]);
+    if hex.len() != ED25519_KEY_LEN * 2 {
+        return Err(KeyError::BadHexLength);
+    }
+    let digit = |b: u8| -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    };
+    let (pairs, _odd) = hex.as_chunks::<2>();
+    for (pair, slot) in pairs.iter().zip(out.iter_mut()) {
+        let hi = digit(pair[0]).ok_or(KeyError::NotHex)?;
+        let lo = digit(pair[1]).ok_or(KeyError::NotHex)?;
+        *slot = (hi << 4) | lo;
+    }
+    Ok(())
+}
+
+/// Standard-alphabet base64 (`A–Z a–z 0–9 + /`), with `=` padding only
+/// when `padded` — SSH fingerprints are unpadded, `authorized_keys`
+/// bodies are padded. No line breaks (RFC4648 §3.2/§3.3). `None` when
+/// the output does not fit `out`.
+pub fn base64_encode(input: &[u8], padded: bool, out: &mut [u8]) -> Option<usize> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut groups = input.len() / 3;
+    if !input.len().is_multiple_of(3) {
+        groups = groups.checked_add(1)?;
+    }
+    let mut total = groups.checked_mul(4)?;
+    if !padded && !input.len().is_multiple_of(3) {
+        // MySQL/base64 "unpadded": drop the 1–2 `=` the last group adds.
+        total = total.checked_sub(3 - input.len() % 3)?;
+    }
+    let dst = out.get_mut(..total)?;
+    let mut w = 0usize;
+    for chunk in input.chunks(3) {
+        let b0 = chunk.first().copied().unwrap_or(0);
+        let b1 = chunk.get(1).copied();
+        let b2 = chunk.get(2).copied();
+        let triple =
+            (u32::from(b0) << 16) | (u32::from(b1.unwrap_or(0)) << 8) | u32::from(b2.unwrap_or(0));
+        let idx = |shift: u32| -> Option<u8> {
+            let i = ((triple >> shift) & 0x3f) as usize;
+            ALPHABET.get(i).copied()
+        };
+        let mut quartet = [0u8; 4];
+        quartet[0] = idx(18)?;
+        quartet[1] = idx(12)?;
+        quartet[2] = match (b1, padded) {
+            (Some(_), _) => idx(6)?,
+            (None, true) => b'=',
+            (None, false) => 0, // never copied: `n` stops short
+        };
+        quartet[3] = match (b2, padded) {
+            (Some(_), _) => idx(0)?,
+            (None, true) => b'=',
+            (None, false) => 0, // never copied
+        };
+        // Unpadded output stops after the characters that carry data.
+        let n = if padded { 4 } else { chunk.len() + 1 };
+        dst.get_mut(w..w.checked_add(n)?)?
+            .copy_from_slice(quartet.get(..n)?);
+        w += n;
+    }
+    Some(w)
+}
+
+/// Length of an SSH SHA-256 fingerprint: `"SHA256:"` + unpadded base64
+/// of a 32-byte digest (43 characters).
+pub const FINGERPRINT_LEN: usize = 7 + 43;
+
+/// Write the OpenSSH SHA-256 fingerprint of a key blob
+/// (`SHA256:` + unpadded base64 of SHA-256(blob)) — the string
+/// `ssh-keygen -lf` prints and GitHub's fingerprints page lists. The
+/// digest is computed by the caller (audited SHA-256 in the kernel);
+/// this is the display encoding only.
+pub fn write_fingerprint(digest: &[u8; 32], out: &mut [u8]) -> Option<usize> {
+    let dst = out.get_mut(..FINGERPRINT_LEN)?;
+    dst.get_mut(..7)?.copy_from_slice(b"SHA256:");
+    let n = base64_encode(digest, false, dst.get_mut(7..)?)?;
+    Some(7 + n)
 }
 
 /// Why key derivation refused its inputs (RFC4253 §7.2).
@@ -3097,5 +3503,563 @@ mod tests {
             erx.next(&mut opener, 9),
             Err(OpenError::Packet(PacketError::BadPadding))
         );
+    }
+
+    // ---- S3: `publickey` auth with ssh-ed25519 (RFC4252 §7) --------
+    //
+    // Fixtures are **public halves only**: a key generated for this
+    // test with `ssh-keygen -t ed25519` (its private half was never
+    // written anywhere), and github.com's published host key (docs
+    // §B.3), whose SHA-256 fingerprint GitHub publishes too.
+
+    /// Raw public key of the fixture.
+    const FIXTURE_KEY: [u8; 32] = [
+        0x5c, 0xfb, 0x6c, 0x8f, 0x65, 0x5a, 0x9f, 0xe5, 0x97, 0xed, 0x0a, 0xd2, 0x6e, 0xde, 0xb8,
+        0x5d, 0x2b, 0xc8, 0xde, 0x8c, 0x4d, 0x04, 0x8b, 0x9a, 0x39, 0x38, 0x3a, 0xee, 0xeb, 0x38,
+        0x80, 0xfb,
+    ];
+    /// The blob exactly as `ssh-keygen` emitted it (`base64 -d` of the
+    /// second field of the `.pub` line).
+    const FIXTURE_BLOB_HEX: &str = "0000000b7373682d65643235353139000000205cfb6c8f655a9fe597ed0ad26edeb85d2bc8de8c4d048b9a39383aeeeb3880fb";
+    /// The `.pub` line's base64 field — what `ssh-keygen`/OpenSSH
+    /// produce for the same blob.
+    const FIXTURE_PUB_B64: &str =
+        "AAAAC3NzaC1lZDI1NTE5AAAAIFz7bI9lWp/ll+0K0m7euF0ryN6MTQSLmjk4Ou7rOID7";
+    /// `ssh-keygen -lf` of the fixture.
+    const FIXTURE_FP: &str = "SHA256:my/l9XnZ33YrPKCJsTEFShnLr03wDFkAc+6LWph2CwI";
+
+    /// github.com's ed25519 host key (S2's pin).
+    const GITHUB_KEY: [u8; 32] = [
+        0xe3, 0x2a, 0xaa, 0x79, 0x15, 0xce, 0xb9, 0xb4, 0x49, 0xd1, 0xba, 0x50, 0xea, 0x2a, 0x28,
+        0xbb, 0x1a, 0x6e, 0x01, 0xf9, 0x0b, 0xda, 0x24, 0x5a, 0x2d, 0x1d, 0x87, 0x69, 0x7d, 0x18,
+        0xa2, 0x65,
+    ];
+    /// The fingerprint on GitHub's published fingerprints page.
+    const GITHUB_FP: &str = "SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU";
+
+    fn unhex(s: &str) -> Vec<u8> {
+        let bytes = s.as_bytes();
+        assert!(bytes.len().is_multiple_of(2), "odd hex fixture");
+        let (pairs, _tail) = bytes.as_chunks::<2>();
+        let mut v = Vec::new();
+        for pair in pairs {
+            let hi = (pair[0] as char).to_digit(16).expect("hex") as u8;
+            let lo = (pair[1] as char).to_digit(16).expect("hex") as u8;
+            v.push((hi << 4) | lo);
+        }
+        v
+    }
+
+    fn fixture_blob() -> [u8; ED25519_KEY_BLOB_LEN] {
+        let mut blob = [0u8; ED25519_KEY_BLOB_LEN];
+        assert_eq!(
+            ed25519_key_blob(&FIXTURE_KEY, &mut blob),
+            Some(ED25519_KEY_BLOB_LEN)
+        );
+        blob
+    }
+
+    /// Hand-built `SSH_MSG_USERAUTH_REQUEST`/`publickey` bytes, field by
+    /// field, independent of the encoder under test.
+    fn publickey_request_wire(key_blob: &[u8], signature: Option<&[u8]>) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.push(SSH_MSG_USERAUTH_REQUEST);
+        v.extend_from_slice(&3u32.to_be_bytes());
+        v.extend_from_slice(b"git");
+        v.extend_from_slice(&14u32.to_be_bytes());
+        v.extend_from_slice(b"ssh-connection");
+        v.extend_from_slice(&9u32.to_be_bytes());
+        v.extend_from_slice(b"publickey");
+        v.push(u8::from(signature.is_some()));
+        v.extend_from_slice(&11u32.to_be_bytes());
+        v.extend_from_slice(b"ssh-ed25519");
+        v.extend_from_slice(&(key_blob.len() as u32).to_be_bytes());
+        v.extend_from_slice(key_blob);
+        if let Some(sig) = signature {
+            v.extend_from_slice(&(sig.len() as u32).to_be_bytes());
+            v.extend_from_slice(sig);
+        }
+        v
+    }
+
+    #[test]
+    fn ed25519_key_blob_matches_the_ssh_keygen_fixture() {
+        let blob = fixture_blob();
+        assert_eq!(blob.as_slice(), unhex(FIXTURE_BLOB_HEX).as_slice());
+        // ...and it is what OpenSSH base64s into a `.pub` line.
+        let mut b64 = [0u8; 96];
+        let n = base64_encode(&blob, true, &mut b64).expect("fits");
+        assert_eq!(&b64[..n], FIXTURE_PUB_B64.as_bytes());
+        // Parsing it back yields the key, byte for byte.
+        assert_eq!(parse_ed25519_key_blob(&blob), Ok(FIXTURE_KEY));
+    }
+
+    #[test]
+    fn ed25519_key_blob_layout_is_string_string() {
+        assert_eq!(ED25519_KEY_BLOB_LEN, 4 + 11 + 4 + 32);
+        let blob = fixture_blob();
+        assert_eq!(&blob[..4], &11u32.to_be_bytes());
+        assert_eq!(&blob[4..15], b"ssh-ed25519");
+        assert_eq!(&blob[15..19], &32u32.to_be_bytes());
+        assert_eq!(&blob[19..], &FIXTURE_KEY);
+    }
+
+    #[test]
+    fn fingerprints_match_ssh_keygen_and_githubs_published_page() {
+        let mut text = [0u8; FINGERPRINT_LEN];
+        let n = write_fingerprint(&sha256(&fixture_blob()), &mut text).expect("fits");
+        assert_eq!(n, FINGERPRINT_LEN);
+        assert_eq!(&text[..n], FIXTURE_FP.as_bytes());
+
+        let mut github = [0u8; ED25519_KEY_BLOB_LEN];
+        assert_eq!(
+            ed25519_key_blob(&GITHUB_KEY, &mut github),
+            Some(ED25519_KEY_BLOB_LEN)
+        );
+        let n = write_fingerprint(&sha256(&github), &mut text).expect("fits");
+        assert_eq!(&text[..n], GITHUB_FP.as_bytes());
+    }
+
+    #[test]
+    fn ed25519_signature_blob_layout_and_roundtrip() {
+        assert_eq!(ED25519_SIG_BLOB_LEN, 4 + 11 + 4 + 64);
+        let sig: [u8; 64] = core::array::from_fn(|i| i as u8);
+        let mut blob = [0u8; ED25519_SIG_BLOB_LEN];
+        assert_eq!(ed25519_signature_blob(&sig, &mut blob), Some(83));
+        assert_eq!(&blob[..4], &11u32.to_be_bytes());
+        assert_eq!(&blob[4..15], b"ssh-ed25519");
+        assert_eq!(&blob[15..19], &64u32.to_be_bytes());
+        assert_eq!(parse_ed25519_signature_blob(&blob), Ok(sig));
+        // A key blob is not a signature blob and vice versa (length).
+        assert_eq!(
+            parse_ed25519_signature_blob(&fixture_blob()),
+            Err(KeyError::BadLength)
+        );
+        assert_eq!(parse_ed25519_key_blob(&blob), Err(KeyError::BadLength));
+    }
+
+    #[test]
+    fn blob_parsers_refuse_every_truncation() {
+        let key = fixture_blob();
+        let mut sig = [0u8; ED25519_SIG_BLOB_LEN];
+        assert_eq!(ed25519_signature_blob(&[7; 64], &mut sig), Some(83));
+        for cut in 0..key.len() {
+            assert!(
+                parse_ed25519_key_blob(&key[..cut]).is_err(),
+                "key blob truncation {cut} accepted"
+            );
+        }
+        for cut in 0..sig.len() {
+            assert!(
+                parse_ed25519_signature_blob(&sig[..cut]).is_err(),
+                "sig blob truncation {cut} accepted"
+            );
+        }
+        // One byte past the end is trailing garbage, not tolerance.
+        let mut long = key.to_vec();
+        long.push(0);
+        assert_eq!(
+            parse_ed25519_key_blob(&long),
+            Err(KeyError::TrailingGarbage)
+        );
+    }
+
+    #[test]
+    fn blob_parsers_refuse_foreign_algorithms_and_lengths() {
+        // Same shape, wrong algorithm name (an RSA key would be this
+        // shape) — refused before any byte could be used.
+        let mut rsa = vec![0u8; 4 + 7 + 4 + 32];
+        rsa[..4].copy_from_slice(&7u32.to_be_bytes());
+        rsa[4..11].copy_from_slice(b"ssh-rsa");
+        rsa[11..15].copy_from_slice(&32u32.to_be_bytes());
+        assert_eq!(parse_ed25519_key_blob(&rsa), Err(KeyError::WrongAlgorithm));
+
+        // Right algorithm, wrong body length (31 and 33).
+        for len in [31u32, 33] {
+            let mut b = vec![0u8; 4 + 11 + 4 + len as usize];
+            b[..4].copy_from_slice(&11u32.to_be_bytes());
+            b[4..15].copy_from_slice(b"ssh-ed25519");
+            b[15..19].copy_from_slice(&len.to_be_bytes());
+            assert_eq!(parse_ed25519_key_blob(&b), Err(KeyError::BadLength));
+        }
+
+        // A length field claiming far more than the blob holds is
+        // refused by the length check itself (never "read what is
+        // there").
+        let mut lying = fixture_blob().to_vec();
+        lying[15..19].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(parse_ed25519_key_blob(&lying), Err(KeyError::BadLength));
+    }
+
+    #[test]
+    fn key_and_signature_encoders_refuse_short_buffers() {
+        let mut out = [0u8; ED25519_KEY_BLOB_LEN];
+        assert_eq!(ed25519_key_blob(&FIXTURE_KEY, &mut out[..50]), None);
+        assert_eq!(
+            ed25519_key_blob(&FIXTURE_KEY, &mut out[..ED25519_KEY_BLOB_LEN]),
+            Some(51)
+        );
+        let mut sig = [0u8; ED25519_SIG_BLOB_LEN];
+        assert_eq!(ed25519_signature_blob(&[0; 64], &mut sig[..82]), None);
+        assert_eq!(
+            ed25519_signature_blob(&[0; 64], &mut sig[..ED25519_SIG_BLOB_LEN]),
+            Some(83)
+        );
+    }
+
+    #[test]
+    fn userauth_publickey_probe_has_exact_wire_shape() {
+        let blob = fixture_blob();
+        let mut out = [0u8; 256];
+        let n = userauth_publickey_payload(AUTH_USER, &blob, None, &mut out).expect("fits");
+        assert_eq!(n, 110);
+        assert_eq!(&out[..n], publickey_request_wire(&blob, None).as_slice());
+        // The boolean is FALSE: a probe, not a claim.
+        assert_eq!(out[1 + 7 + 18 + 13], 0);
+    }
+
+    #[test]
+    fn userauth_publickey_signed_request_appends_the_signature() {
+        let blob = fixture_blob();
+        let mut sig_blob = [0u8; ED25519_SIG_BLOB_LEN];
+        assert_eq!(ed25519_signature_blob(&[0xAB; 64], &mut sig_blob), Some(83));
+        let mut out = [0u8; 256];
+        let n =
+            userauth_publickey_payload(AUTH_USER, &blob, Some(&sig_blob), &mut out).expect("fits");
+        assert_eq!(n, 110 + 4 + 83);
+        assert_eq!(
+            &out[..n],
+            publickey_request_wire(&blob, Some(&sig_blob)).as_slice()
+        );
+        assert_eq!(out[1 + 7 + 18 + 13], 1);
+    }
+
+    #[test]
+    fn userauth_publickey_refuses_bad_inputs() {
+        let blob = fixture_blob();
+        let mut out = [0u8; 256];
+        // No user, no key.
+        assert_eq!(userauth_publickey_payload(b"", &blob, None, &mut out), None);
+        assert_eq!(
+            userauth_publickey_payload(AUTH_USER, b"", None, &mut out),
+            None
+        );
+        // A blob that is not an ed25519 key (wrong alg, trailing junk,
+        // wrong length).
+        let mut rsa = blob;
+        rsa[4..15].copy_from_slice(b"ssh-ed25519"); // keep shape
+        rsa[11] = b'X'; // now "ssh-ed2X519"
+        assert_eq!(
+            userauth_publickey_payload(AUTH_USER, &rsa, None, &mut out),
+            None
+        );
+        let mut long = blob.to_vec();
+        long.push(0);
+        assert_eq!(
+            userauth_publickey_payload(AUTH_USER, &long, None, &mut out),
+            None
+        );
+        // A signature blob that is not 64 bytes of ed25519 signature.
+        let mut short = [0u8; ED25519_SIG_BLOB_LEN];
+        assert!(ed25519_signature_blob(&[0; 64], &mut short).is_some());
+        short[15..19].copy_from_slice(&63u32.to_be_bytes());
+        assert_eq!(
+            userauth_publickey_payload(AUTH_USER, &blob, Some(&short), &mut out),
+            None
+        );
+        // Output buffer one byte short of the exact request.
+        let mut tight = [0u8; 197];
+        assert_eq!(
+            userauth_publickey_payload(AUTH_USER, &blob, Some(&short), &mut tight[..196]),
+            None
+        );
+        // A hostile user name that would not fit the buffer.
+        let big = vec![b'u'; 4096];
+        assert_eq!(
+            userauth_publickey_payload(&big, &blob, None, &mut out),
+            None
+        );
+    }
+
+    #[test]
+    fn signed_data_is_the_session_id_prefixed_to_the_probe() {
+        let blob = fixture_blob();
+        let mut probe = [0u8; 256];
+        let plen = userauth_publickey_payload(AUTH_USER, &blob, None, &mut probe).expect("fits");
+        let session = [0x5Au8; 32];
+        let mut data = [0u8; 256];
+        let dlen = userauth_signed_data(&session, &probe[..plen], &mut data).expect("fits");
+        assert_eq!(dlen, 32 + 110);
+        assert_eq!(&data[..32], &session);
+        assert_eq!(&data[32..dlen], &probe[..plen]);
+        // No session id, no request, or a short buffer: refused.
+        assert_eq!(userauth_signed_data(b"", &probe[..plen], &mut data), None);
+        assert_eq!(userauth_signed_data(&session, b"", &mut data), None);
+        assert_eq!(
+            userauth_signed_data(&session, &probe[..plen], &mut data[..141]),
+            None
+        );
+    }
+
+    #[test]
+    fn signed_request_verifies_and_any_edit_is_rejected() {
+        use ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
+
+        let sk = SigningKey::from_bytes(&[0x42u8; 32]);
+        let vk = sk.verifying_key();
+        let mut key_blob = [0u8; ED25519_KEY_BLOB_LEN];
+        assert_eq!(
+            ed25519_key_blob(&vk.to_bytes(), &mut key_blob),
+            Some(ED25519_KEY_BLOB_LEN)
+        );
+
+        let mut probe = [0u8; 256];
+        let plen =
+            userauth_publickey_payload(AUTH_USER, &key_blob, None, &mut probe).expect("fits");
+        let session = [0x11u8; 32];
+        let mut data = [0u8; 256];
+        let dlen = userauth_signed_data(&session, &probe[..plen], &mut data).expect("fits");
+
+        let sig = sk.sign(&data[..dlen]);
+        let mut sig_blob = [0u8; ED25519_SIG_BLOB_LEN];
+        assert_eq!(
+            ed25519_signature_blob(&sig.to_bytes(), &mut sig_blob),
+            Some(ED25519_SIG_BLOB_LEN)
+        );
+        // The blob on the wire roundtrips to the same signature.
+        let parsed = parse_ed25519_signature_blob(&sig_blob).expect("our own blob parses");
+        assert!(
+            vk.verify(&data[..dlen], &Signature::from_bytes(&parsed))
+                .is_ok()
+        );
+
+        // A different session identifier (rekey / MITM) breaks it.
+        let mut other_session = session;
+        other_session[31] ^= 1;
+        let mut other_data = [0u8; 256];
+        let olen =
+            userauth_signed_data(&other_session, &probe[..plen], &mut other_data).expect("fits");
+        assert!(
+            vk.verify(&other_data[..olen], &Signature::from_bytes(&parsed))
+                .is_err()
+        );
+
+        // So does one flipped bit anywhere in the request itself.
+        for i in [0usize, 1 + 7 + 18 + 13, plen - 1] {
+            let mut tampered = data;
+            tampered[32 + i] ^= 1;
+            assert!(
+                vk.verify(&tampered[..dlen], &Signature::from_bytes(&parsed))
+                    .is_err(),
+                "tampering at request byte {i} still verified"
+            );
+        }
+    }
+
+    #[test]
+    fn pk_ok_roundtrip_and_rejections() {
+        let blob = fixture_blob();
+        let mut p = Vec::new();
+        p.push(SSH_MSG_USERAUTH_PK_OK);
+        p.extend_from_slice(&11u32.to_be_bytes());
+        p.extend_from_slice(b"ssh-ed25519");
+        p.extend_from_slice(&(blob.len() as u32).to_be_bytes());
+        p.extend_from_slice(&blob);
+        let ok = parse_userauth_pk_ok(&p).expect("parses");
+        assert_eq!(ok.algorithm, b"ssh-ed25519");
+        assert_eq!(ok.key_blob, &blob);
+
+        // Wrong message byte.
+        let mut wrong = p.clone();
+        wrong[0] = SSH_MSG_USERAUTH_FAILURE;
+        assert_eq!(
+            parse_userauth_pk_ok(&wrong),
+            Err(UserAuthError::WrongMessage)
+        );
+        // Wrong algorithm name (same length, so the algorithm is what
+        // gets refused, not the field length).
+        let mut alg = p.clone();
+        alg[5..16].copy_from_slice(b"ssh-ed2551X");
+        assert_eq!(
+            parse_userauth_pk_ok(&alg),
+            Err(UserAuthError::WrongAlgorithm)
+        );
+        // A key blob that is not an ed25519 key (the echoed blob's
+        // inner algorithm byte is corrupted — still 51 bytes, so the
+        // length checks pass and the blob check must refuse it).
+        let mut badkey = p.clone();
+        badkey[24] = b'X';
+        assert_eq!(parse_userauth_pk_ok(&badkey), Err(UserAuthError::BadKey));
+        // Trailing bytes and every truncation.
+        let mut tail = p.clone();
+        tail.push(0);
+        assert_eq!(
+            parse_userauth_pk_ok(&tail),
+            Err(UserAuthError::TrailingGarbage)
+        );
+        for cut in 0..p.len() {
+            assert!(
+                parse_userauth_pk_ok(&p[..cut]).is_err(),
+                "pk_ok truncation {cut} accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn userauth_success_and_banner_shapes() {
+        assert_eq!(parse_userauth_success(&[SSH_MSG_USERAUTH_SUCCESS]), Ok(()));
+        assert_eq!(
+            parse_userauth_success(&[SSH_MSG_USERAUTH_SUCCESS, 0]),
+            Err(UserAuthError::TrailingGarbage)
+        );
+        assert_eq!(
+            parse_userauth_success(&[SSH_MSG_USERAUTH_FAILURE]),
+            Err(UserAuthError::WrongMessage)
+        );
+        assert_eq!(parse_userauth_success(&[]), Err(UserAuthError::Truncated));
+
+        let mut b = Vec::new();
+        b.push(SSH_MSG_USERAUTH_BANNER);
+        b.extend_from_slice(&14u32.to_be_bytes());
+        b.extend_from_slice(b"hello, friend\n");
+        b.extend_from_slice(&0u32.to_be_bytes());
+        let banner = parse_userauth_banner(&b).expect("parses");
+        assert_eq!(banner.message, b"hello, friend\n");
+        assert_eq!(banner.language, b"");
+        for cut in 0..b.len() {
+            assert!(
+                parse_userauth_banner(&b[..cut]).is_err(),
+                "banner truncation {cut} accepted"
+            );
+        }
+        let mut tail = b.clone();
+        tail.push(1);
+        assert_eq!(
+            parse_userauth_banner(&tail),
+            Err(UserAuthError::TrailingGarbage)
+        );
+        // A length field that overruns the payload.
+        let mut liar = b.clone();
+        liar[1..5].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(parse_userauth_banner(&liar), Err(UserAuthError::Truncated));
+    }
+
+    #[test]
+    fn seed_hex_accepts_both_cases_and_surrounding_whitespace() {
+        let mut seed = [0u8; 32];
+        parse_seed_hex(
+            b"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+            &mut seed,
+        )
+        .expect("lowercase");
+        assert_eq!(seed, core::array::from_fn(|i| i as u8));
+        parse_seed_hex(
+            b"  \r\n000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F\t\n",
+            &mut seed,
+        )
+        .expect("uppercase + whitespace");
+        assert_eq!(seed, core::array::from_fn(|i| i as u8));
+        // Trimmed to nothing is a length error, not an empty seed.
+        assert_eq!(
+            parse_seed_hex(b"  \n\t ", &mut seed),
+            Err(KeyError::BadHexLength)
+        );
+    }
+
+    #[test]
+    fn seed_hex_refuses_malformed_text() {
+        let mut seed = [0u8; 32];
+        // 63 and 65 digits.
+        assert_eq!(
+            parse_seed_hex(&[b'a'; 63], &mut seed),
+            Err(KeyError::BadHexLength)
+        );
+        assert_eq!(
+            parse_seed_hex(&[b'a'; 65], &mut seed),
+            Err(KeyError::BadHexLength)
+        );
+        // A non-hex byte in either nibble position, and an interior
+        // space (whitespace is only trimmed at the ends).
+        for pos in [0usize, 1, 32, 63] {
+            for bad_byte in *b"g:" {
+                let mut b = vec![b'0'; 64];
+                b[pos] = bad_byte;
+                assert_eq!(
+                    parse_seed_hex(&b, &mut seed),
+                    Err(KeyError::NotHex),
+                    "byte {pos} set to {bad_byte}"
+                );
+            }
+            if (1..63).contains(&pos) {
+                let mut b = vec![b'0'; 64];
+                b[pos] = b' ';
+                assert_eq!(parse_seed_hex(&b, &mut seed), Err(KeyError::NotHex));
+            }
+        }
+        // A trailing non-hex digit is still 64 bytes long, so it is the
+        // digit check (not the length check) that must catch it.
+        let mut tail = vec![b'0'; 63];
+        tail.push(b'z');
+        assert_eq!(parse_seed_hex(&tail, &mut seed), Err(KeyError::NotHex));
+        // A 32-byte raw binary seed is not hex text.
+        assert!(parse_seed_hex(&[0x7f; 32], &mut seed).is_err());
+    }
+
+    #[test]
+    fn base64_matches_rfc4648_vectors() {
+        // RFC4648 §10 test vectors.
+        let cases: [(&[u8], &str, &str); 7] = [
+            (b"", "", ""),
+            (b"f", "Zg==", "Zg"),
+            (b"fo", "Zm8=", "Zm8"),
+            (b"foo", "Zm9v", "Zm9v"),
+            (b"foob", "Zm9vYg==", "Zm9vYg"),
+            (b"fooba", "Zm9vYmE=", "Zm9vYmE"),
+            (b"foobar", "Zm9vYmFy", "Zm9vYmFy"),
+        ];
+        let mut out = [0u8; 32];
+        for (input, padded, unpadded) in cases {
+            let n = base64_encode(input, true, &mut out).expect("fits");
+            assert_eq!(&out[..n], padded.as_bytes(), "padded {padded}");
+            let n = base64_encode(input, false, &mut out).expect("fits");
+            assert_eq!(&out[..n], unpadded.as_bytes(), "unpadded {unpadded}");
+        }
+    }
+
+    #[test]
+    fn base64_and_fingerprint_refuse_short_buffers() {
+        let mut out = [0u8; 8];
+        // 6 bytes → 8 padded chars, 8 chars unpadded; one less fails.
+        for (input_len, padded_len, unpadded_len) in
+            [(6usize, 8usize, 8usize), (4, 8, 6), (1, 4, 2)]
+        {
+            let input = vec![0u8; input_len];
+            assert_eq!(
+                base64_encode(&input, true, &mut out[..padded_len - 1]),
+                None
+            );
+            assert_eq!(
+                base64_encode(&input, true, &mut out[..padded_len]),
+                Some(padded_len)
+            );
+            assert_eq!(
+                base64_encode(&input, false, &mut out[..unpadded_len - 1]),
+                None
+            );
+            assert_eq!(
+                base64_encode(&input, false, &mut out[..unpadded_len]),
+                Some(unpadded_len)
+            );
+        }
+        let mut fp = [0u8; FINGERPRINT_LEN];
+        assert_eq!(
+            write_fingerprint(&[0; 32], &mut fp[..FINGERPRINT_LEN - 1]),
+            None
+        );
+        assert_eq!(
+            write_fingerprint(&[0; 32], &mut fp[..FINGERPRINT_LEN]),
+            Some(FINGERPRINT_LEN)
+        );
+        assert_eq!(&fp[..7], b"SHA256:");
     }
 }
