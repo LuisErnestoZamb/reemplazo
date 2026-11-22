@@ -18,15 +18,18 @@ const MAX_LFN_UNITS: usize = 255;
 
 /// Where the directory being scanned lives.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum DirLoc {
+pub(crate) enum DirLoc {
     /// The fixed root region (root-entry count bounded).
     Root,
-    /// A cluster chain (subdirectory).
+    /// A cluster chain (subdirectory). For a *slot location* this names
+    /// the exact cluster holding the slot; for a *directory head* it is
+    /// the chain's first cluster.
     Cluster(u32),
 }
 
 /// The parts of a directory entry the reader needs. `pub(crate)`: the
-/// file-reading half in the crate root consumes it.
+/// file-reading half in the crate root and the writer (`write` module)
+/// consume it.
 #[derive(Clone, Copy)]
 pub(crate) struct DirEntry {
     /// First data cluster (0 = none; FAT32's high word must be 0 here).
@@ -67,6 +70,25 @@ enum Step {
     KeepGoing,
     /// The `0x00` marker: nothing after this point is in use.
     End,
+}
+
+/// Result of [`Fat16::locate`]: either the entry was found (with the
+/// exact slot it lives in, so a writer can update it in place) or the
+/// parent directory resolved but the final component is absent (so a
+/// writer knows where to create it).
+pub(crate) enum Placement {
+    /// The final component exists in directory `loc` at `slot`.
+    Found {
+        /// Directory *containing* the entry (the specific cluster for a
+        /// subdirectory slot, [`DirLoc::Root`] for the fixed root).
+        loc: DirLoc,
+        /// Slot index inside `loc`.
+        slot: u32,
+        entry: DirEntry,
+    },
+    /// The final component does not exist; `parent` is the directory
+    /// head a writer would create it in.
+    Missing { parent: DirLoc },
 }
 
 /// Assembled long-name state while scanning one directory.
@@ -254,13 +276,29 @@ fn short_matches(raw: &[u8; 32], component: &str) -> bool {
 }
 
 impl<'a, D: BlockDevice + ?Sized> Fat16<'a, D> {
-    /// Resolve an absolute path to its directory entry.
-    ///
-    /// `.`/`..` are *refused*, not interpreted (a read-only root
-    /// filesystem has no need for traversal and refusing removes the
-    /// whole class of escape); the same holds for empty components and
-    /// non-absolute paths — [`Error::Path`].
+    /// Resolve an absolute path to its directory entry (read path
+    /// convenience over [`locate`](Self::locate)).
     pub(crate) fn resolve(&self, path: &str) -> Result<Option<DirEntry>, Error> {
+        Ok(match self.locate(path)? {
+            Placement::Found { entry, .. } => Some(entry),
+            Placement::Missing { .. } => None,
+        })
+    }
+
+    /// Resolve an absolute path to its **slot**: where the entry lives
+    /// (`Placement::Found`) or, when the final component is absent, the
+    /// existing parent directory a writer would create it in
+    /// (`Placement::Missing`).
+    ///
+    /// `.`/`..` are *refused*, not interpreted (a root filesystem has no
+    /// need for traversal and refusing removes the whole class of
+    /// escape); the same holds for empty components and non-absolute
+    /// paths — [`Error::Path`]. A missing *intermediate* component is
+    /// [`Error::NotFound`] (nothing can be created below a directory
+    /// that does not exist — this crate has no `mkdir`); a missing final
+    /// component is `Placement::Missing`. Both readings collapse to
+    /// `NotFound` for the read path, exactly as before FS2.
+    pub(crate) fn locate(&self, path: &str) -> Result<Placement, Error> {
         let mut rest = path.strip_prefix('/').ok_or(Error::Path)?;
         if rest.is_empty() {
             return Err(Error::Path);
@@ -274,17 +312,30 @@ impl<'a, D: BlockDevice + ?Sized> Fat16<'a, D> {
             if component.is_empty() || component == "." || component == ".." {
                 return Err(Error::Path);
             }
-            let Some(entry) = self.scan_dir(loc, component)? else {
-                return Ok(None);
+            let Some((entry_loc, slot, entry)) = self.scan_dir(loc, component)? else {
+                return match tail {
+                    None | Some("") => Ok(Placement::Missing { parent: loc }),
+                    Some(_) => Err(Error::NotFound),
+                };
             };
             match tail {
-                None => return Ok(Some(entry)),
+                None => {
+                    return Ok(Placement::Found {
+                        loc: entry_loc,
+                        slot,
+                        entry,
+                    });
+                }
                 Some("") => {
                     // A trailing slash must name a directory.
                     if !entry.is_dir() {
                         return Err(Error::Path);
                     }
-                    return Ok(Some(entry));
+                    return Ok(Placement::Found {
+                        loc: entry_loc,
+                        slot,
+                        entry,
+                    });
                 }
                 Some(t) => {
                     if !entry.is_dir() {
@@ -303,7 +354,8 @@ impl<'a, D: BlockDevice + ?Sized> Fat16<'a, D> {
     /// Scan one directory for `name`, stopping at the first match or at
     /// the directory's own end. Both forms of end are bounded: the root
     /// by its entry count, a subdirectory by its (cycle-checked) chain.
-    fn scan_dir(&self, dir: DirLoc, name: &str) -> Result<Option<DirEntry>, Error> {
+    /// On a match the entry's exact slot location travels with it.
+    fn scan_dir(&self, dir: DirLoc, name: &str) -> Result<Option<(DirLoc, u32, DirEntry)>, Error> {
         let mut lfn = LfnState::new();
         match dir {
             DirLoc::Root => {
@@ -311,7 +363,7 @@ impl<'a, D: BlockDevice + ?Sized> Fat16<'a, D> {
                     let mut raw = [0u8; 32];
                     read_bytes(self.dev, self.root_byte(index)?, &mut raw)?;
                     match self.consider(&raw, name, &mut lfn)? {
-                        Step::Found(entry) => return Ok(Some(entry)),
+                        Step::Found(entry) => return Ok(Some((DirLoc::Root, index, entry))),
                         Step::KeepGoing => {}
                         Step::End => break,
                     }
@@ -330,7 +382,9 @@ impl<'a, D: BlockDevice + ?Sized> Fat16<'a, D> {
                         let mut raw = [0u8; 32];
                         read_bytes(self.dev, base + u64::from(slot) * 32, &mut raw)?;
                         match self.consider(&raw, name, &mut lfn)? {
-                            Step::Found(entry) => return Ok(Some(entry)),
+                            Step::Found(entry) => {
+                                return Ok(Some((DirLoc::Cluster(cluster), slot, entry)));
+                            }
                             Step::KeepGoing => {}
                             Step::End => return Ok(None),
                         }

@@ -67,6 +67,26 @@ pub(crate) unsafe fn inw(port: u16) -> u16 {
     val
 }
 
+/// Output a word (16 bits) to I/O port `port` (x86 `out` instruction).
+/// Needed for the ATA data register (0x1F0) during PIO `WRITE SECTORS`
+/// (the write half of the FS2 milestone).
+///
+/// # Safety
+/// Same contract as [`outb`], for 16-bit access width.
+#[inline]
+pub(crate) unsafe fn outw(port: u16, val: u16) {
+    // SAFETY: forwarded to the caller's contract above; `out` to a port
+    // touches I/O space only, never memory.
+    unsafe {
+        core::arch::asm!(
+            "out dx, ax",
+            in("dx") port,
+            in("ax") val,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+}
+
 /// Output a dword to I/O port `port` (x86 `out` instruction).
 /// Needed for PCI configuration (CF8/CFC).
 ///
