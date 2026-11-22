@@ -127,7 +127,7 @@ too). Persistence of config waits for the filesystem milestone (installer/fatfs)
 | A2 | Editor: `editorbuf` gap-buffer crate (host tests) + viewport/cursor/editing keys/line numbers/in-memory buffers; save/open deferred to the FS milestone | **`EDITOR_OK`** (edit a buffer, undo/redo proof, on-screen) | A1 |
 | A3 | AI chat over the **mock**: `aiwire` crate (serde_json request/response/SSE, host tests) + `net::http` POST + xtask `chat-mock` on 127.0.0.1, guest reaches it at `10.0.2.2:<port>` (slirp, no DNS, no secrets) → render the reply in a chat pane | **`AI_CHAT_OK`** (request built → mock 200 → JSON parsed → reply rendered) | A1, serde_json, POST, SSE |
 | A4 | Real endpoint over TLS 1.3 + streaming SSE + key entry (RAM) — **manual verification** with the user's key/endpoint; smoke keeps the mock | manual run (documented in the doc + AGENTS note); not a smoke marker (no secrets in CI) | A3, TLS |
-| A5 | Editor ↔ chat integration: `ai` pane can quote the buffer, apply a completion into the editor (the "opencode-like" workflow) | **`AI_EDIT_OK`** (mock completion inserted into the editor buffer, asserted on screen) | A2, A3 |
+| A5 | Editor ↔ chat integration: `ai` pane can quote the buffer, apply a completion into the editor (the "opencode-like" workflow) | **`AI_EDIT_OK`** — **landed 2026-11-21**: mock completion applied into the retained editor buffer (undo/redo round-trip asserted on the buffer, frame read back from `0xb8000`) + interactive `ai apply` | A2, A3 |
 | A6 | Future: graphical GUI on the VBE framebuffer (font atlas, retained widgets) and/or userland relocation of `apps/` behind syscalls | separate research | A1–A5 |
 
 Order rationale: A1 before anything because both apps render; A3 before A4 because
@@ -168,3 +168,24 @@ the mock makes the whole chain smoke-testable **without credentials**, keeping t
   crates). Adopted: `VgaBackend` + widgets are the A1 rendering path.
 - 2026-11-21 — no_std SSE crate search: only futures/std-based options found
   (`eventsource-stream`, `reqwest-eventsource`).
+- 2026-11-21 — **A5 landed (`AI_EDIT_OK`, markers 22 → 23):** the editor's
+  buffer became a **retained document** — one `static mut Option<Doc>`
+  (buffer + caret) in `apps/editor.rs` under the repo's single-consumer idiom
+  (boot proof before `shell::run`, `edit`/`ai apply` served sequentially, IRQ0
+  never touches it). `edit` mounts it (`Esc` saves back instead of dropping;
+  the in-memory sample on first use), `ai apply` quotes its cursor line → one
+  sanitized mock exchange shared by all three callers
+  (`apps::ai::one_shot`: `ai <message>`, `ai apply`, the boot proof) →
+  `apply_completion` inserts at the cursor through the same `insert_at`
+  primitive typing uses, so the completion is **one undo entry** (Tab removes
+  it, Delete restores it). Boot proof: seed → quote → exchange → apply →
+  undo/redo round-trip asserted byte-exact on the buffer → editor frame read
+  back from `0xb8000`. Verified: `cargo xtask check` exit 0; `cargo xtask
+  smoke` PASS 23/23 with `AI_EDIT_OK` between `AI_CHAT_OK` and `SHELL_OK` (all
+  22 pre-existing markers intact); manual HMP session against `cargo xtask
+  run` — first `edit` showed the proof's document (`… // TODO: ask AI
+  reemplazo: mock reply ok`, `Ln 3,Col 61 [+]`), caret moved to line 4 +
+  Esc, `ai apply` printed `ai: applied \`reemplazo: mock reply ok\` at the
+  editor cursor`, reopening `edit` showed `} reemplazo: mock reply ok`
+  (`Ln 4,Col 27 [+]`), Tab removed it, Delete restored it; `ai hello` still
+  prints the mock reply (A3 path unchanged).

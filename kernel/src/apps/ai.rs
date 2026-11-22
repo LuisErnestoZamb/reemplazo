@@ -27,6 +27,13 @@
 //!   `EDITOR_OK` and `SHELL_OK`. Fail-closed: `FATAL:` + `halt()`.
 //! - [`chat_cmd`]: the optional `ai <message>` shell builtin, fail-soft
 //!   like every other builtin (the real endpoint config is A4).
+//! - A5 (docs/ai-client.md §7): [`one_shot`] is the sanitized exchange
+//!   all three callers share (the two builtins and A5's `AI_EDIT_OK`
+//!   proof in `apps::editor`), [`apply_cmd`] is the `ai apply` builtin —
+//!   quote the editor's retained document, exchange, insert the reply
+//!   through `apps::editor::apply_completion` — and [`is_canned`] is the
+//!   proof's reply-content check. No transport code is duplicated: the
+//!   apply path *is* [`exchange`].
 //!
 //! # Where the code lives
 //!
@@ -521,7 +528,7 @@ fn prove(stack: &mut Stack) -> Result<(), &'static str> {
     // JSON shape passed (`reply()` returned Some above); the *content*
     // must be the canned answer — a 200 carrying anything else fails
     // the proof as loudly as a transport error would.
-    if !reply.contains(CANNED_REPLY) {
+    if !is_canned(&reply) {
         return Err("mock reply content mismatch");
     }
 
@@ -602,6 +609,28 @@ fn row_holds_attr(y: usize, attr: u8) -> bool {
 // The `ai` builtin: one-shot exchange, printed as text
 // ---------------------------------------------------------------------------
 
+/// One sanitized mock exchange for `message` — the shared body behind
+/// the `ai <message>` builtin, A5's [`apply_cmd`] and A5's
+/// `AI_EDIT_OK` proof (`apps::editor::ai_edit_boot_proof`), so all
+/// three build the request and read the reply through exactly one
+/// path. Both directions go through [`sanitize_text`] (the
+/// printable-ASCII policy): nothing off the wire reaches a caller, the
+/// editor document or the serial log verbatim.
+pub fn one_shot(stack: &mut Stack, message: &str) -> Result<String, &'static str> {
+    let request = ChatRequest::new(MODEL)
+        .system(SYSTEM_PROMPT)
+        .user(sanitize_text(message));
+    exchange(stack, &request).map(|reply| sanitize_text(&reply))
+}
+
+/// A5's reply-content check for the boot proof: is this the canned mock
+/// answer? (`AI_CHAT_OK`'s policy — a 200 with the wrong body fails as
+/// loudly as a transport error would; the builtin paths deliberately do
+/// not use this — A4's real endpoint answers with real text.)
+pub fn is_canned(reply: &str) -> bool {
+    reply.contains(CANNED_REPLY)
+}
+
 /// The `ai <message>` shell builtin: one exchange against the mock
 /// (the real endpoint configuration is A4) with the reply printed as
 /// sanitized text. Fails soft — a typo, a dead mock or a bad response
@@ -609,18 +638,40 @@ fn row_holds_attr(y: usize, attr: u8) -> bool {
 pub fn chat_cmd(stack: &mut Stack, args: &str) {
     let message = args.trim();
     if message.is_empty() {
-        serial_println!("usage: ai <message>   (mock endpoint; real endpoint: milestone A4)");
+        serial_println!(
+            "usage: ai <message> | ai apply   (mock endpoint; real endpoint: milestone A4)"
+        );
         return;
     }
-    let request = ChatRequest::new(MODEL).system(SYSTEM_PROMPT).user(message);
-    match exchange(stack, &request) {
-        Ok(reply) => {
-            // Sanitize into a local first: the serial macros evaluate
-            // their arguments twice (VGA + UART), so the expression
-            // must stay side-effect free.
-            let reply = sanitize_text(&reply);
-            serial_println!("ai: {reply}");
-        }
+    match one_shot(stack, message) {
+        // The serial macros evaluate their arguments twice (VGA +
+        // UART), so every argument stays a plain side-effect-free local
+        // — `one_shot` already returned the sanitized reply.
+        Ok(reply) => serial_println!("ai: {reply}"),
+        Err(why) => serial_println!("ai: {why}"),
+    }
+}
+
+/// The A5 `ai apply` shell builtin — the "opencode-like" apply step:
+/// quote the retained editor document's cursor line
+/// ([`crate::apps::editor::quote_cursor_line`]), run one mock exchange
+/// on it, and insert the sanitized reply at the document's cursor
+/// ([`crate::apps::editor::apply_completion`], one undo entry — the
+/// editor's undo removes exactly this completion). Fails soft (shell
+/// contract): a dead mock or a refused insert prints one line and
+/// returns to the prompt, touching nothing.
+pub fn apply_cmd(stack: &mut Stack) {
+    let Some(context) = crate::apps::editor::quote_cursor_line() else {
+        serial_println!("ai: no document to apply into (no editor buffer yet)");
+        return;
+    };
+    let prompt = format!("complete this line: {context}");
+    match one_shot(stack, &prompt) {
+        Ok(reply) => match crate::apps::editor::apply_completion(&reply) {
+            // Plain locals only: side-effect-free macro arguments.
+            Ok(()) => serial_println!("ai: applied `{reply}` at the editor cursor"),
+            Err(why) => serial_println!("ai: apply refused: {why}"),
+        },
         Err(why) => serial_println!("ai: {why}"),
     }
 }

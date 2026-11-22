@@ -15,12 +15,39 @@
 //! - [`run`]: the `edit` shell builtin's interactive loop (Esc quits,
 //!   screen self-heals like `tui`'s).
 //!
+//! # Milestone A5: the retained document (editor ↔ AI)
+//!
+//! One **retained document** outlives `edit` sessions: the buffer plus
+//! caret live in a module [`static`] ([`DOC`]) instead of being dropped
+//! on `Esc`. [`Editor::mount`] takes it out for a session (the in-memory
+//! [`SAMPLE`] on first use — the pre-A5 behaviour) and
+//! [`Editor::unmount`] gives it back, so `Esc` *saves* the session into
+//! the document rather than discarding it. Two operations then work on
+//! the resident document without opening the editor:
+//!
+//! - [`quote_cursor_line`] — the document's cursor line, the context an
+//!   `ai apply` request quotes (the "quote the buffer" half of A5),
+//! - [`apply_completion`] — insert a model completion at the cursor
+//!   through the same `insert_at` primitive typing uses, so it records
+//!   **one undo entry** and the editor's undo (Tab / Ctrl-U) removes
+//!   exactly that completion.
+//!
+//! The SAFETY contract of the `static mut` follows the repo idiom (the
+//! `screen.rs`/`tls.rs` single-consumer rule): one core, boot proof
+//! before `shell::run`, and the shell serves `edit` / `ai apply`
+//! sequentially — each entry point takes the document for one short
+//! operation and gives it back; IRQ0 never touches this module.
+//! [`ai_edit_boot_proof`] wires that document to A3's mock exchange and
+//! proves the whole loop (`AI_EDIT_OK`, between `AI_CHAT_OK` and
+//! `SHELL_OK`).
+//!
 //! # Scope: no filesystem, no network (deferred, not stubbed)
 //!
 //! Open/save need the filesystem milestone (installer/fat32); they are
 //! deliberately absent — there are **no fake stubs** here. The buffer
-//! starts from an in-memory [`SAMPLE`] and lives only for the session.
-//! No network path exists in this milestone either.
+//! starts from an in-memory [`SAMPLE`] and lives only in the retained
+//! document (RAM) for the session. The network path exists only as A5's
+//! quote/apply pair over the A3 mock — a real endpoint is milestone A4.
 //!
 //! # Key map (also shown in the status bar)
 //!
@@ -48,13 +75,16 @@
 //! `Del`-less terminals can redo with Ctrl-R; `0x7F` stays Backspace
 //! (terminal convention).
 
+use crate::apps::ai;
 use crate::apps::screen::{self, ScreenError};
 use crate::apps::tui::VgaBackend;
 use crate::keyboard::Key;
+use crate::netstack::Stack;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
+use core::ptr::addr_of_mut;
 use editorbuf::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -83,6 +113,71 @@ const STATUS_ATTR: u8 = 0x4F;
 /// + status). GRUB leaves 80×25.
 const MIN_COLS: usize = 30;
 const MIN_ROWS: usize = 6;
+
+// ---------------------------------------------------------------------------
+// Milestone A5: the retained document
+// ---------------------------------------------------------------------------
+
+/// The A5 seed text: what the retained document holds when
+/// [`ai_edit_boot_proof`] starts (and the only way `SEED` ever enters
+/// the document — a fresh `edit` before the proof ran falls back to
+/// [`SAMPLE`]). The cursor is parked at the **end of line 2** — the
+/// insertion point — which ends with a space so the applied completion
+/// reads as its own word (the mock reply is canned and carries no
+/// leading space). Line 2's `// TODO: ask AI` stays byte-identical
+/// through the apply, which is what the readback asserts.
+const SEED: &str =
+    "// reemplazo A5 - editor <-> AI\nfn main() {\n    let answer = 0; // TODO: ask AI \n}\n";
+/// Byte offset of the insertion point within [`SEED`]: right after the
+/// trailing space of line 2 (the `\n` that closes it follows). Found
+/// structurally by [`seed_document`], pinned here as a cross-check.
+const SEED_CURSOR: usize = SEED.len() - "\n}\n".len();
+/// Smallest geometry the A5 proof needs: gutter (4) + the longest
+/// rendered row (the seed line + the canned reply = 60) and six rows
+/// (five text lines + status).
+const AI_MIN_COLS: usize = 64;
+const AI_MIN_ROWS: usize = 6;
+/// Bound on the line quoted into an `ai apply` request (bytes, cut at a
+/// char boundary): a 1 MiB line must not become a 1 MiB request body
+/// (docs/ai-client.md §8 — bounded memory).
+const QUOTE_CAP: usize = 96;
+
+/// One retained document: the buffer plus the caret that outlive an
+/// `edit` session (module docs — A5).
+struct Doc {
+    buf: Buffer,
+    /// Byte offset into `buf` — always a char boundary, ≤ len (the same
+    /// contract as [`Editor::cursor`], re-validated on mount after any
+    /// history replay).
+    cursor: usize,
+}
+
+/// The one open document: `None` until the first `edit` or the
+/// [`ai_edit_boot_proof`] seed creates it. SAFETY contract (the repo's
+/// `static mut` idiom, as `screen.rs`/`tls.rs`): **single consumer** on
+/// one core — the boot proof runs before `shell::run`, and the shell
+/// serves `edit` / `ai apply` sequentially, each taking the document for
+/// one short operation via [`doc_mut`]/[`doc_ref`] and giving it back;
+/// IRQ0 (PIT) never touches this module, so no handler can alias the
+/// references handed out here. The payload is heap-backed, so the static
+/// itself is a small `Option`.
+static mut DOC: Option<Doc> = None;
+
+/// Exclusive access to the retained document — the single-consumer
+/// boundary (see [`DOC`]'s SAFETY note).
+fn doc_mut() -> &'static mut Option<Doc> {
+    // SAFETY: raw-pointer deref of the `static mut` whose access
+    // contract is [`DOC`]'s; callers take it for one short operation at
+    // a time and never hold two of these at once.
+    unsafe { &mut *addr_of_mut!(DOC) }
+}
+
+/// Shared access to the retained document (read paths that must not
+/// alias a live `&mut`, e.g. [`quote_cursor_line`]).
+fn doc_ref() -> &'static Option<Doc> {
+    // SAFETY: read-only side of [`DOC`]'s single-consumer contract.
+    unsafe { &*core::ptr::addr_of!(DOC) }
+}
 
 // ---------------------------------------------------------------------------
 // Editor state
@@ -139,6 +234,35 @@ impl Editor {
             view_w: 0,
             scratch: Vec::new(),
         }
+    }
+
+    /// Mount the retained document into this session (A5): buffer and
+    /// caret from [`DOC`], fresh view state. First use — no document
+    /// yet — falls back to the in-memory [`SAMPLE`], exactly the
+    /// pre-A5 behaviour.
+    fn mount() -> Self {
+        match doc_mut().take() {
+            Some(doc) => Self {
+                buf: doc.buf,
+                cursor: doc.cursor,
+                scroll_row: 0,
+                scroll_col: 0,
+                view_h: 0,
+                view_w: 0,
+                scratch: Vec::new(),
+            },
+            None => Self::sample(),
+        }
+    }
+
+    /// Give the document back to [`DOC`] — the `Esc` "save" path (A5):
+    /// the session's buffer and caret survive into the next `edit` and
+    /// are what `ai apply` inserts into afterwards.
+    fn unmount(&mut self) {
+        *doc_mut() = Some(Doc {
+            buf: core::mem::take(&mut self.buf),
+            cursor: self.cursor,
+        });
     }
 
     /// Apply one input event. Returns whether the state changed (the
@@ -223,14 +347,7 @@ impl Editor {
     }
 
     fn try_insert(&mut self, text: &str) -> bool {
-        if self.buf.insert(self.cursor, text).is_ok() {
-            // Inserted at the cursor, which was a boundary, so
-            // cursor + text.len() is a boundary too.
-            self.cursor = self.cursor.saturating_add(text.len());
-            true
-        } else {
-            false // buffer at MAX_BYTES: fail soft, keep editing
-        }
+        insert_at(&mut self.buf, &mut self.cursor, text)
     }
 
     /// Move one line up/down keeping the character column (clamped to
@@ -398,6 +515,78 @@ impl Editor {
             Paragraph::new(self.status_text()).style(Style::new().fg(Color::White).bg(Color::Blue));
         frame.render_widget(status, status_area);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Milestone A5: document operations (retained document)
+// ---------------------------------------------------------------------------
+
+/// Insert `text` at `cursor` inside `buf`, advancing `cursor` past it —
+/// **one** implementation shared by ordinary typing ([`Editor::try_insert`])
+/// and A5's completion apply ([`apply_completion`], [`seed_document`]'s
+/// proof): `Buffer::insert` refuses non-char-boundary offsets and inserts
+/// past `MAX_BYTES`, so UTF-8 safety and the byte cap stay editorbuf's
+/// (this only decides "cursor advances or the edit fails soft").
+fn insert_at(buf: &mut Buffer, cursor: &mut usize, text: &str) -> bool {
+    if buf.insert(*cursor, text).is_ok() {
+        // Inserted at a boundary, so cursor + text.len() is one too.
+        *cursor = (*cursor).saturating_add(text.len());
+        true
+    } else {
+        false // buffer at MAX_BYTES: fail soft, keep editing
+    }
+}
+
+/// A5's "quote the buffer": the retained document's cursor line, the
+/// context an `ai apply` request carries. `None` when no document is
+/// open yet (nothing to quote). The line is cut to [`QUOTE_CAP`] bytes
+/// at a char boundary — a huge line cannot become a huge request.
+pub fn quote_cursor_line() -> Option<String> {
+    let doc = doc_ref().as_ref()?;
+    let line = doc.buf.line_of(doc.cursor).unwrap_or(0);
+    let mut bytes = Vec::new();
+    if !doc.buf.line_bytes(line, &mut bytes) {
+        return Some(String::new());
+    }
+    // editorbuf guarantees valid UTF-8, so this is the whole line;
+    // `unwrap_or("")` keeps the quote panic-free regardless.
+    let text = core::str::from_utf8(&bytes).unwrap_or("");
+    let mut head = String::new();
+    for (i, ch) in text.char_indices() {
+        if i >= QUOTE_CAP {
+            break; // `i` is a char start, so the cut stays on a boundary
+        }
+        head.push(ch);
+    }
+    Some(head)
+}
+
+/// A5's apply operation: insert a model completion `text` at the
+/// retained document's cursor, through [`insert_at`] — so the edit
+/// lands in `editorbuf`'s undo history exactly like typed text and the
+/// editor's undo (Tab / Ctrl-U) removes precisely this completion.
+/// `Err` (fail-soft, shell contract) when no document is open or the
+/// buffer refused the insert; in both cases nothing is modified.
+pub fn apply_completion(text: &str) -> Result<(), &'static str> {
+    let doc = doc_mut().as_mut().ok_or("no open document")?;
+    if insert_at(&mut doc.buf, &mut doc.cursor, text) {
+        Ok(())
+    } else {
+        Err("insert refused (buffer full)")
+    }
+}
+
+/// Put [`SEED`] into the retained document with the caret at the
+/// insertion point ([`SEED_CURSOR`], cross-checked against the buffer's
+/// own line index so the two cannot drift apart).
+fn seed_document() -> Result<(), &'static str> {
+    let buf = Buffer::from_text(SEED).map_err(|_| "seed text refused")?;
+    let cursor = buf.line_end(2).ok_or("seed line 2 missing")?;
+    if cursor != SEED_CURSOR {
+        return Err("seed insertion point drifted");
+    }
+    *doc_mut() = Some(Doc { buf, cursor });
+    Ok(())
 }
 
 /// Gutter width: right-aligned line numbers in at least 3 columns
@@ -594,29 +783,218 @@ fn row_holds_attr(y: usize, attr: u8) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// The boot proof: AI_EDIT_OK (milestone A5)
+// ---------------------------------------------------------------------------
+
+/// Script the A5 proof — the "opencode-like" loop end to end: seed the
+/// retained document ([`SEED`]), quote its cursor line into **one real
+/// mock exchange** (A3's transport, sanitizing both directions), apply
+/// the reply at the document's cursor through the same path `ai apply`
+/// uses, prove the **undo/redo round-trip** at buffer level, render the
+/// editor frame and read it back from `0xb8000` — the smoke test's
+/// `AI_EDIT_OK` (printed between `AI_CHAT_OK` and `SHELL_OK`).
+///
+/// Fail-closed like every other boot proof, with the failure domain in
+/// the prefix: the exchange and the reply content fail as `FATAL: ai:`,
+/// the document, undo trail and screen as `FATAL: editor:`. A genuinely
+/// absent text console skips the proof (the `TUI_OK` rule), and — like
+/// `ai::boot_proof` — it needs the network stack, which
+/// [`crate::kernel_main`] guarantees by only calling this inside its
+/// `Some(stack)` branch (the smoke always has a NIC, so a skip shows up
+/// as a missing marker). Afterwards the screen is cleared and the
+/// console cursor reset, so the shell starts clean — and the retained
+/// document is left **with the completion applied**, which is what the
+/// next `edit` / `ai apply` session works on.
+pub fn ai_edit_boot_proof(stack: &mut Stack) {
+    match screen::open() {
+        Ok(()) => {}
+        Err(ScreenError::NoConsole) => return,
+        Err(why) => {
+            serial_println!("FATAL: editor: {why}");
+            crate::halt();
+        }
+    }
+    if let Err(why) = seed_document() {
+        serial_println!("FATAL: editor: {why}");
+        crate::halt();
+    }
+    // The quote comes from the resident document (A5's "quote the
+    // buffer"); no document after the seed above is a logic bug.
+    let Some(context) = quote_cursor_line() else {
+        serial_println!("FATAL: editor: seeded document is not resident");
+        crate::halt();
+    };
+    // A3's exchange + sanitizing path (`ai::one_shot`): transport and
+    // reply text are untrusted, and the content must be the canned mock
+    // answer — a 200 carrying anything else fails as loudly as a
+    // transport error would.
+    let reply = match ai::one_shot(stack, &context) {
+        Ok(reply) => reply,
+        Err(why) => {
+            serial_println!("FATAL: ai: {why}");
+            crate::halt();
+        }
+    };
+    if !ai::is_canned(&reply) {
+        serial_println!("FATAL: ai: mock reply content mismatch");
+        crate::halt();
+    }
+    if let Err(why) = prove_ai_edit(&reply) {
+        serial_println!("FATAL: editor: {why}");
+        crate::halt();
+    }
+    serial_println!("AI_EDIT_OK"); // machine-checked by `cargo xtask smoke`
+    crate::vga::clear_screen();
+}
+
+/// The document/render half of [`ai_edit_boot_proof`]: mount the seeded
+/// document, apply the completion at the cursor, assert the buffer
+/// through one undo **and** redo (both directions really replay the
+/// applied edit), render, read the frame back from `0xb8000`, then
+/// unmount — the document goes back into [`DOC`] **with the completion
+/// applied**, which the shell's `edit`/`ai apply` then see. Every error
+/// string becomes a `FATAL: editor:` line.
+fn prove_ai_edit(reply: &str) -> Result<(), &'static str> {
+    let (cols, rows) = screen::dims().ok_or("screen geometry lost after open")?;
+    if cols < AI_MIN_COLS || rows < AI_MIN_ROWS {
+        return Err("text screen too small for the A5 frame (min 64x6)");
+    }
+    let mut ed = Editor::mount();
+
+    // The insertion point is the seeded cursor's line; the seed line's
+    // exact bytes are the baseline for every assertion below.
+    let target = ed.buf.line_of(ed.cursor).ok_or("cursor lost its line")?;
+    let seed_line = line_text(&ed.buf, target).ok_or("cursor line unreadable")?;
+    let mut applied = seed_line.clone();
+    applied.push_str(reply);
+
+    // (a) Apply at the cursor — the A5 operation, one undo entry.
+    if !insert_at(&mut ed.buf, &mut ed.cursor, reply) {
+        return Err("completion insert refused");
+    }
+    if !line_equals(&ed.buf, target, applied.as_bytes()) {
+        return Err("completion not applied at the cursor");
+    }
+    let applied_cursor = ed.cursor; // end of the just-applied completion
+
+    // (b) Undo removes exactly the applied completion, redo restores it
+    // byte-exact — driven on `editorbuf` directly (buffer level, before
+    // any rendering), so the on-screen end state below can only be the
+    // *restored* completion, never a lucky draw.
+    if !ed.buf.undo() {
+        return Err("undo of the applied completion returned false");
+    }
+    if !line_equals(&ed.buf, target, seed_line.as_bytes()) {
+        return Err("undo did not remove the completion");
+    }
+    ed.clamp_cursor();
+    if !ed.buf.redo() {
+        return Err("redo of the applied completion returned false");
+    }
+    if !line_equals(&ed.buf, target, applied.as_bytes()) {
+        return Err("redo did not restore the completion");
+    }
+    // Undo shrank the buffer from under the caret (A2's clamp rule can
+    // leave it mid-text once redo brings the bytes back) — park it at
+    // the end of the restored completion, where an editor leaves it
+    // after an apply, and where the next `ai apply` appends.
+    ed.cursor = applied_cursor;
+    ed.clamp_cursor();
+
+    // (c) The round-trip touched nothing else: the rest of the seed is
+    // still byte-identical.
+    if !line_starts_with(&ed.buf, 0, b"// reemplazo A5 - editor <-> AI") {
+        return Err("undo trail corrupted the seed header");
+    }
+    if !line_starts_with(&ed.buf, 3, b"}") {
+        return Err("undo trail corrupted the closing brace");
+    }
+
+    // (d) Render through the A1 path (ratatui → VgaBackend → screen
+    // diff → `0xb8000`) and read back the visible end state: original
+    // text and completion both on row 2, gutter and status intact.
+    let mut terminal = Terminal::new(VgaBackend::default()).map_err(|_| "terminal init failed")?;
+    terminal
+        .draw(|frame| ed.render_into(frame))
+        .map_err(|_| "A5 frame failed")?;
+
+    let gutter = gutter_width(ed.buf.line_count());
+    if !cells_hold(0, 0, gutter_cell(1, gutter).as_bytes()) {
+        return Err("line-number gutter missing on row 0");
+    }
+    if !cells_hold(0, 2, gutter_cell(target + 1, gutter).as_bytes()) {
+        return Err("line-number gutter missing on the edited row");
+    }
+    if !row_holds(target, b"let answer = 0; // TODO: ask AI") {
+        return Err("original text missing from the screen");
+    }
+    if !row_holds(target, reply.as_bytes()) {
+        return Err("applied completion missing from the screen");
+    }
+    let status_row = rows.checked_sub(1).ok_or("no status row")?;
+    if !row_holds(status_row, b"Esc quit") {
+        return Err("status bar missing from the last row");
+    }
+    if !row_holds(status_row, b"[+]") {
+        return Err("modified flag missing from the status bar");
+    }
+    if !row_holds_attr(status_row, STATUS_ATTR) {
+        return Err("status attribute missing from the last row");
+    }
+
+    ed.unmount();
+    Ok(())
+}
+
+/// Line `line` of `buf` as text, or `None` when it cannot be read.
+/// (`editorbuf` guarantees UTF-8; the `Err` arm degrades to `None`
+/// rather than panicking.)
+fn line_text(buf: &Buffer, line: usize) -> Option<String> {
+    let mut out = Vec::new();
+    if !buf.line_bytes(line, &mut out) {
+        return None;
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Does line `line` of `buf` hold exactly `want`? (The A5 proof's
+/// byte-exact assertions around the applied completion — `line_bytes`
+/// excludes the trailing newline.)
+fn line_equals(buf: &Buffer, line: usize, want: &[u8]) -> bool {
+    let mut out = Vec::new();
+    buf.line_bytes(line, &mut out) && out.as_slice() == want
+}
+
+// ---------------------------------------------------------------------------
 // The `edit` builtin: interactive session
 // ---------------------------------------------------------------------------
 
-/// The `edit` shell builtin: open the in-memory sample buffer and edit
-/// it with the polled keyboard until `Esc`. Fails soft — no text
-/// console or a render error prints one line and returns to the
-/// prompt; when a frame did reach the screen, the text buffer is
-/// cleared on exit so the shell resumes on a clean screen (same
-/// contract as `tui`).
+/// The `edit` shell builtin: open the **retained document** (the
+/// in-memory sample on first use — module docs, A5) and edit it with the
+/// polled keyboard until `Esc`, which saves the session back into the
+/// document instead of dropping it. Fails soft — no text console or a
+/// render error prints one line and returns to the prompt; when a frame
+/// did reach the screen, the text buffer is cleared on exit so the shell
+/// resumes on a clean screen (same contract as `tui`).
 pub fn run() {
     if let Err(why) = screen::open() {
         serial_println!("editor: {why}");
         return;
     }
-    if session() {
+    // Mount before the session and unmount on *every* path out of it —
+    // an early return must never lose the document.
+    let mut ed = Editor::mount();
+    let framed = session(&mut ed);
+    ed.unmount();
+    if framed {
         crate::vga::clear_screen();
     }
 }
 
-/// One interactive session. Returns whether any frame reached the
-/// screen (only then is the screen cleared on exit).
-fn session() -> bool {
-    let mut ed = Editor::sample();
+/// One interactive session on an already-mounted editor. Returns
+/// whether any frame reached the screen (only then is the screen
+/// cleared on exit).
+fn session(ed: &mut Editor) -> bool {
     let mut terminal = match Terminal::new(VgaBackend::default()) {
         Ok(terminal) => terminal,
         Err(why) => {
