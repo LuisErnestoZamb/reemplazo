@@ -38,6 +38,8 @@ Estado: **hito 1 completado** (`e53295e`).kernel+apps separados por una frontera
 
 ## Deuda y decisiones
 
+- **Barra superior/launcher** (`kernel/src/apps/launcher.rs`, builtin `apps`): hoy dibuja la fila 0 del VGA en ring 0 con `screen::put` + `flush_diff`; en el hito 3/7 se convierte en el proceso `shell` de usuario, dibujando celdas por `VgaPutCell`/`VgaFlush` sobre el mismo servicio kernel de `flush_diff` (para no romper el readback de `0xb8000`). Su API de navegación (`keyboard::next_event`) ya es la misma que usaría el proceso.
+
 - **Qué se queda en ring 0 al final**: ATA/AHCI/e1000/sky2, PCI/PIC/PIT/IDT, memory/heap, `netstack` (smoltcp), `tls` + raíces, `fs/` + `install.rs`, VGA/serial, y el propio loader/scheduler/dispatch. Razones: sin IOMMU el DMA de usuario es inseguro; el NIC es polled y el stack necesita el PIT en ring 0; FAT16 `write` ya es no-atómico; el installer debe poder formatear antes de que exista un proceso.
 - **Latencia**: sky2 y AHCI sin IRQ (INTx/NCQ pendiente) → I/O se sondea en el tick a 100 Hz (≤10 ms añadidos). No bloquea los markers (deadlines ≥1 s).
 - **Seguridad**: Merom no tiene SMAP/SMEP/NX; la única barrera al dereferenciar punteros de usuario es `userptr::validated_slice` + los bits U/S. Todo `unsafe` nuevo lleva `// SAFETY:`.
