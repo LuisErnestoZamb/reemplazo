@@ -60,6 +60,7 @@
 use crate::clock;
 use crate::keyfile::ServerConfig;
 use crate::netstack::{OP_DEADLINE_MS, Stack};
+use crate::power::idle;
 use crate::ssh;
 use core::ptr::addr_of_mut;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -215,6 +216,16 @@ pub(crate) fn serve_once(stack: &mut Stack, cfg: &ServerConfig) -> bool {
             if clock::now_ms() > deadline {
                 break;
             }
+            // Nothing to accept and no reset to re-arm this pass: sleep
+            // a tick instead of spinning the Core2 at 100%. `hlt` with
+            // IF=1 (armed by `arm_interrupts` long before the serve
+            // path) wakes on IRQ0 within one tick, so `clock::now_ms`
+            // keeps the window deadline exact — SAFETY as in
+            // `main::test_interrupts`. The NIC is polled (IRQ0 is the
+            // only unmasked line), so a packet arriving mid-sleep is
+            // noticed on the next poll: ≤10 ms added latency per idle
+            // pass, the accepted price of a quiet machine for SSH.
+            idle();
         }
         if !connected {
             if window == 0 {
@@ -276,6 +287,9 @@ pub(crate) fn serve_once(stack: &mut Stack, cfg: &ServerConfig) -> bool {
             if clock::now_ms() > deadline {
                 break; // release anyway: one session, then the next window
             }
+            // FIN not acknowledged yet: sleep a tick (as in the accept
+            // loop above) rather than spin until the close completes.
+            idle();
         }
     }
     served
@@ -881,7 +895,10 @@ fn recv_banner(
         match ssh::recv_ready(stack, handle, &mut line[got..]) {
             ssh::Chunk::Ready(n) => got += n,
             ssh::Chunk::Closed => return Err("connection closed before the client banner"),
-            ssh::Chunk::Idle => {}
+            // Nothing queued: sleep a tick instead of spinning. The
+            // deadline check below still fires on time — the clock
+            // runs on IRQ0 while the CPU sleeps.
+            ssh::Chunk::Idle => idle(),
         }
         match ssh_wire::decode_banner(&line[..got]) {
             ssh_wire::BannerStep::Incomplete => {}
@@ -941,7 +958,9 @@ fn recv_plain(
         match ssh::recv_ready(stack, handle, &mut rx[*got..]) {
             ssh::Chunk::Ready(n) => *got += n,
             ssh::Chunk::Closed => return Err("connection closed mid-handshake"),
-            ssh::Chunk::Idle => {}
+            // No bytes this pass: sleep a tick rather than spin (the
+            // deadline above keeps counting on IRQ0).
+            ssh::Chunk::Idle => idle(),
         }
     }
 }
@@ -1023,8 +1042,13 @@ impl Conn<'_, '_> {
                 },
                 Err(_) => return Err("receive buffer full before the packet completed"),
             };
-            if let Some(n) = n {
-                self.enc_rx.commit(n);
+            match n {
+                // Bytes landed: loop closed, no sleep (throughput).
+                Some(n) if n > 0 => self.enc_rx.commit(n),
+                // `Idle` (or a 0-byte read): nothing to parse this
+                // pass — sleep a tick instead of spinning. The
+                // deadline above still fires on time (IRQ0 clock).
+                _ => idle(),
             }
         }
     }
@@ -1052,6 +1076,12 @@ fn send_all(stack: &mut Stack, handle: SocketHandle, data: &[u8]) -> Wire {
             .get_mut::<tcp::Socket>(handle)
             .send_slice(&data[sent..])
         {
+            // TX buffer full (peer window shut or data still unacked):
+            // no progress, so sleep a tick until the next poll's ACK
+            // frees room instead of spinning. A closed connection still
+            // returns `Err` here, and the deadline below bounds a
+            // stalled peer either way.
+            Ok(0) => idle(),
             Ok(n) => sent += n,
             Err(_) => return Err("tcp send rejected (connection lost)"),
         }
