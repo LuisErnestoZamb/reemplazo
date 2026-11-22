@@ -198,6 +198,11 @@ const TD_ACTLEN_MASK: u32 = 0x7FF;
 /// transaction before reporting an error (Linux `uhci_maxerr(3)`
 /// pattern).
 const TD_CERR3: u32 = 3 << 27;
+/// Token bit12: the transfer targets a **low-speed** device (UHCI
+/// spec "Token" field). Real keyboards (the MacBook's included) are
+/// low-speed HID; QEMU's usb-kbd is full-speed, which is why the
+/// smoke never needed this bit before.
+const TD_LOW_SPEED: u32 = 1 << 12;
 
 // TD token bits (Linux TD_TOKEN_*): PID 7:0, device 14:8, endpoint
 // 18:15, data toggle 19, expected length (len - 1) 31:21.
@@ -454,6 +459,9 @@ struct UsbKbd {
     addr: u8,
     /// Endpoint-0 max packet size (8 until the first descriptor read).
     maxpkt0: u8,
+    /// The device answered on a low-speed port (PORTSC LSDA): every
+    /// TD this keyboard schedules carries [`TD_LOW_SPEED`].
+    low_speed: bool,
     /// The keyboard's interrupt-IN endpoint (validated by `usbwire`).
     endpoint: usbwire::EndpointDescriptor,
     /// Interrupt pipe data toggle (DATA0 at endpoint enable, USB 2.0
@@ -556,6 +564,7 @@ fn bring_up(dev: &Device) -> Result<Option<UsbKbd>, &'static str> {
     }
 
     let mut kbd = UsbKbd {
+        low_speed: false, // set by the port scan below, before enumeration
         io,
         _fl_frame: fl_frame,
         _arena_frame: arena_frame,
@@ -617,10 +626,13 @@ fn bring_up(dev: &Device) -> Result<Option<UsbKbd>, &'static str> {
         if sc & PORT_CCS == 0 {
             continue; // nothing connected
         }
-        if sc & PORT_LSDA != 0 {
-            serial_println!("usb: port {port} has a low-speed device (out of scope)");
-            continue; // boot keyboards are full-speed (HID 1.11 §7.1)
+        let low_speed = sc & PORT_LSDA != 0;
+        if low_speed {
+            // Real keyboards are often low-speed HID (the MacBook's
+            // is); enumerate them with the TD low-speed bit set.
+            serial_println!("usb: port {port} low-speed device — enumerating");
         }
+        kbd.low_speed = low_speed;
         // Reset the port: PR is write-triggered and read-only in
         // PORTSC (QEMU `UHCI_PORT_READ_ONLY` includes bit 9; real
         // hardware clears it itself), so: assert PR, hold 50 ms (USB
@@ -844,7 +856,8 @@ impl UsbKbd {
                 | (u32::from(s.addr & 0x7F) << 8)
                 | (u32::from(s.ep & 0x0F) << 15)
                 | ((s.toggle as u32) << 19)
-                | (explen << TD_TOKEN_EXPLEN_SHIFT);
+                | (explen << TD_TOKEN_EXPLEN_SHIFT)
+                | if self.low_speed { TD_LOW_SPEED } else { 0 };
             let td = Td {
                 link,
                 status: TD_ACTIVE | TD_CERR3,
@@ -1168,11 +1181,21 @@ pub fn init(scan: &Scan) {
                 return;
             }
             Ok(None) => continue, // healthy, no keyboard: try next UHCI
-            Err(why) => fatal(why),
+            Err(why) => {
+                // A controller/transfer failure must not strand the
+                // machine: without a serial port the only way out is
+                // the power button, so USB problems degrade to a
+                // warning (the keyboard simply stays unavailable).
+                serial_println!("usb: enumeration failed (continuing without a keyboard): {why}");
+            }
         }
     }
     if found_uhci {
-        fatal("UHCI present but no HID boot keyboard enumerated");
+        // Not fatal: a machine without a usable HID keyboard (e.g. the
+        // MacBook during bring-up) must still reach the network/sshd.
+        // The QEMU smoke's USB_KBD_OK still only appears when a
+        // keyboard really enumerated.
+        serial_println!("usb: no HID boot keyboard enumerated (continuing)");
     }
     // No UHCI at all: silent no-op (documented in the module header).
 }
