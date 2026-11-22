@@ -631,7 +631,10 @@ fn run(root: &Path) -> bool {
 /// with the line-number gutter and status bar, read back from
 /// `0xb8000`), `AI_CHAT_OK` (A3 chat client: OpenAI-style POST against
 /// the in-container mock, serde_json reply parsed, the conversation
-/// pane read back from `0xb8000`) — within
+/// pane read back from `0xb8000`), `AI_EDIT_OK` (A5 editor ↔ AI: the
+/// mock completion applied into the retained editor buffer through the
+/// `ai apply` path, undo/redo round-trip asserted on the buffer, the
+/// editor frame read back from `0xb8000`) — within
 /// [`SMOKE_TIMEOUT`]. Then the keyboard milestone:
 /// once `SHELL_OK` matches, connect to QEMU's HMP monitor
 /// ([`monitor_port`]) and type `echo KEYBOARD_OK` key by key with
@@ -649,7 +652,9 @@ fn run(root: &Path) -> bool {
 /// text buffer, ratatui backend, full-screen frame readback), the A2
 /// editor (gap buffer + line index edits with undo/redo, viewport frame
 /// readback), the A3 chat client (serde_json request/response over
-/// `net::http` POST against the mock + chat-pane readback), the serial
+/// `net::http` POST against the mock + chat-pane readback), the A5
+/// editor ↔ AI integration (retained document, completion apply +
+/// undo round-trip, editor-frame readback), the serial
 /// shell coming up, or the keyboard path (i8042 bring-up, scancode
 /// decode, input multiplexing) — so it gates every milestone in the
 /// chain.
@@ -657,7 +662,7 @@ fn run(root: &Path) -> bool {
 /// It runs **without a disk**, so the `ata::probe` that sits between
 /// `PCI_OK` and `E1000_OK` stays silent here.
 fn smoke(root: &Path) -> bool {
-    const MARKERS: [&str; 22] = [
+    const MARKERS: [&str; 23] = [
         "BOOT_OK",
         "VGA_OK",
         "MEM_OK",
@@ -678,6 +683,7 @@ fn smoke(root: &Path) -> bool {
         "TUI_OK",
         "EDITOR_OK",
         "AI_CHAT_OK",
+        "AI_EDIT_OK",
         "SHELL_OK",
         "KEYBOARD_OK",
     ];

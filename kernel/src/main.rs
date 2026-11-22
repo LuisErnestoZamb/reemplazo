@@ -162,6 +162,21 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
         apps::ai::boot_proof(stack);
     }
 
+    // A5 editor ↔ AI (the "opencode-like" moment): seed the retained
+    // editor document, quote its cursor line into one mock exchange
+    // (10.0.2.2:8099 via slirp, like A3), apply the sanitized reply at
+    // the cursor, prove the undo/redo round-trip and the rendered frame
+    // read back from 0xb8000 (AI_EDIT_OK — between AI_CHAT_OK and
+    // SHELL_OK), then another clean text screen for the shell. The
+    // retained document stays resident with the completion applied,
+    // which the shell's `edit` / `ai apply` open afterwards. Like the
+    // A3 proof it needs the network stack; without one it is skipped
+    // (and the smoke, which always has a NIC, fails on the missing
+    // marker).
+    if let Some(stack) = stack.as_mut() {
+        apps::editor::ai_edit_boot_proof(stack);
+    }
+
     // The shell is the kernel's idle state until a scheduler exists;
     // without a NIC there is nothing to drive, so just park.
     match stack.as_mut() {

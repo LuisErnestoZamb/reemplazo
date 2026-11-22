@@ -123,7 +123,7 @@ impl LineDiscipline {
 /// Run the shell forever — the kernel's idle state until a scheduler
 /// exists. Brings up the polled PS/2 keyboard first (`keyboard::init`
 /// fails soft where there is no i8042 — the MacBook), prints
-/// `SHELL_OK` (the smoke test's fifteenth marker) and then serves
+/// `SHELL_OK` (the smoke test's shell marker) and then serves
 /// prompts from **both** input sources until `halt`.
 pub fn run(stack: &mut Stack) -> ! {
     keyboard::init();
@@ -177,6 +177,7 @@ fn execute(stack: &mut Stack, line: &str) {
              \x20 tui               full-screen TUI demo (Esc quits)\n\
              \x20 edit              in-memory text editor (Esc quits)\n\
              \x20 ai <message>      chat completion via the mock endpoint\n\
+             \x20 ai apply          insert a chat completion into the editor\n\
              \x20 halt              park the CPU"
         ),
         "echo" => serial_println!("{rest}"),
@@ -266,6 +267,10 @@ fn execute(stack: &mut Stack, line: &str) {
         }
         "tui" => crate::apps::tui::run(),
         "edit" => crate::apps::editor::run(),
+        // A5: `ai apply` is the editor-integration builtin (quote the
+        // retained document → mock exchange → insert at its cursor);
+        // anything else after `ai` is a chat message, exactly as before.
+        "ai" if rest == "apply" => crate::apps::ai::apply_cmd(stack),
         "ai" => crate::apps::ai::chat_cmd(stack, rest),
         "halt" => {
             serial_println!("halting.");
