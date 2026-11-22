@@ -382,6 +382,94 @@ fn build_user(root: &Path) -> bool {
     true
 }
 
+/// Hito 3: cross-compile `user-shell` (its own tiny workspace, so the root
+/// member list stays owned by the integrator) and leave the ELF at
+/// `target/x86_64-unknown-none/release/user-shell`. `stage_shell_module`
+/// then copies it into the ISO under the multiboot module name `hello`,
+/// which is the one name the kernel's U1 loader captures today. Same
+/// `code-model=large` scoping rule as `build_user` — never set it globally.
+fn build_user_shell(root: &Path) -> bool {
+    let manifest = root.join("user/shell/Cargo.toml");
+    let status = Command::new("cargo")
+        .args([
+            "build",
+            "--manifest-path",
+            &manifest.to_string_lossy(),
+            "--release",
+            "--target",
+            "x86_64-unknown-none",
+        ])
+        .env(
+            "RUSTFLAGS",
+            "-C target-cpu=x86-64 -C relocation-model=static -C code-model=large",
+        )
+        .env("CARGO_TARGET_DIR", root.join("target"))
+        .current_dir(root)
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => {
+            eprintln!("xtask user-shell: cargo build failed with {s}");
+            return false;
+        }
+        Err(e) => {
+            eprintln!("xtask user-shell: cannot run cargo: {e}");
+            return false;
+        }
+    }
+    let elf = root.join("target/x86_64-unknown-none/release/user-shell");
+    if !elf.is_file() {
+        eprintln!("xtask user-shell: no ELF at {}", elf.display());
+        return false;
+    }
+    println!("xtask user-shell: built {}", elf.display());
+    true
+}
+
+/// Hito 3 counterpart of [`stage_hello_module`]: stage the `user-shell`
+/// ELF as the `hello` multiboot module for the dedicated `smoke-user` ISO.
+/// Reuses the existing capture path in `kernel/src/userland/module.rs`, so
+/// no kernel loader change is needed to run the console-owning process.
+fn stage_shell_module(root: &Path, iso_root: &Path, cfg_path: &Path) {
+    let relative = root.join("target/x86_64-unknown-none/release/user-shell");
+    let bytes = match std::fs::read(&relative) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("xtask user-shell: cannot read {}: {e}", relative.display());
+            return;
+        }
+    };
+    if bytes.len() as u64 > HELLO_MODULE_CAP {
+        eprintln!(
+            "xtask user-shell: ELF is {} B, above the {HELLO_MODULE_CAP} B module cap",
+            bytes.len()
+        );
+        return;
+    }
+    if let Err(e) = std::fs::write(iso_root.join("boot/hello.elf"), bytes) {
+        eprintln!("xtask user-shell: cannot write boot/hello.elf: {e}");
+        return;
+    }
+    let cfg = match std::fs::read_to_string(cfg_path) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("xtask user-shell: cannot read {}: {e}", cfg_path.display());
+            return;
+        }
+    };
+    if cfg.contains("module2 /boot/hello.elf hello") {
+        return;
+    }
+    let cfg = cfg.replacen(
+        "    boot\n",
+        "    module2 /boot/hello.elf hello\n    boot\n",
+        1,
+    );
+    if let Err(e) = std::fs::write(cfg_path, cfg) {
+        eprintln!("xtask user-shell: cannot write {}: {e}", cfg_path.display());
+    }
+}
+
 /// The early config embedded **inside `core.img`** (`grub-mkimage -c`)
 /// — this is what boots the *installed* disk (§4, §8.6):
 ///
@@ -445,6 +533,9 @@ const HELLO_MODULE_CAP: u64 = 4 * 1024 * 1024;
 /// Where the userland agent's build puts the first user ELF. The first hit
 /// wins; `target/iso-root/hello.elf` lets a caller pre-stage the binary
 /// without owning `user/hello/`.
+// Retained for `xtask user` / the integrator: hito 3's smoke-user stages
+// the shell instead, but the U1 hello path is still a supported build.
+#[allow(dead_code)]
 const HELLO_SOURCES: &[&str] = &[
     // The real cargo artifact (built by `xtask user` / `iso_inner`).
     "target/x86_64-unknown-none/release/user-hello",
@@ -456,6 +547,7 @@ const HELLO_SOURCES: &[&str] = &[
 ];
 
 /// First existing path for the userland `hello` build, if any.
+#[allow(dead_code)]
 fn hello_source(root: &Path) -> Option<std::path::PathBuf> {
     HELLO_SOURCES
         .iter()
@@ -467,6 +559,7 @@ fn hello_source(root: &Path) -> Option<std::path::PathBuf> {
 /// to GRUB's config (the name is the module's command line, matched by the
 /// kernel before its frame allocator exists). Missing binary → silent
 /// no-op; present but too large → loud ISO-build failure.
+#[allow(dead_code)]
 fn stage_hello_module(root: &Path, iso_root: &Path, cfg_path: &Path) {
     let Some(relative) = hello_source(root) else {
         eprintln!("xtask: no user hello ELF found; skipping ELF_OK module");
@@ -522,7 +615,9 @@ fn iso_inner(root: &Path, hwtest: bool, user_mode: bool) -> bool {
     // U1: build/stage the userland ELF only in the dedicated smoke-user
     // ISO. The standard smoke/install/ssh/hwtest ISOs stay byte-identical
     // (no hello module -> no ELF_OK -> original marker chains).
-    if user_mode && !build_user(root) {
+    // Hito 3: the smoke-user ISO runs the console-owning user shell under
+    // the existing `hello` module name (the U1 loader's one capture slot).
+    if user_mode && !build_user_shell(root) {
         return false;
     }
     let kernel = root.join("target/x86_64-unknown-none/release/kernel");
@@ -609,7 +704,7 @@ fn iso_inner(root: &Path, hwtest: bool, user_mode: bool) -> bool {
     // chains. With the ELF present the kernel's ELF_OK proof runs after
     // SHELL_OK (the module is captured before `memory::init`).
     if user_mode {
-        stage_hello_module(root, &iso_root, &boot_dir.join("grub.cfg"));
+        stage_shell_module(root, &iso_root, &boot_dir.join("grub.cfg"));
     }
     // I1b: the config embedded in the installed disk's core.img.
     if let Err(e) = std::fs::write(iso_root.join("boot/early.cfg"), GRUB_EARLY_CFG) {
@@ -1927,6 +2022,10 @@ fn smoke_user(root: &Path) -> bool {
         "ELF_OK",
         "USER_RUN_OK",
         "SYSCALL_OK",
+        // Hito 3: the user process proves the VGA service round-trip and
+        // serves its own prompt before handing control back to PID0.
+        "USER_CONSOLE_OK",
+        "USER_SHELL_OK",
         "USER_RETURN_OK",
         "SCHED_RR_OK",
         "USER_YIELD_OK",
