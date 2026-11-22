@@ -25,9 +25,10 @@
 //!   IDE, what `-drive …,if=ide` attaches to, registers them at
 //!   realize time with no guest PCI setup), so this driver needs no
 //!   PCI probe and no BAR mapping. (The MacBook's ICH7 runs its disk
-//!   in **AHCI** mode, where these ports are not the path — real
-//!   hardware gets the separate AHCI milestone; this driver is the
-//!   QEMU/installer path.)
+//!   in **AHCI** mode, where these ports are not the path — the SATA
+//!   driver is `crate::ahci` [milestone `AHCI_OK`], the other variant
+//!   of the [`Disk`] block enum below; this IDE driver stays the
+//!   QEMU/installer path and the byte-identical baseline.)
 //!
 //! Why it is the installer's foundation: GPT, FAT32 and the payload
 //! layout are all sector I/O on the target disk, so every installer
@@ -507,7 +508,7 @@ fn magic_checksum() -> u8 {
 /// LBA0 must carry [`MAGIC`] at [`MAGIC_OFFSET`] followed by its
 /// checksum byte. Slice access only (never raw indexing): the offset is
 /// a constant, but the bytes are disk data.
-fn has_magic(sector: &[u8; 512]) -> bool {
+pub(crate) fn has_magic(sector: &[u8; 512]) -> bool {
     let end = MAGIC_OFFSET + MAGIC.len();
     sector.get(MAGIC_OFFSET..end) == Some(MAGIC) && sector.get(end) == Some(&magic_checksum())
 }
@@ -515,7 +516,7 @@ fn has_magic(sector: &[u8; 512]) -> bool {
 /// Same shape as [`has_magic`] for [`TARGET_MAGIC`] (its own wrapping
 /// sum — the marker identifies the wipe-able target disk, so it gets
 /// its own checksum byte and its own string).
-fn has_target_magic(sector: &[u8; 512]) -> bool {
+pub(crate) fn has_target_magic(sector: &[u8; 512]) -> bool {
     let end = MAGIC_OFFSET + TARGET_MAGIC.len();
     sector.get(MAGIC_OFFSET..end) == Some(TARGET_MAGIC)
         && sector.get(end) == Some(&target_magic_checksum())
@@ -525,4 +526,97 @@ fn has_target_magic(sector: &[u8; 512]) -> bool {
 /// duplicated in xtask's `write_target_image`.
 fn target_magic_checksum() -> u8 {
     TARGET_MAGIC.iter().fold(0u8, |acc, &b| acc.wrapping_add(b))
+}
+
+// ---------------------------------------------------------------------------
+// The block-device abstraction both drivers sit behind
+// ---------------------------------------------------------------------------
+
+/// A block disk the filesystem, GPT and installer work on — **either**
+/// the legacy-IDE [`Drive`] or an [`crate::ahci::AhciDisk`].
+///
+/// Why an enum and not a trait (the same call `netstack::Nic` made for
+/// e1000/sky2): there are exactly two implementations, the method
+/// surface is four methods, and an enum keeps the call sites free of
+/// `dyn` dispatch and of a `&mut self` requirement — both drivers are
+/// stateless from the caller's point of view (`read_sectors`/`write_*`
+/// take `&self`), which is what lets `fat::BlockDevice`'s shared
+/// adapter and `gptwire::Device` keep their `&self` signatures
+/// unchanged.
+///
+/// Semantics are the IDE driver's documented contract, unchanged:
+/// whole 512-byte sectors only, 1..=256 sectors per call, every range
+/// checked against the IDENTIFY-reported capacity inside the driver,
+/// and `false` (never a panic, never a hang) on any failure. The AHCI
+/// side splits a 256-sector request into two 128-sector commands
+/// internally; the caller cannot tell, and neither can the smoke.
+pub(crate) enum Disk {
+    /// Legacy IDE primary-channel drive (QEMU's disk path, unit 0/1).
+    Ide(Drive),
+    /// AHCI/SATA disk on one port (the MacBook's ICH7 path). Boxed so
+    /// the enum stays pointer-sized: the AHCI struct carries its DMA
+    /// frame handles and a 40-byte model string, and the IDE path (the
+    /// smoke's hot path) should not pay for that.
+    Ahci(alloc::boxed::Box<crate::ahci::AhciDisk>),
+}
+
+impl Disk {
+    /// Wrap a probed AHCI disk in the shared block layer.
+    pub(crate) fn ahci(disk: crate::ahci::AhciDisk) -> Disk {
+        Disk::Ahci(alloc::boxed::Box::new(disk))
+    }
+
+    /// Total addressable 512-byte sectors (IDENTIFY on either driver).
+    pub(crate) fn sectors(&self) -> u32 {
+        match self {
+            Disk::Ide(drive) => drive.sectors,
+            Disk::Ahci(disk) => disk.sectors(),
+        }
+    }
+
+    /// Read whole sectors into `buf` (see the type docs for the
+    /// contract). `false` on any driver-level failure.
+    pub(crate) fn read_sectors(&self, lba: u32, buf: &mut [u8]) -> bool {
+        match self {
+            Disk::Ide(drive) => drive.read_sectors(lba, buf),
+            Disk::Ahci(disk) => disk.read_sectors(lba, buf),
+        }
+    }
+
+    /// Write whole sectors from `buf`; same contract as the read path.
+    pub(crate) fn write_sectors(&self, lba: u32, buf: &[u8]) -> bool {
+        match self {
+            Disk::Ide(drive) => drive.write_sectors(lba, buf),
+            Disk::Ahci(disk) => disk.write_sectors(lba, buf),
+        }
+    }
+
+    /// Sanitized model string (see [`Drive::model_name`]; the AHCI
+    /// driver uses the identical sanitization).
+    pub(crate) fn model_name<'a>(&self, out: &'a mut [u8; 40]) -> &'a str {
+        match self {
+            Disk::Ide(drive) => drive.model_name(out),
+            Disk::Ahci(disk) => disk.model_name(out),
+        }
+    }
+
+    /// Which transport this disk came through — log lines only.
+    pub(crate) fn transport(&self) -> &'static str {
+        match self {
+            Disk::Ide(_) => "ide",
+            Disk::Ahci(_) => "ahci",
+        }
+    }
+
+    /// The legacy-IDE drive behind this disk, if any. The S5 key-file
+    /// reader and G3's checkout adapter still take `&Drive` (their
+    /// modules are IDE-only by design: `smoke-ssh` attaches IDE disks
+    /// and the checkout proof is the IDE path's), so a source disk that
+    /// came through AHCI simply has no key file and no extra checkout.
+    pub(crate) fn ide(&self) -> Option<&Drive> {
+        match self {
+            Disk::Ide(drive) => Some(drive),
+            Disk::Ahci(_) => None,
+        }
+    }
 }

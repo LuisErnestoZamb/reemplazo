@@ -77,15 +77,17 @@
 //! - **No shell `disks`/`install`/`netinstall` builtins** (boot-time
 //!   proof chosen for I1/I2 — see docs/installer.md §8.3/§8.4), no
 //!   HTTPS fetch (TLS against a local server is impossible — §7.2;
-//!   the real `api.github.com` fetch is a later milestone), no AHCI,
-//!   no `/boot/grub/grub.cfg` on p2 (I1b embeds a tiny early config in
+//!   the real `api.github.com` fetch is a later milestone), no AHCI
+//!   *install* write path yet (the driver exists and probes + reads;
+//!   the smoke's install runs on the IDE disk — `AHCI_OK` is the
+//!   additive proof), no `/boot/grub/grub.cfg` on p2 (I1b embeds a tiny early config in
 //!   `core.img` instead, §8.6), no GRUB modules beyond the tested
 //!   boot-critical set, and no interactive menu (timeout 0 semantics:
 //!   boot the only entry).
 
 use crate::ata;
 use crate::clock;
-use crate::fs::{AtaDisk, stamp};
+use crate::fs::{BlockDisk, stamp};
 use crate::netstack::{OP_DEADLINE_MS, Stack};
 use core::ptr::{addr_of, addr_of_mut};
 use gptwire::{Guid, Partition, TYPE_BASIC_DATA, TYPE_BIOS_GRUB};
@@ -398,11 +400,11 @@ fn qualify<'a>(name: &str, out: &'a mut [u8; 101]) -> Result<&'a str, fat::Error
 /// whole sectors, range-checked against IDENTIFY capacity on *both*
 /// ends: this adapter checks the request, `Drive::*_sectors` re-checks
 /// it device-side).
-struct GptDev<'a>(&'a ata::Drive);
+struct GptDev<'a>(&'a ata::Disk);
 
 impl gptwire::Device for GptDev<'_> {
     fn size_bytes(&self) -> u64 {
-        u64::from(self.0.sectors) * 512
+        u64::from(self.0.sectors()) * 512
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), gptwire::Error> {
@@ -448,7 +450,7 @@ impl gptwire::Device for GptDev<'_> {
 /// drive re-checks against IDENTIFY capacity, `Drive::*_sectors`'
 /// bound).
 struct Part<'a>(
-    &'a ata::Drive,
+    &'a ata::Disk,
     /* first byte */ u64,
     /* bytes */ u64,
 );
@@ -490,7 +492,7 @@ impl fat::BlockDevice for Part<'_> {
 /// The window describing p2 on `target` — one value built from the
 /// validated GPT and reused for format, copy and verify (so all three
 /// steps address the *same* byte range by construction).
-fn p2_window(target: &ata::Drive, first_lba: u64, last_lba: u64) -> Part<'_> {
+fn p2_window(target: &ata::Disk, first_lba: u64, last_lba: u64) -> Part<'_> {
     let bytes = (last_lba - first_lba + 1) * 512;
     Part(target, first_lba * 512, bytes)
 }
@@ -502,9 +504,9 @@ fn p2_window(target: &ata::Drive, first_lba: u64, last_lba: u64) -> Part<'_> {
 /// install onto. The probing itself happens **once in `kernel_main`**
 /// (before the offline install rewrites LBA0 and erases the marker) —
 /// this function only checks and reports.
-fn prepare_target(target: Option<&ata::Drive>) -> Option<&ata::Drive> {
+fn prepare_target(target: Option<&ata::Disk>) -> Option<&ata::Disk> {
     let target = target?;
-    let total = u64::from(target.sectors);
+    let total = u64::from(target.sectors());
     if total < MIN_TARGET_SECTORS {
         serial_println!(
             "FATAL: install: target too small ({total} sectors, need {MIN_TARGET_SECTORS})"
@@ -514,8 +516,9 @@ fn prepare_target(target: Option<&ata::Drive>) -> Option<&ata::Drive> {
     let mut name_buf = [0u8; 40];
     let model = target.model_name(&mut name_buf);
     serial_println!(
-        "install: target '{model}' {total} sectors ({} MiB)",
-        total / 2048
+        "install: target {transport} '{model}' {total} sectors ({} MiB)",
+        total / 2048,
+        transport = target.transport()
     );
     Some(target)
 }
@@ -525,9 +528,9 @@ fn prepare_target(target: Option<&ata::Drive>) -> Option<&ata::Drive> {
 /// target present is `FATAL: install:` + halt — both markers stand on
 /// this one path, so `INST_OK` and `NETINST_OK` assert identical disk
 /// work (including an identical, bootable GRUB installation).
-fn install_payload(target: &ata::Drive, files: &[PayloadFile<'_>], payloads: &Payloads) {
+fn install_payload(target: &ata::Disk, files: &[PayloadFile<'_>], payloads: &Payloads) {
     // --- Step 1: GPT (docs/installer.md §3.2) ---
-    let total = u64::from(target.sectors);
+    let total = u64::from(target.sectors());
     let Some((_, last_usable)) = gptwire::usable_range(total * 512) else {
         fatal_msg("target cannot hold a GPT");
     };
@@ -692,7 +695,7 @@ fn install_payload(target: &ata::Drive, files: &[PayloadFile<'_>], payloads: &Pa
 /// The installed `core.img` embeds an early config that searches for
 /// `/KERNEL.ELF` and boots it with `multiboot2` (§8.6 documents the
 /// exact config), so p2 needs no `/boot/grub` directory at all.
-fn install_grub(target: &ata::Drive, payloads: &Payloads) {
+fn install_grub(target: &ata::Disk, payloads: &Payloads) {
     let Some((boot, core)) = payloads.grub() else {
         fatal_msg("grubpayload module missing (ISO built without GRUB artifacts?)");
     };
@@ -790,7 +793,7 @@ fn install_grub(target: &ata::Drive, payloads: &Payloads) {
 
 /// Write whole sectors at `lba` in ≤256-sector commands (the ATA
 /// driver's documented per-command bound), range-checked first.
-fn write_sectors_at(target: &ata::Drive, lba: u64, bytes: &[u8]) -> bool {
+fn write_sectors_at(target: &ata::Disk, lba: u64, bytes: &[u8]) -> bool {
     const CHUNK: usize = 256 * 512;
     if bytes.is_empty() || !bytes.len().is_multiple_of(512) {
         return false;
@@ -818,7 +821,7 @@ const VERIFY_LEN: usize = DOWNLOAD_CAP;
 /// the ISO's `payload` module as `/KERNEL.ELF`, run [`install_payload`],
 /// print `INST_OK`. Silent without a marked target disk; `FATAL:` +
 /// `halt()` on any failure with one.
-pub(crate) fn prove(source: &ata::Drive, target: Option<&ata::Drive>, payloads: &Payloads) {
+pub(crate) fn prove(source: &ata::Disk, target: Option<&ata::Disk>, payloads: &Payloads) {
     let Some(target) = prepare_target(target) else {
         return; // no (marked) target disk → zero output, boot continues
     };
@@ -831,7 +834,7 @@ pub(crate) fn prove(source: &ata::Drive, target: Option<&ata::Drive>, payloads: 
     // Read the payload from the source volume — the FS1 machinery,
     // bounded by [`PAYLOAD_CAP`] per file (a bigger file on the
     // source is refused, never truncated).
-    let src_disk = AtaDisk(source);
+    let src_disk = BlockDisk(source);
     let src_fs = match fat::Fat16::mount(&src_disk) {
         Ok(fs) => fs,
         Err(e) => fatal(e),
@@ -869,7 +872,7 @@ pub(crate) fn prove(source: &ata::Drive, target: Option<&ata::Drive>, payloads: 
 /// Read `name` (bare, [`qualify`]-prefixed) from a mounted volume
 /// into `buf` — the offline path's bounded source read.
 fn read_named(
-    fs: &fat::Fat16<'_, AtaDisk<'_>>,
+    fs: &fat::Fat16<'_, BlockDisk<'_>>,
     name: &str,
     buf: &mut [u8],
 ) -> Result<usize, fat::Error> {
@@ -887,7 +890,7 @@ fn read_named(
 /// [`install_payload`], print `NETINST_OK`. Requires the NIC (called
 /// after the boot network chain) and a *marked* target — silent
 /// otherwise, like every other proof here.
-pub(crate) fn netprove(stack: &mut Stack, target: Option<&ata::Drive>, payloads: &Payloads) {
+pub(crate) fn netprove(stack: &mut Stack, target: Option<&ata::Disk>, payloads: &Payloads) {
     let Some(target) = prepare_target(target) else {
         return; // no marked target → no network noise either
     };

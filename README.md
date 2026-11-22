@@ -69,7 +69,8 @@ All in Rust, all in this workspace:
 | `git-pack/` | Packfile v2 reader: header, zlib streams, OFS/REF deltas, trailer + in-memory index, tree/commit parsing — host-tested |
 | `git-store/` | Local git object store formats: loose objects (SHA-1 + zlib), tree/commit writers, the v2 index and refs/HEAD — `no_std`, `forbid(unsafe_code)`, 44 adversarial host tests |
 | `rtc/` | CMOS clock decoding (BCD, 12/24 h, leap years, century plausibility) — host-tested |
-| `pci/` | PCI enumeration and device IDs (e1000, sky2, …) |
+| `pci/` | PCI enumeration and device IDs (e1000, sky2, AHCI class, …) |
+| `ahci-wire/` | AHCI (SATA) wire logic: HBA/port registers, PxIS/PxTFD decode, H2D FIS, command-header/table/PRDT layouts, IDENTIFY + PRDT splitting — `no_std`, `forbid(unsafe_code)`, zero deps, 27 adversarial host tests |
 | `xtask/` | Build/test orchestration (`cargo xtask …`) |
 | `docs/` | Milestone research: hardware probes, crate evaluations, smoltcp/installer designs |
 | `iso/` | Bootable ISO assembly |
@@ -80,7 +81,7 @@ All in Rust, all in this workspace:
 ```sh
 cargo xtask check   # fmt + clippy (host and kernel target) + tests + cross-build
 cargo xtask smoke   # build ISO, boot headless, assert serial markers in order
-cargo xtask smoke-install  # two IDE disks (FAT16 source + blank target); assert BLK_OK + FAT_OK + FS_WRITE_OK + FS_TREE_OK + INST_OK + GIT_CHECKOUT_OK + GIT_STORE_OK + GIT_PUSH_OK + NETINST_OK
+cargo xtask smoke-install  # two IDE disks (FAT16 source + blank target) + an AHCI copy of the source; assert BLK_OK + AHCI_OK + FAT_OK + FS_WRITE_OK + FS_TREE_OK + INST_OK + GIT_CHECKOUT_OK + GIT_STORE_OK + GIT_PUSH_OK + NETINST_OK
 cargo xtask run     # interactive boot in QEMU (Ctrl-C quits)
 cargo test -p mbi <name>   # single test
 ```
@@ -101,7 +102,13 @@ discipline → builtin.
 `cargo xtask smoke-install` boots the same ISO with **two** 64 MiB IDE
 disks attached — a FAT16 *source* volume (`disk.img`) and a blank
 *target* (`target.img`, carrying the wipe marker the installer
-requires) — and asserts `BLK_OK` (the ATA PIO probe), `FAT_OK` — the
+requires) — plus a **third** image, `disk-ahci.img` (a byte copy of the
+source volume), attached through QEMU's AHCI controller
+(`-device ich9-ahci,id=sata` + `-drive if=none,id=ahci0` +
+`-device ide-hd,drive=ahci0,bus=sata.1`) — the MacBook ICH7's transport.
+It asserts `BLK_OK` (the ATA PIO probe), `AHCI_OK` (the AHCI driver's
+PCI probe → port bring-up → `IDENTIFY DEVICE` → LBA0 read → magic, on
+the SATA path the legacy PIO driver cannot reach), `FAT_OK` — the
 FAT mount plus a byte-exact `/README.TXT` read — `FS_WRITE_OK`: the
 kernel *writes* `/RESULT.TXT`, re-mounts from scratch and reads it
 back byte-exact (with `/README.TXT` re-checked for clobbering), `FS_TREE_OK`:
@@ -230,13 +237,13 @@ Milestones landed so far (see `git log` for details):
 - [ ] sky2 driver (real hardware only)
 - [ ] git, ssh, browser, AI client + editor
 - [ ] ISO installer + network installer
-  - [x] Block layer: ATA PIO driver on the legacy IDE primary channel (`cargo xtask smoke-install` asserts `BLK_OK`)
+  - [x] Block layer: ATA PIO driver on the legacy IDE primary channel (`cargo xtask smoke-install` asserts `BLK_OK`) and an **AHCI (SATA) driver** — PCI class 01h/06h/01h, BAR5 ABAR MMIO, port bring-up with bounded ST/FRE handshakes, `IDENTIFY DEVICE`, LBA48 `READ/WRITE DMA EXT` with a scatter/gather PRDT over 4 KiB frames, one command in flight (`ahci-wire` + `kernel/src/ahci.rs`; `smoke-install` asserts `AHCI_OK` on a QEMU `ich9-ahci` disk, and AHCI is the automatic source when no IDE disk answers). Real-ICH7 validation, IRQ completion and NCQ remain
   - [x] Filesystem: FAT16 reader + writer + directories + LFN writes, `no_std` + `forbid(unsafe_code)` + zero deps (`smoke-install` asserts `FAT_OK`, `FS_WRITE_OK` — write + re-mount read-back — and `FS_TREE_OK` — nested mkdir + long-name write + re-mount read-back; `fat/` crate, 102 adversarial host tests incl. randomized write/tree oracles)
   - [x] Shared FAT16 formatter: `fat::format_fat16` derives the geometry from the device size and self-checks against the reader — used by xtask's disk images *and* the kernel installer (`fat/tests/format.rs`, +8 tests)
   - [x] GPT reader + writer: `gptwire` crate, `no_std` + `forbid(unsafe_code)` + zero deps, 49 adversarial host tests (CRC32 vectors, truncated/bad-CRC headers, absurd entry counts, backup mismatch, overlap, MBR garbage)
   - [x] Install-to-disk (I1): GPT → FAT16 p2 → payload copy → byte-exact re-read (`smoke-install` asserts `INST_OK`; host-side re-verify after QEMU exits)
   - [x] Network installer (I2): `payload.tar` (ustar: built kernel + README) fetched from an in-container HTTP responder over the OS's own smoltcp/`net::http` stack, ustar walked with checksum validation, installed + byte-exact re-read (`smoke-install` asserts `NETINST_OK`; host verifies the installed kernel against the built binary). Real-`api.github.com` fetch and HTTPS remain later milestones
-  - [x] **Bootable target (I1b)**: GRUB `boot.img`+`core.img` built by `grub-mkimage` at ISO time, shipped as a multiboot2 module, written by the installer to LBA0 + the `bios_grub` partition with `grub-setup`'s LBA patch and the GPT protective MBR preserved; `smoke-install` boots `target.img` **alone** (no ISO) and asserts the installed system's `BOOT_OK … SHELL_OK`. GRUB boot code on real-hardware disks (AHCI) and a p2 `grub.cfg`/menu remain later work
+  - [x] **Bootable target (I1b)**: GRUB `boot.img`+`core.img` built by `grub-mkimage` at ISO time, shipped as a multiboot2 module, written by the installer to LBA0 + the `bios_grub` partition with `grub-setup`'s LBA patch and the GPT protective MBR preserved; `smoke-install` boots `target.img` **alone** (no ISO) and asserts the installed system's `BOOT_OK … SHELL_OK`. GRUB boot code on real-hardware disks (AHCI install write path) and a p2 `grub.cfg`/menu remain later work
 
 ## License
 

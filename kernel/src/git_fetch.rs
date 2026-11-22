@@ -145,12 +145,7 @@ fn fatal(msg: &str) -> ! {
 /// diskless main smoke's marker chain is untouched.
 ///
 /// `head` is the oid G2 parsed out of the advertisement (`HEAD`).
-pub fn fetch(
-    stack: &mut Stack,
-    ip: Ipv4Address,
-    head: [u8; 20],
-    drive: Option<&crate::ata::Drive>,
-) {
+pub fn fetch(stack: &mut Stack, ip: Ipv4Address, head: [u8; 20], drive: Option<&crate::ata::Disk>) {
     // 1. The want/deepen/done request (see the module docs for the
     //    exact v0 grammar).
     let mut request = [0u8; 256];
@@ -272,12 +267,19 @@ pub fn fetch(
     // 7. Checkout — disk only. Without a drive this whole block is
     //    skipped (the diskless smoke); the handle comes from the boot
     //    probe, so `BLK_OK` is never printed a second time.
-    if let Some(drive) = drive {
-        checkout(drive, &files, &walk);
-        // G4/G5: the local object store (`.git` objects/refs/index) and
-        // one local commit on top of the fetched head, proved from a
-        // fresh mount (GIT_STORE_OK). Disk-only, like the checkout.
-        crate::git_store::realize(drive, &head, &tree_oid, &objects, &by_oid, &files);
+    if let Some(disk) = drive {
+        // The checkout and the local store are the **IDE** disk's
+        // proofs (their adapters still take `ata::Drive`; `smoke-ssh`
+        // and `smoke-install` attach IDE disks). An AHCI-only source
+        // disk still gets the filesystem/install proofs above — this
+        // block just has nothing IDE to write to.
+        if let Some(drive) = disk.ide() {
+            checkout(disk, &files, &walk);
+            // G4/G5: the local object store (`.git` objects/refs/index)
+            // and one local commit on top of the fetched head, proved
+            // from a fresh mount (GIT_STORE_OK). Disk-only.
+            crate::git_store::realize(drive, &head, &tree_oid, &objects, &by_oid, &files);
+        }
     }
 }
 
@@ -287,7 +289,7 @@ pub fn fetch(
 /// byte-exact with a content fragment each, assert the file count (a
 /// silently skipped blob fails loudly), then print `GIT_CHECKOUT_OK`
 /// (smoke-install).
-fn checkout(drive: &crate::ata::Drive, files: &[(Vec<u8>, &[u8])], walk: &Walk) {
+fn checkout(drive: &crate::ata::Disk, files: &[(Vec<u8>, &[u8])], walk: &Walk) {
     if walk.files < MIN_CHECKOUT_FILES || walk.dirs < MIN_CHECKOUT_DIRS {
         fatal("checkout: fetched tree is smaller than the full checkout requires");
     }

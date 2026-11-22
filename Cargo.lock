@@ -44,6 +44,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ahci-wire"
+version = "0.1.0"
+
+[[package]]
 name = "aiwire"
 version = "0.1.0"
 dependencies = [
@@ -784,6 +788,7 @@ name = "kernel"
 version = "0.1.0"
 dependencies = [
  "aes",
+ "ahci-wire",
  "aiwire",
  "csscore",
  "ctr",
