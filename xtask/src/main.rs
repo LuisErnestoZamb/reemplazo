@@ -445,9 +445,12 @@ const HELLO_MODULE_CAP: u64 = 4 * 1024 * 1024;
 /// wins; `target/iso-root/hello.elf` lets a caller pre-stage the binary
 /// without owning `user/hello/`.
 const HELLO_SOURCES: &[&str] = &[
+    // The real cargo artifact (built by `xtask user` / `iso_inner`).
+    "target/x86_64-unknown-none/release/user-hello",
     "user/hello/target/x86_64-unknown-none/release/hello",
     "user/hello/target/x86_64-unknown-none/release/hello.elf",
     "user/hello/hello.elf",
+    "target/iso-root/boot/hello.elf",
     "target/iso-root/hello.elf",
 ];
 
@@ -513,6 +516,11 @@ fn stage_hello_module(root: &Path, iso_root: &Path, cfg_path: &Path) {
 /// `crate::hwtest` (static address, sshd, no smoke chain).
 fn iso_inner(root: &Path, hwtest: bool) -> bool {
     if !build_kernel(root) {
+        return false;
+    }
+    // U1: build the userland ELF before wiping iso-root (stage_hello_module
+    // copies it from the cargo artifact into the ISO below).
+    if !build_user(root) {
         return false;
     }
     let kernel = root.join("target/x86_64-unknown-none/release/kernel");

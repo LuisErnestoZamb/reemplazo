@@ -8,7 +8,7 @@
  *   - `headers` (R) holds the ELF header + program header table at
  *     USER_BASE itself (one page below the first section) — this is the
  *     page lld emits before `.text` when max-page-size=0x1000;
- *   - `user` (RWX) starts at USER_BASE + 0x1000 and contains .text (with
+ *   - `user` (R|X) starts at USER_BASE + 0x1000 and contains .text (with
  *     `_start`, the ELF entry), .rodata, .data and .bss. A single writable
  *     segment keeps the first loader trivial: map p_filesz bytes, zero
  *     p_filesz..p_memsz, jump to e_entry.
@@ -22,7 +22,7 @@ USER_BASE = 0x0000008000000000;
 
 PHDRS {
     headers PT_LOAD FLAGS(4); /* R   — ELF headers page */
-    user    PT_LOAD FLAGS(7); /* RWX — code + rodata + data + bss */
+    user    PT_LOAD FLAGS(5); /* R|X — code + rodata; the loader rejects W|X segments */
 }
 
 SECTIONS {

@@ -15,7 +15,15 @@
 // allow once both call sites exist.
 #![allow(dead_code)]
 
+pub mod elf;
+pub mod load;
+pub mod module;
 pub mod process;
 pub mod sched;
 pub mod syscall;
 pub mod userptr;
+
+/// Boot-time proof that the staged user ELF parses and maps (U1).
+pub(crate) fn boot_proof() {
+    load::boot_proof()
+}

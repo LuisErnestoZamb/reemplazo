@@ -141,6 +141,10 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
             // Copied before the frame allocator for the same reason as
             // the installer payloads.
             let sshd_len = capture_sshd_module(&info);
+            // U1: capture the userland ELF module before the frame
+            // allocator exists — GRUB module frames are not in the MBI
+            // memory map (same reason as the sshd/payload modules).
+            crate::userland::module::capture_hello(&info);
             memory::init(&info, mbi_addr);
             memory::selftest(&info, mbi_addr); // MEM_OK
             heap::init(); // carve a contiguous run, init the global heap

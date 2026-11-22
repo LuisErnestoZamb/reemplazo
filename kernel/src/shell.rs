@@ -155,6 +155,10 @@ impl<'a> LineDiscipline<'a> {
 pub fn run(stack: &mut Stack, payloads: &Payloads) -> ! {
     keyboard::init();
     serial_println!("SHELL_OK"); // machine-checked by `cargo xtask smoke`
+    // U1: prove the staged user ELF parses and maps into a user page
+    // table. Prints ELF_OK only when the module is present, so the
+    // diskless/single-purpose smokes keep their original marker chains.
+    crate::userland::boot_proof();
     serial_print!("{PROMPT}");
 
     let mut disc = LineDiscipline::new(payloads);
