@@ -123,7 +123,7 @@ problem:
 |---|---|---|---|
 | B0 | *(shared prerequisite)* TUI screen layer — docs/ai-client.md milestone **A1** (`TUI_OK`) | — | — |
 | B1 | URL parse/resolve + fetch with redirect loop against real hosts (GET only) | **`BROWSER_FETCH_OK`** (resolve+fetch github.com through ≥1 redirect, print status/final URL) | `url` probe, TLS |
-| B2 | HTML tree builder crate (host tests) + text layout + render in the TUI viewport | **`BROWSER_RENDER_OK`** (a real page rendered as navigable text in QEMU) | B0, B1 |
+| B2 | HTML tree builder crate (host tests) + text layout + render in the TUI viewport | **`BROWSER_RENDER_OK`** (landed: `dom` arena tree over the tokenizer, word-wrapped layout rendered in the viewport and read back from `0xb8000` — real page *and* a feature fixture, since today's example.com carries no `<h1>`/`<a>`) | B0, B1 |
 | B3 | CSS subset: parser + cascade + attribute mapping | **`BROWSER_CSS_OK`** (styled page differs from unstyled, asserted on screen) | B2 |
 | B4 | Navigation polish: history, link jump, status bar, error pages (DNS/refused/timeout → friendly page, never a hang) | **`BROWSER_NAV_OK`** (scripted key sequence follows a link and goes back) | B2 |
 | later | GUI (A6), images, cookies, HTTP cache, keep-alive, JS stance revisit | separate research | — |
@@ -151,6 +151,19 @@ so the AI-client track (A1→A2→A3) and the browser track interleave cleanly:
 
 ## Appendix: verification log
 
+- 2026-11-22 — **B2 landed** (`BROWSER_RENDER_OK`, 25-marker chain):
+  `dom` (new workspace crate, exception (a) of §4) builds an iterative
+  arena tree with `DEPTH_CAP` 64 / `NODE_CAP` 4096 refused fail-closed
+  and adoption-agency-lite rules documented in the crate docs — 38 host
+  tests green (`cargo test -p dom`). The kernel lays the tree out for
+  the text viewport and reads the rendered frame back from `0xb8000`
+  (real page *and* an embedded feature fixture). Two recorded
+  deviations: the fetch is `http://example.com` — today's TLS chain
+  terminates at AAA Certificate Services, which `tls.rs`'s pinned
+  USERTrust ECC root refuses (`tls.rs` outside B2's change set) — and
+  the post-2023 example.com carries no `<h1>`/`<a>`, so heading/link/
+  list/pre assertions run on the fixture frame while title, paragraph
+  and word-wrap assertions run on the real page.
 - 2026-11-21 — `url` no_std+alloc confirmed from docs.rs feature description
   ("The `alloc` feature provides no_std support") and servo/rust-url release
   notes; build probe deferred to milestone B1 start.

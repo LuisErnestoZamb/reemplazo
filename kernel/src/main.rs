@@ -186,6 +186,17 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
     // marker).
     if let Some(stack) = stack.as_mut() {
         apps::editor::ai_edit_boot_proof(stack);
+        // B2 browser render (docs/browser.md §4/§6): fetch a small
+        // real page with B1's parameterized fetch, build the `dom`
+        // tree over our tokenizer, lay it out for the text viewport,
+        // render it through A1's screen layer and read the frame back
+        // from 0xb8000 — BROWSER_RENDER_OK lands between AI_EDIT_OK
+        // and SHELL_OK (the smoke asserts markers in order). Like the
+        // other network phases it needs the stack; without one it is
+        // skipped (and the smoke, which always has a NIC, fails on
+        // the missing marker). Its proofs clear the screen at the
+        // end, so the shell still starts clean.
+        browser::render_smoke(stack); // BROWSER_RENDER_OK
     }
 
     // The shell is the kernel's idle state until a scheduler exists;

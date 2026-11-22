@@ -46,6 +46,14 @@ multiboot2 = { version = "0.28", default-features = false }
 # (its `core_io` backend's build script rejects modern rustc); the
 # recorded evaluation is `docs/installer.md` §5/§9.1 plus the FS1 commit.
 fat = { path = "../fat" }
+# HTML tree construction (B2 of docs/browser.md §4): from-scratch under
+# dependency-policy exception (a) — no maintained no_std tree builder
+# exists (html5ever/markup5ever std, html5gum cannot build no_std: the
+# in-tree spike evidence is `html/src/lib.rs`). Arena of nodes over our
+# own `html` tokenizer, iterative (depth/node caps, fail-closed),
+# `no_std` + `forbid(unsafe_code)`, zero deps beyond `html`;
+# adversarially host-tested in `dom/tests/`.
+dom = { path = "../dom" }
 net = { path = "../net" }
 pci = { path = "../pci" }
 rtc = { path = "../rtc" }

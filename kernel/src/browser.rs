@@ -1,7 +1,9 @@
 //! B1 of docs/browser.md (§3 URL handling, §7 networking): URL
 //! parsing/resolution through the `url` crate plus a
 //! redirect-following HTTP(S) GET — the smoke test's
-//! `BROWSER_FETCH_OK`.
+//! `BROWSER_FETCH_OK`. B2 (§4/§6) adds [`render_smoke`]: the same
+//! fetch parameterized for a second URL, feeding the `dom` tree
+//! builder and the text-layout viewport proof (`BROWSER_RENDER_OK`).
 //!
 //! Chain proven on every boot: parse [`START_URL`]
 //! (`http://github.com/…`), plain-HTTP GET → `301 + Location`
@@ -43,6 +45,20 @@ use url::Url;
 /// http endpoint 301s to https, so every boot exercises a plain hop,
 /// a redirect resolution and a TLS hop (docs/browser.md §7 row B1).
 const START_URL: &str = "http://github.com/LuisErnestoZamb/reemplazo";
+/// B2's render URL (docs/browser.md §7 row B2): a real, stable,
+/// ~600-byte page with a direct `200` and no redirect.
+///
+/// **Why plain `http`, not `https`** (documented deviation): today's
+/// `example.com` is served by Cloudflare with a chain that terminates
+/// at `AAA Certificate Services` (leaf → Cloudflare TLS Issuing ECC
+/// CA 3 → SSL.com Transit → SSL.com Root → Comodo AAA), while
+/// `tls.rs` pins exactly **one** trust anchor — the USERTrust ECC CA —
+/// and `tls.rs` is outside B2's change set. The TLS hop would refuse
+/// the chain fail-closed, so the render proof fetches the identical
+/// page over plain HTTP (verified: `http://example.com` answers `200`
+/// directly, no redirect, `Content-Length` framed). Revisit when
+/// `tls.rs` grows a multi-root store.
+const RENDER_URL: &str = "http://example.com";
 /// Redirects followed before refusing (docs §7: N=5). A chain still
 /// redirecting after five hops is refused, never looped.
 const MAX_REDIRECTS: usize = 5;
@@ -378,17 +394,27 @@ fn tls_hop(
     )
 }
 
-/// The B1 proof: parse [`START_URL`], fetch it following up to
-/// [`MAX_REDIRECTS`] redirects, assert the final 200 with a non-empty
-/// bounded body, print what came back — `BROWSER_FETCH_OK`.
+/// What one [`fetch`] handed back: the final URL, how many head bytes
+/// of the body are stored in [`BODY`] (`min(total, BODY_SAMPLE)`), and
+/// the total body size on the wire.
+struct Fetched {
+    url: Url,
+    stored: usize,
+    total: usize,
+}
+
+/// Fetch `start`, following up to [`MAX_REDIRECTS`] redirects — the
+/// B1 proof loop, parameterized so B2's render proof can point it at
+/// [`RENDER_URL`] (additive: `fetch_smoke` below still runs it with
+/// [`START_URL`], prints and all). Every failure is a fail-closed
+/// `FATAL: browser:` + [`crate::halt`], never a partial result;
+/// success returns the final URL plus the bounded body sample's
+/// stored length.
 ///
-/// Runs after the A3 chat proof so the marker lands between
-/// `AI_CHAT_OK` and `SHELL_OK` (the smoke asserts markers in order).
-/// Its serial lines mirror to the VGA text buffer, so the screen is
-/// cleared at the end — exactly like the A1/A2/A3 proofs — and the
-/// shell still starts clean.
-pub fn fetch_smoke(stack: &mut Stack) {
-    let mut url = match Url::parse(START_URL) {
+/// Its serial lines mirror to the VGA text buffer — callers hand the
+/// shell a clean screen afterwards (see [`fetch_smoke`]).
+fn fetch(stack: &mut Stack, start: &str) -> Fetched {
+    let mut url = match Url::parse(start) {
         Ok(url) => url,
         Err(e) => {
             serial_println!("FATAL: browser: cannot parse the start URL: {e:?}");
@@ -500,8 +526,62 @@ pub fn fetch_smoke(stack: &mut Stack) {
     serial_println!(
         "browser: fetched {final_shown} — {body_total} bytes after {redirects} redirect(s)"
     );
+    Fetched {
+        url: final_url,
+        // The sample is filled head-first by both hop classes, so the
+        // stored prefix is exactly `min(total, BODY_SAMPLE)`.
+        stored: min(body_total, BODY_SAMPLE),
+        total: body_total,
+    }
+}
+
+/// The B1 proof: fetch [`START_URL`] following up to
+/// [`MAX_REDIRECTS`] redirects, assert the final 200 with a non-empty
+/// bounded body, print what came back — `BROWSER_FETCH_OK`.
+///
+/// Runs after the A3 chat proof so the marker lands between
+/// `AI_CHAT_OK` and `AI_EDIT_OK` (the smoke asserts markers in order).
+/// Its serial lines mirror to the VGA text buffer, so the screen is
+/// cleared at the end — exactly like the A1/A2/A3 proofs — and the
+/// shell still starts clean.
+pub fn fetch_smoke(stack: &mut Stack) {
+    // `total` is only informational here — `fetch` already refused an
+    // empty body and printed the summary line.
+    let fetched = fetch(stack, START_URL);
+    debug_assert!(fetched.total > 0 && fetched.stored > 0);
     serial_println!("BROWSER_FETCH_OK"); // machine-checked by `cargo xtask smoke`
     // The serial lines above mirrored to the text buffer; hand the
     // shell the same clean screen the A1/A2/A3 proofs leave behind.
     crate::vga::clear_screen();
+}
+
+/// The B2 proof (docs/browser.md §4/§6/§7): fetch [`RENDER_URL`] with
+/// the parameterized B1 fetch, then hand the bounded body sample to
+/// [`crate::apps::browser::boot_proof`] — which builds the `dom` tree
+/// over our tokenizer, lays it out for the text viewport, renders it
+/// through A1's screen layer, reads the frame back from `0xb8000` and
+/// prints `BROWSER_RENDER_OK` (fail-closed `FATAL: browser:` +
+/// [`crate::halt`] on any mismatch). Clears the screen afterwards so
+/// the shell starts clean, like every neighboring proof. Needs the
+/// network stack — `kernel_main` only calls this inside its
+/// `Some(stack)` branch (the smoke always has a NIC, so a skip shows
+/// up as a missing marker).
+pub fn render_smoke(stack: &mut Stack) {
+    let fetched = fetch(stack, RENDER_URL);
+    let mut sbuf = [0u8; SANITIZE_CAP];
+    // The URL is wire data: sanitize once into a local, then reuse it
+    // (the log line and the status bar share the printable-ASCII view).
+    let status = sanitize(fetched.url.as_str().as_bytes(), &mut sbuf);
+    serial_println!(
+        "browser: rendering {status} ({} stored bytes)",
+        fetched.stored
+    );
+    // SAFETY: single-use statics — the same contract as
+    // `fetch_smoke`: sequential use on one core, IRQ0 never touches
+    // `BODY`, and `fetch` has returned (its `&mut` is gone).
+    let body = unsafe { &*core::ptr::addr_of!(BODY) };
+    let Some(html) = body.get(..fetched.stored) else {
+        fatal("body sample out of range");
+    };
+    crate::apps::browser::boot_proof(html, status);
 }
