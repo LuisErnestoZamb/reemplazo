@@ -87,7 +87,16 @@ fn dispatch_inner(frame: &mut Frame) -> (i64, *mut Frame) {
         NR_EXIT => (sys_exit(frame.rdi as i64), ptr),
         NR_YIELD => (0, sys_yield(ptr)),
         NR_TIME => (sys_time(), ptr),
-        _ => (ENOSYS, ptr),
+        n => (
+            crate::userland::console::dispatch_extra(
+                n,
+                [
+                    frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
+                ],
+            )
+            .unwrap_or(ENOSYS),
+            ptr,
+        ),
     };
     // SAFETY: `ptr` was derived from the live `&mut frame` and is the only
     // handle used again after the match (the Yield arm may have handed the
