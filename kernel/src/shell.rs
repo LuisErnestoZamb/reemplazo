@@ -178,6 +178,7 @@ fn execute(stack: &mut Stack, line: &str) {
              \x20 edit              in-memory text editor (Esc quits)\n\
              \x20 ai <message>      chat completion via the mock endpoint\n\
              \x20 ai apply          insert a chat completion into the editor\n\
+             \x20 ssh-auth <hex|path>  ssh publickey auth to github.com (S3)\n\
              \x20 halt              park the CPU"
         ),
         "echo" => serial_println!("{rest}"),
@@ -272,6 +273,17 @@ fn execute(stack: &mut Stack, line: &str) {
         // anything else after `ai` is a chat message, exactly as before.
         "ai" if rest == "apply" => crate::apps::ai::apply_cmd(stack),
         "ai" => crate::apps::ai::chat_cmd(stack, rest),
+        // S3 manual verification path: `ssh-auth <64-hex-seed>` or
+        // `ssh-auth /KEY.BIN` on a mounted FAT volume (keyfile.rs
+        // parses the argument, fail-soft; ssh.rs runs the same
+        // publickey exchange the boot phase uses, without markers).
+        "ssh-auth" => {
+            // `keyfile` prints why on every refusal (usage, no disk,
+            // bad file) — nothing to add here.
+            if let Some(seed) = crate::keyfile::seed(rest) {
+                crate::ssh::auth_cmd(stack, seed);
+            }
+        }
         "halt" => {
             serial_println!("halting.");
             crate::halt();

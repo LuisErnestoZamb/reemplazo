@@ -29,6 +29,7 @@ mod git;
 mod heap;
 mod idt;
 mod keyboard;
+mod keyfile;
 mod memory;
 mod pci;
 mod pic;
