@@ -44,3 +44,26 @@ pub fn tick() {
 pub fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
 }
+
+/// Scheduler seam for IRQ0: returns the frame the CPU must resume with.
+///
+/// `HZ`, [`init`] and [`tick`] are unchanged — this is only the hook the
+/// integrator connects to `crate::userland::sched::on_tick` via
+/// [`crate::idt::register_sched_hooks`]. No hook (or `SCHED_ACTIVE == false`)
+/// means the interrupted context resumes, which keeps the boot chain and
+/// the cooperative milestone intact.
+///
+/// PREEMPT_USER_ONLY: PID0 runs in ring 0 and is never switched out by a
+/// tick; only a frame saved from CPL3 is offered to the scheduler.
+pub fn on_tick(frame: *mut crate::idt::Frame) -> *mut crate::idt::Frame {
+    if !crate::idt::SCHED_ACTIVE.load(Ordering::Acquire) {
+        return frame;
+    }
+    // SAFETY: `frame` is the frame our asm stub built on the interrupt
+    // stack; reading the saved CS is a plain aligned load, single-core.
+    let from_user = unsafe { (*frame).cs & 3 } == 3;
+    if !from_user {
+        return frame;
+    }
+    crate::idt::call_tick_hook(frame)
+}

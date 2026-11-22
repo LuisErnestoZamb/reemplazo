@@ -124,6 +124,34 @@ long_mode_start:
     movw %ax, %fs
     movw %ax, %gs
 
+    /* Finish the TSS descriptor's base fields. GAS cannot shift a
+     * relocatable symbol into the split base bytes, so they are patched
+     * here — after `lgdt` (which copied only the pointer) and before
+     * `ltr` (which reads the descriptor). */
+    leaq tss(%rip), %rax
+    leaq gdt64 + 40(%rip), %rdx
+    movw %ax, 2(%rdx)                  /* base 15..0 */
+    shrq $16, %rax
+    movb %al, 4(%rdx)                  /* base 23..16 */
+    shrq $8, %rax
+    movb %al, 7(%rdx)                  /* base 31..24 */
+    shrq $8, %rax
+    movl %eax, 8(%rdx)                 /* base 63..32 (0: kernel < 4 GiB) */
+
+    /* 64-bit TSS (GDT index 5). RSP0 is where a CPL3→CPL0 interrupt
+     * switches to; it starts at the boot stack and the scheduler may
+     * repoint it per task with `idt::set_tss_rsp0`. IOPB = 0x68 is one
+     * past the TSS limit (0x67), so *every* port is denied to CPL3
+     * (SDM Vol.3A §8.5.3); ring 0 still does I/O via IOPL=0. */
+    leaq stack_top(%rip), %rax
+    movq %rax, tss + 4(%rip)           /* RSP0 @ offset 4 */
+    movw $0x68, tss + 0x64(%rip)       /* I/O map base @ offset 0x64 */
+
+    /* `ltr` takes r/m16, not an immediate. Descriptor is present, DPL0,
+     * type 9 (64-bit TSS available); loading it marks it busy. */
+    movw $0x28, %ax
+    ltr %ax
+
     movq $stack_top, %rsp
     xorq %rbp, %rbp
 
@@ -137,20 +165,42 @@ long_mode_start:
     hlt
     jmp .Lhang64
 
-/* --- GDT64 (spec: needed before CS reload; 6-byte ptr for 32-bit lgdt) */
+/* --- GDT64: 7 slots, needed before the CS reload -----------------------
+ * 0x00 null · 0x08 kernel code (DPL0) · 0x10 kernel data (DPL0) ·
+ * 0x1B user code (index 3, DPL3 + RPL3) · 0x23 user data (index 4, DPL3) ·
+ * 0x28/0x30 64-bit TSS (index 5, DPL0). A long-mode system descriptor
+ * spans TWO slots (SDM Vol.3A §8.2.3): the first 8 bytes hold limit,
+ * base 31..0 and type/P, the second hold base 63..32 + 4 reserved zero
+ * bytes; slot 0x30 is therefore not usable as a segment. The TSS base
+ * bytes are patched in `long_mode_start` (GAS cannot shift a relocatable
+ * symbol). Every code/data entry is flat; the user data descriptor keeps
+ * D/B=0 as the kernel one does (long mode ignores it).
+ */
 .section .rodata, "a"
 .balign 8
 gdt64:
     .quad 0x0000000000000000           /* 0x00: null */
     .quad 0x00209a0000000000           /* 0x08: code, L=1, P, DPL0, exec/read */
     .quad 0x0000920000000000           /* 0x10: data, P, DPL0, read/write */
+    .quad 0x0020fa0000000000           /* 0x18/0x1B: code, L=1, P, DPL3 */
+    .quad 0x0000f20000000000           /* 0x20/0x23: data, P, DPL3 */
+    .word tss_end - tss - 1            /* TSS limit = 104 - 1 = 0x67 */
+    .word 0                            /* base 15..0: patched at boot */
+    .byte 0                            /* base 23..16: patched at boot */
+    .byte 0x89                         /* type=9 (64-bit TSS available), S=0, P=1 */
+    .byte 0x00                         /* limit 19..16 = 0, G/AVL/L = 0 */
+    .byte 0                            /* base 31..24: patched at boot */
+    .long 0                            /* base 63..32: patched at boot (0) */
+    .long 0                            /* reserved half of the 16-byte TSS desc */
+gdt64_end:
 gdt64_ptr:
-    .word gdt64_ptr - gdt64 - 1        /* limit = size - 1 */
+    .word gdt64_end - gdt64 - 1        /* limit = 7*8 - 1 = 55 */
     .long gdt64                        /* base (kernel < 4 GiB) */
 
 /* --- Data --------------------------------------------------------------- */
 .section .bss, "aw", @nobits
 .balign 4096
+.global pml4                           /* the ELF loader must map PML4[1] */
 pml4: .skip 4096
 pdpt: .skip 4096
 pd0:  .skip 4096
@@ -160,6 +210,15 @@ pd3:  .skip 4096
 
 boot_magic: .skip 4
 boot_mbi:   .skip 4
+
+/* 64-bit TSS, 104 bytes (SDM Vol.3A §8.2.3). RSP0 (+4) and the I/O map
+ * base (+0x64) are initialised in `long_mode_start` before `ltr`; the
+ * rest stays zero (IST unused, no other privilege stacks). */
+.balign 16
+.global tss
+tss:
+    .skip 104
+tss_end:
 
 /* Guard gap between the stack and the page tables above it: a stack
  * overflow must eat this padding before it can corrupt a page-table
