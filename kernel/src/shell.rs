@@ -252,6 +252,7 @@ pub(crate) fn execute(stack: &mut Stack, payloads: &Payloads, line: &str) {
              \x20 disks             list disks: id, model, size, wipe-marker state\n\
              \x20 install <dev> yes guided install onto a wipe-marked disk\n\
              \x20 netinstall <dev> yes  same, payload fetched over the network\n\
+             \x20 netinstall-real <dev> yes  same, payload from api.github.com (HTTPS)\n\
              \x20 apps              application launcher (top bar)\n\
              \x20 tui               full-screen TUI demo (Esc quits)\n\
              \x20 edit              in-memory text editor (Esc quits)\n\
@@ -357,6 +358,7 @@ pub(crate) fn execute(stack: &mut Stack, payloads: &Payloads, line: &str) {
         "disks" => list_disks(),
         "install" => guided_cmd(stack, payloads, "install", rest),
         "netinstall" => guided_cmd(stack, payloads, "netinstall", rest),
+        "netinstall-real" => guided_cmd(stack, payloads, "netinstall-real", rest),
         "apps" => crate::apps::launcher::run(stack, payloads),
         "tui" => crate::apps::tui::run(),
         "edit" => crate::apps::editor::run(),
@@ -591,6 +593,15 @@ fn guided_cmd(stack: &mut Stack, payloads: &Payloads, cmd: &str, rest: &str) {
         .map(|e| &e.disk);
     let result = if cmd == "netinstall" {
         install::netinstall_run(stack, &entry.disk, payloads)
+    } else if cmd == "netinstall-real" {
+        // Opt-in: the CI smoke keeps using the in-container mock; the
+        // real source needs sky2 + DNS + TLS and a published payload.
+        install::netprove_https(
+            stack,
+            Some(&entry.disk),
+            payloads,
+            install::NETINSTALL_REAL_URL,
+        )
     } else {
         install::guided_install(&entry.disk, payloads, source)
     };
