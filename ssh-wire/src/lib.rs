@@ -154,6 +154,13 @@ fn validate_ident(line: &[u8]) -> Result<(), BannerError> {
 /// `SSH_MSG_KEXINIT` (RFC4253 §7.1).
 pub const SSH_MSG_KEXINIT: u8 = 20;
 
+/// `SSH_MSG_IGNORE` (RFC4253 §6.1): a receiver MUST be able to
+/// process it at any time — padding from a chatty peer.
+pub const SSH_MSG_IGNORE: u8 = 2;
+/// `SSH_MSG_UNIMPLEMENTED` (RFC4253 §6.1).
+pub const SSH_MSG_UNIMPLEMENTED: u8 = 3;
+/// `SSH_MSG_DEBUG` (RFC4253 §6.1): sent by `ssh -v` peers.
+pub const SSH_MSG_DEBUG: u8 = 4;
 /// Framing cap for unencrypted packets, matching OpenSSH's limit: a
 /// declared `packet_length` beyond this is refused the moment the
 /// header is complete — before a single byte of the attacker-chosen

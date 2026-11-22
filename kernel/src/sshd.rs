@@ -122,6 +122,23 @@ const CHANNEL_WINDOW: u32 = 64 * 1024;
 const MAX_PACKET: u32 = PAYLOAD_CAP as u32;
 /// Server-side channel id for the one session channel.
 const SERVER_CHANNEL: u32 = 0;
+/// Users the authorized key may authenticate **as** (audit F4): the
+/// key check alone would accept any name (`root`, `nobody`, …), a
+/// fail-open authorization default the future multi-user policy would
+/// inherit. Three names cover the deployments: `git` (the kernel's
+/// own client, `ssh_wire::AUTH_USER`), `reemplazo` (the OpenSSH
+/// interop harness) and `luis` (the live MacBook operator). Anything
+/// else gets `USERAUTH_FAILURE`, never `SUCCESS`.
+const SERVER_USERS: [&[u8]; 3] = [b"git", b"reemplazo", b"luis"];
+/// `SSH_MSG_IGNORE`/`SSH_MSG_DEBUG`/`SSH_MSG_UNIMPLEMENTED` a session
+/// may receive (RFC4253 §6.1 requires *being able to receive* them;
+/// audit F7) before the session is dropped anyway — bounded so they
+/// cannot become the new wedge channel F1 closed.
+const NOISE_MAX: u32 = 32;
+/// Key probes (`publickey` without signature → `PK_OK`) allowed per
+/// session (audit F11): probes need the authorized key already, but
+/// they used to be uncounted and could keep a session alive forever.
+const PROBES_MAX: u32 = 16;
 
 /// Single-use session receive buffer (the `ssh::RX` idiom: single core,
 /// IRQ0 never touches it, one connection at a time).
@@ -556,6 +573,8 @@ fn session(
     };
     let mut service_accepted = false;
     let mut failures = 0u32;
+    let mut probes = 0u32;
+    let mut noise = 0u32;
     let mut payload = [0u8; PAYLOAD_CAP];
     loop {
         let plen = wire.recv_into(stack, &mut payload)?;
@@ -564,6 +583,18 @@ fn session(
             return Err("empty encrypted payload");
         };
         match msg {
+            // RFC4253 §6.1: IGNORE/DEBUG/UNIMPLEMENTED must be
+            // receivable at any time (audit F7) — consume them, but
+            // bounded so they cannot reopen the wedge F1 closed.
+            ssh_wire::SSH_MSG_IGNORE
+            | ssh_wire::SSH_MSG_DEBUG
+            | ssh_wire::SSH_MSG_UNIMPLEMENTED => {
+                noise += 1;
+                if noise > NOISE_MAX {
+                    return Err("too many IGNORE/DEBUG messages");
+                }
+            }
+            ssh_wire::SSH_MSG_KEXINIT => return Err("rekey not supported"),
             ssh_wire::SSH_MSG_SERVICE_REQUEST => {
                 // Audit F1: exactly one service request per session —
                 // a repeat used to re-answer forever (each within its
@@ -606,7 +637,15 @@ fn session(
                 }
                 match auth_request(stack, &mut wire, p, &session_id, cfg)? {
                     AuthOutcome::Accepted => break,
-                    AuthOutcome::ProbeAccepted => {}
+                    AuthOutcome::ProbeAccepted => {
+                        // Audit F11: probes need the authorized key,
+                        // but they still consume the session — bounded
+                        // so a keyed peer cannot probe forever.
+                        probes += 1;
+                        if probes > PROBES_MAX {
+                            return Err("too many publickey probes");
+                        }
+                    }
                     AuthOutcome::Rejected => {
                         failures += 1;
                         if failures >= AUTH_ATTEMPTS_MAX {
@@ -654,6 +693,15 @@ fn auth_request(
     };
     if req.service != ssh_wire::AUTH_SERVICE {
         return Err("USERAUTH_REQUEST named a different service");
+    }
+    // Account binding (audit F4): the key check below must not grant
+    // any name the peer cares to claim — only the deployed users.
+    if !SERVER_USERS.contains(&req.user) {
+        let mut sbuf = [0u8; SANITIZE_CAP];
+        let user = ssh::sanitize(req.user, &mut sbuf);
+        serial_println!("sshd: user {user} is not one of the server accounts");
+        send_failure(stack, wire)?;
+        return Ok(AuthOutcome::Rejected);
     }
 
     if req.method == b"none" {
@@ -731,6 +779,9 @@ fn send_failure(stack: &mut Stack, wire: &mut Conn<'_, '_>) -> Wire {
 fn channel_phase(stack: &mut Stack, wire: &mut Conn<'_, '_>) -> Wire {
     let mut payload = [0u8; PAYLOAD_CAP];
     let mut buf = [0u8; 512];
+    // RFC4253 §6.1 noise budget (audit F7), shared by both loops
+    // below: IGNORE/DEBUG/UNIMPLEMENTED are consumed, bounded.
+    let mut noise = 0u32;
 
     // 1. Channel open.
     let plen = wire.recv_into(stack, &mut payload)?;
@@ -812,6 +863,16 @@ fn channel_phase(stack: &mut Stack, wire: &mut Conn<'_, '_>) -> Wire {
                     tolerated += 1;
                     if tolerated > CHANNEL_TOLERANCE_MAX {
                         return Err("too many non-progress channel messages before exec");
+                    }
+                }
+                // RFC4253 §6.1 noise, bounded as in the pre-auth loop
+                // (audit F7).
+                ssh_wire::SSH_MSG_IGNORE
+                | ssh_wire::SSH_MSG_DEBUG
+                | ssh_wire::SSH_MSG_UNIMPLEMENTED => {
+                    noise += 1;
+                    if noise > NOISE_MAX {
+                        return Err("too many IGNORE/DEBUG messages");
                     }
                 }
                 other => {
@@ -896,6 +957,16 @@ fn channel_phase(stack: &mut Stack, wire: &mut Conn<'_, '_>) -> Wire {
                     tolerated += 1;
                     if tolerated > CHANNEL_TOLERANCE_MAX {
                         return Err("too many non-progress messages while closing");
+                    }
+                    false
+                }
+                // RFC4253 §6.1 noise (audit F7): consumed, bounded.
+                Some(&ssh_wire::SSH_MSG_IGNORE)
+                | Some(&ssh_wire::SSH_MSG_DEBUG)
+                | Some(&ssh_wire::SSH_MSG_UNIMPLEMENTED) => {
+                    noise += 1;
+                    if noise > NOISE_MAX {
+                        return Err("too many IGNORE/DEBUG messages");
                     }
                     false
                 }

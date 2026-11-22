@@ -123,7 +123,7 @@ closed, and `service`/`method`/`algorithm` are all checked before the decision.
   confirmation — or raise `PAYLOAD_CAP` to 4096 (fits `RX_CAP`) and keep 32
   KiB. Pick one; they must agree.
 
-## F4 — No user binding: the authorized key authenticates as any user (**medio**)
+## F4 — No user binding: the authorized key authenticates as any user (**medio**, **FIXED** — `SERVER_USERS` allowlist [git, reemplazo, luis]; anything else gets USERAUTH_FAILURE)
 
 - **Where:** `kernel/src/sshd.rs:595-615` (service checked, **user never
   compared to anything**; only sanitized for logging at `:611`), `:654-656`
@@ -194,7 +194,7 @@ closed, and `service`/`method`/`algorithm` are all checked before the decision.
   `CHANNEL_OPEN_FAILURE`) when `initial_window < expected_output` or
   `max_packet < 300`; or track the window and cap the data packet.
 
-## F7 — `SSH_MSG_IGNORE`/`DEBUG`/`UNIMPLEMENTED` are fatal (**bajo**)
+## F7 — `SSH_MSG_IGNORE`/`DEBUG`/`UNIMPLEMENTED` are fatal (**bajo**, **FIXED** — consumed at all three dispatch points with a shared `NOISE_MAX` (32) budget; rekey KEXINIT answers `rekey not supported`)
 
 - **Where:** `kernel/src/sshd.rs:558-561` (pre-auth `other => Err`),
   `:749-752` (pre-exec), `:820-824` (close-wait `_ => Err`).
@@ -279,7 +279,7 @@ closed, and `service`/`method`/`algorithm` are all checked before the decision.
   `sshd`-session reseed, and consider mixing a per-connection RDRAND-less
   jitter sample (RTT of the peer's SYN) into the ephemeral secret.
 
-## F11 — `PK_OK` probes are not counted against `AUTH_ATTEMPTS_MAX` (**bajo**)
+## F11 — `PK_OK` probes are not counted against `AUTH_ATTEMPTS_MAX` (**bajo**, **FIXED** — `PROBES_MAX` (16) per session)
 
 - **Where:** `kernel/src/sshd.rs:547-556` — only `AuthOutcome::Rejected`
   increments `failures`; `ProbeAccepted` (`:549`) loops with no bound.
