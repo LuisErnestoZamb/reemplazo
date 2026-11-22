@@ -101,6 +101,14 @@ fn capture_sshd_module(info: &BootInformation) -> Option<usize> {
     None
 }
 
+/// True when GRUB passed a `demo` module: a hardware demo mode that
+/// skips the slirp-only network proofs (their mocks live at 10.0.2.2
+/// and do not exist on the real LAN) and runs the userland + shell
+/// directly. Intended for Option/C / GRUB demos, never for CI.
+fn demo_mode(info: &BootInformation) -> bool {
+    info.module_tags().any(|tag| tag.cmdline() == Ok("demo"))
+}
+
 /// Called from `entry.S` with System V AMD64 args.
 ///
 /// # Safety
@@ -124,7 +132,7 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
         halt();
     }
 
-    let (payloads, sshd_len) = match read_mbi(mbi_addr) {
+    let (payloads, sshd_len, demo) = match read_mbi(mbi_addr) {
         Ok(info) => {
             report_boot_info(&info);
             sync_vga(&info);
@@ -141,6 +149,7 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
             // Copied before the frame allocator for the same reason as
             // the installer payloads.
             let sshd_len = capture_sshd_module(&info);
+            let demo = demo_mode(&info);
             // U1: capture the userland ELF module before the frame
             // allocator exists — GRUB module frames are not in the MBI
             // memory map (same reason as the sshd/payload modules).
@@ -149,7 +158,7 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
             memory::selftest(&info, mbi_addr); // MEM_OK
             heap::init(); // carve a contiguous run, init the global heap
             heap::prove_alloc(); // ALLOC_OK — before the network chain
-            (payloads, sshd_len)
+            (payloads, sshd_len, demo)
         }
         Err(e) => {
             serial_println!("FATAL: bad multiboot2 info: {:?}", e);
@@ -274,6 +283,18 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
                 serial_println!("FATAL: hw: sshd module is malformed (want 64 bytes)");
                 halt();
             }
+        }
+    }
+
+    if demo {
+        // Hardware demo: the slirp mocks (10.0.2.2:8099) do not exist on
+        // the real LAN, so skip the network proofs and run the staged
+        // userland ELF + the interactive shell directly.
+        serial_println!("hw: demo mode — userland + shell, no network proofs");
+        crate::userland::boot_proof();
+        match stack.as_mut() {
+            Some(stack) => shell::run(stack, &payloads),
+            None => halt(),
         }
     }
 
