@@ -23,6 +23,13 @@ pub const NR_WRITE: u64 = 0;
 pub const NR_EXIT: u64 = 1;
 pub const NR_YIELD: u64 = 2;
 pub const NR_TIME: u64 = 3;
+// Hito 3 — console + VGA service (mirrors kernel/src/userland/console.rs).
+pub const NR_READ: u64 = 4;
+pub const NR_VGA_DIMS: u64 = 5;
+pub const NR_VGA_PUT_CELL: u64 = 6;
+pub const NR_VGA_CLEAR: u64 = 7;
+pub const NR_VGA_FLUSH: u64 = 8;
+pub const NR_VGA_PEEK: u64 = 9;
 
 // --- Errnos (mirror kernel/src/userland/syscall.rs) ----------------------
 pub const EINVAL: i64 = -1;
@@ -76,6 +83,68 @@ pub fn time() -> i64 {
     arch::syscall0(NR_TIME)
 }
 
+// --- Hito 3: console + VGA service ---------------------------------------
+
+/// Read one line from the console into `buf`. Returns the byte count, `0`
+/// when no complete line is waiting (non-blocking — `yield_now` and retry),
+/// or a negative errno. `fd` must be `0` (stdin).
+#[inline]
+pub fn read(fd: u64, buf: &mut [u8]) -> i64 {
+    arch::syscall3(NR_READ, fd, buf.as_mut_ptr() as u64, buf.len() as u64)
+}
+
+/// Geometry of the kernel's VGA text console. `None` when the mirror is
+/// off or the syscall failed. Encoded as `cols | rows << 16` on the wire.
+#[inline]
+pub fn console_dims() -> Option<(u16, u16)> {
+    let packed = arch::syscall0(NR_VGA_DIMS);
+    if packed < 0 {
+        None
+    } else {
+        let packed = packed as u64;
+        Some((packed as u16, (packed >> 16) as u16))
+    }
+}
+
+/// Stage one raw text cell in the kernel's off-screen buffer. No hardware
+/// write until [`vga_flush`]. `attr` is the VGA attribute byte
+/// (`fg | bg << 4`). Returns `0` on success, a negative errno otherwise.
+#[inline]
+pub fn vga_put_cell(x: u16, y: u16, glyph: u8, attr: u8) -> i64 {
+    arch::syscall4(
+        NR_VGA_PUT_CELL,
+        x as u64,
+        y as u64,
+        glyph as u64,
+        attr as u64,
+    )
+}
+
+/// Blank the kernel's staged cell buffer (no hardware write).
+#[inline]
+pub fn vga_clear() -> i64 {
+    arch::syscall0(NR_VGA_CLEAR)
+}
+
+/// Diff the staged cells against `0xb8000` and write only what changed.
+#[inline]
+pub fn vga_flush() -> i64 {
+    arch::syscall0(NR_VGA_FLUSH)
+}
+
+/// Read one raw cell back from the hardware text buffer, or `None` when
+/// the mirror is off or the coordinates are out of range.
+#[inline]
+pub fn vga_peek(x: u16, y: u16) -> Option<(u8, u8)> {
+    let packed = arch::syscall2(NR_VGA_PEEK, x as u64, y as u64);
+    if packed < 0 {
+        None
+    } else {
+        let packed = packed as u64;
+        Some((packed as u8, (packed >> 8) as u8))
+    }
+}
+
 /// The one piece of unsafe in this crate: the raw `int 0x80` wrappers.
 mod arch {
     #![allow(unsafe_code)]
@@ -95,6 +164,14 @@ mod arch {
         unsafe { raw(nr, a1, 0, 0, 0, 0, 0) }
     }
 
+    /// Invoke a syscall with two arguments (hito 3: `vga_peek`).
+    #[inline(always)]
+    pub fn syscall2(nr: u64, a1: u64, a2: u64) -> i64 {
+        // SAFETY: a1/a2 are bounded integer coordinates; the kernel
+        // validates them before touching hardware.
+        unsafe { raw(nr, a1, a2, 0, 0, 0, 0) }
+    }
+
     /// Invoke a syscall with three arguments (write's ABI).
     #[inline(always)]
     pub fn syscall3(nr: u64, a1: u64, a2: u64, a3: u64) -> i64 {
@@ -102,6 +179,14 @@ mod arch {
         // validates them with copy_from_user before any dereference. The
         // slice borrow in `write` keeps the buffer alive for the call.
         unsafe { raw(nr, a1, a2, a3, 0, 0, 0) }
+    }
+
+    /// Invoke a syscall with four arguments (hito 3: `vga_put_cell`).
+    #[inline(always)]
+    pub fn syscall4(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> i64 {
+        // SAFETY: all four are bounded integers; the kernel checks the
+        // coordinates and the cell bytes before any hardware write.
+        unsafe { raw(nr, a1, a2, a3, a4, 0, 0) }
     }
 
     /// Raw gate. `rax` = number in / i64 result out; args in SysV registers.

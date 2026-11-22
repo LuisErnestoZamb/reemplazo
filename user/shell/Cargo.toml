@@ -1,0 +1,13 @@
+[package]
+name = "user-shell"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Standalone workspace root on purpose: the hito-3 crate is built by
+# `xtask smoke-user` with its own `CARGO_TARGET_DIR`, so the root workspace
+# member list (owned by the integrator) never has to change.
+[workspace]
+
+[dependencies]
+userlib = { path = "../../userlib" }
