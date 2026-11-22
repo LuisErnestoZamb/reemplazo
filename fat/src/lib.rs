@@ -98,7 +98,7 @@ mod dir;
 /// `write_disk_image` and the kernel's installer (docs/installer.md
 /// §8.1 → §8.3).
 pub mod format;
-pub use format::{FormatOpts, Geometry, format_fat16, geometry};
+pub use format::{FormatOpts, Geometry, format_fat16, geometry, geometry_with};
 /// The write half (FS2): [`write::Stamp`] and the writer's module docs
 /// (ordering, naming rule, refusals) live here.
 pub mod write;

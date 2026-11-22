@@ -78,7 +78,7 @@ All in Rust, all in this workspace:
 ```sh
 cargo xtask check   # fmt + clippy (host and kernel target) + tests + cross-build
 cargo xtask smoke   # build ISO, boot headless, assert serial markers in order
-cargo xtask smoke-install  # two FAT16/blank IDE disks; assert BLK_OK + FAT_OK + FS_WRITE_OK + INST_OK
+cargo xtask smoke-install  # two IDE disks; assert BLK_OK + FAT_OK + FS_WRITE_OK + INST_OK + NETINST_OK
 cargo xtask run     # interactive boot in QEMU (Ctrl-C quits)
 cargo test -p mbi <name>   # single test
 ```
@@ -106,8 +106,13 @@ back byte-exact (with `/README.TXT` re-checked for clobbering), and
 `INST_OK`: the install flow on the target — GPT written and re-read
 (`gptwire`), p2 formatted FAT16 with the shared `fat::format_fat16`,
 the payload copied from the source volume and read back byte-exact
-after a fresh re-mount. When QEMU exits, xtask re-verifies `target.img`
-on the host (GPT + FAT + files byte-exact).
+after a fresh re-mount, and `NETINST_OK`: after the boot network
+chain, the kernel fetches `payload.tar` (the built kernel + README)
+from an in-container responder on `10.0.2.2:8080` **with its own
+stack**, walks the ustar headers, reinstalls onto the target and reads
+everything back byte-exact. When QEMU exits, xtask re-verifies
+`target.img` on the host — GPT + FAT + the installed kernel byte-exact
+against the built binary.
 
 **Notes:**
 
@@ -165,6 +170,7 @@ Milestones landed so far (see `git log` for details):
   - [x] Shared FAT16 formatter: `fat::format_fat16` derives the geometry from the device size and self-checks against the reader — used by xtask's disk images *and* the kernel installer (`fat/tests/format.rs`, +8 tests)
   - [x] GPT reader + writer: `gptwire` crate, `no_std` + `forbid(unsafe_code)` + zero deps, 49 adversarial host tests (CRC32 vectors, truncated/bad-CRC headers, absurd entry counts, backup mismatch, overlap, MBR garbage)
   - [x] Install-to-disk (I1): GPT → FAT16 p2 → payload copy → byte-exact re-read (`smoke-install` asserts `INST_OK`; host-side re-verify after QEMU exits). GRUB boot code on the target is deferred (I1b) — the installed disk is not yet bootable
+  - [x] Network installer (I2): `payload.tar` (ustar: built kernel + README) fetched from an in-container HTTP responder over the OS's own smoltcp/`net::http` stack, ustar walked with checksum validation, installed + byte-exact re-read (`smoke-install` asserts `NETINST_OK`; host verifies the installed kernel against the built binary). Real-`api.github.com` fetch and HTTPS remain later milestones
 
 ## License
 

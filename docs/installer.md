@@ -2,7 +2,8 @@
 
 Status: design (research complete) + **FS1 landed** — FAT16 reader and its `FAT_OK`
 smoke marker (§8.1) + **FS2 landed** — FAT16 write path and its `FS_WRITE_OK` marker
-(§8.2) + **I1 landed** — GPT + install-to-disk and its `INST_OK` marker (§8.3).
+(§8.2) + **I1 landed** — GPT + install-to-disk and its `INST_OK` marker (§8.3) +
+**I2 landed** — the network installer and its `NETINST_OK` marker (§8.4).
 Scope: the two installer deliverables from
 AGENTS.md — *a bootable ISO* and *a network installer that fetches the system over the
 network with the OS's own stack*. Target: 2007 MacBook2,1, GRUB i386-pc boot chain
@@ -678,6 +679,65 @@ the target image on the host.
   (diskless neutrality: `install::prove` never reached, and silent without a marked target);
   `cargo xtask smoke-install` PASS — `BLK_OK + FAT_OK + FS_WRITE_OK + INST_OK` plus the host
   verify line; `gptwire` 49 + `fat` 79 + `xtask` 2 host tests green.
+
+### 8.4 I2 landed — network installer (`NETINST_OK`)
+
+The network half of the deliverable is in (same branch). `cargo xtask smoke-install` now
+asserts `["BLK_OK", "FAT_OK", "FS_WRITE_OK", "INST_OK", "NETINST_OK"]` and the host verifier
+compares the installed kernel against the built binary.
+
+- **Invocation:** still boot-time (the doc's §7.1 `netinstall <url>` builtin stays open as
+  later work): `install::netprove` runs **after the boot network chain** — it needs the NIC,
+  which is not up when `INST_OK` runs — gated on the source disk *and* the target found in
+  `kernel_main`. The target is probed **exactly once, before `INST_OK`**: the first install's
+  protective MBR overwrites LBA0, i.e. the very place the `reemplazo-target-v1` marker lives,
+  so a re-probe after the offline install could never succeed (the first I2 run failed
+  silently on exactly this — recorded here because the symptom was a *missing* marker, not an
+  error line).
+- **Serving the payload (§7.2's container path, chat-mock pattern):** xtask builds
+  `payload.tar` at boot with the host's `tar --format ustar` — `README.TXT` + **the actual
+  built kernel** (`target/x86_64-unknown-none/release/kernel`, the system payload of §6.1;
+  GRUB's `boot.img`/`core.img` join it with I1b's `MOD_OK` payload path) — wraps it in a
+  canned `HTTP/1.1 200` with a computed `Content-Length` (`payload-http.txt`), and the
+  container's `MOCK_LOOP` gains a second bounded `nc` responder on `127.0.0.1:8080`
+  (guest→`10.0.2.2:8080` lands on the container's loopback, exactly like `:8099`; no
+  `guestfwd` needed — §9.3's question never had to be answered). The host-QEMU backend's
+  `chat-mock` subcommand serves both ports. No internet needed.
+- **The client:** plain-HTTP `GET /payload.tar` on `tcp5` (local port 49163 — the `ai`
+  exchange's socket, left TimeWait/Closed by the A5 proof, which is what smoltcp `connect`
+  accepts; `ai.rs` documents the observation), `net::http::ResponseParser` framed
+  incrementally into a **bounded 2 MiB `static`** (`DOWNLOAD`; status 200 + `Content-Length`
+  == received asserted fail-closed, oversize refused), clean FIN → TimeWait close. No DNS
+  (the host is the dotted quad from `net::SLIRP_GATEWAY`), no TLS (impossible locally per
+  §7.2 — the real `api.github.com` fetch stays milestone 7/9's later work).
+- **ustar walker** (`install::parse_tar`, in-kernel): every header checksum-validated
+  (unsigned *and* the historical signed sum accepted — both equal on real `bsdtar`
+  output, which is what the parser's rules were pinned against: magic `ustar\0`, type `0`,
+  octal size with checked arithmetic, data range inside the buffer, 1..=100-byte printable
+  ASCII name with no `/` and an empty `prefix`, ≤8 files, zero block or clean end
+  terminates). pax/GNU extension entries are **refused**, not skipped past blindly.
+- **Install:** the *same* `install_payload` as `INST_OK` — GPT rewrite + validate, format,
+  copy, fresh re-mount, byte-exact read-back — so both markers assert identical disk work.
+  The format's cluster floor is now 16 sectors/8 KiB
+  (`fat::FormatOpts::min_sectors_per_cluster`, new knob): the writer's first-fit allocation
+  probes the FAT once per cluster, and at 1 KiB clusters a 1.7 MB kernel meant ~1700
+  O(n²)-shaped scans of sector reads — measured too slow for the smoke budget, ~210 at
+  8 KiB (the knob exists because of this measurement; `fat/tests/format.rs` pins it).
+- **Host verify (§7.3):** after QEMU exits, xtask re-parses the target's GPT, mounts p2 and
+  compares `/KERNEL.ELF` **byte-for-byte against the built kernel binary** — ground truth
+  that catches a corrupted download even though the guest already verified its own copy —
+  plus `/README.TXT` against the payload constant.
+- **Not in I2 (later milestones):** the §7.1 `netinstall <url>` shell builtin, the real
+  `api.github.com` HTTPS fetch (milestone 7/`TLSGET_OK`, needs no local server), redirect
+  following (the local server is a single 200), `Range` resume (§6.5: restart instead),
+  payload signatures (§6.4's honest "TLS authenticates; we hash for corruption" stance
+  applies once the fetch is TLS).
+- **Verified:** `cargo xtask check` exit 0; `cargo xtask smoke` PASS with all 24 markers
+  unchanged and **zero** installer lines (diskless neutrality); `cargo xtask smoke-install`
+  PASS — `BLK_OK + FAT_OK + FS_WRITE_OK + INST_OK + NETINST_OK` with
+  `netinstall: 1717248 bytes received` / `payload carries 2 files`, plus the host line
+  `host verify ok — GPT + FAT16 p2 + installed kernel byte-exact`; `gptwire` 49 +
+  `fat` 81 + `xtask` 2 host tests green.
 
 ---
 

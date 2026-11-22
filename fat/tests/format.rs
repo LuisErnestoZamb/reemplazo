@@ -76,6 +76,7 @@ fn opts<'a>(label: &'a [u8; 11], hidden: u32) -> FormatOpts<'a> {
         label,
         volume_id: 0x2026_1122,
         hidden_sectors: hidden,
+        min_sectors_per_cluster: 1,
     }
 }
 
@@ -194,6 +195,46 @@ fn format_inside_a_partition_records_hidden_sectors() {
         u32::from_le_bytes([boot[28], boot[29], boot[30], boot[31]]),
         4096
     );
+}
+
+#[test]
+fn format_honors_min_cluster_size() {
+    // The installer's knob: min 16 sectors/cluster (8 KiB) on 64 MiB
+    // — spc jumps straight to 16, the volume still mounts, and a file
+    // round-trips.
+    let img = Mem::new(64 * 1024 * 1024);
+    let opts = FormatOpts {
+        label: b"REEMPLAZO  ",
+        volume_id: 0x2026_1122,
+        hidden_sectors: 0,
+        min_sectors_per_cluster: 16,
+    };
+    let geo = format_fat16(&img, &opts).expect("formats");
+    assert_eq!(geo.sectors_per_cluster, 16);
+    assert!(geo.clusters >= 4085 && geo.clusters <= 65524);
+    let boot = img.boot_sector();
+    assert_eq!(boot[13], 16);
+
+    let fs = Fat16::mount(&img).expect("mounts");
+    fs.write_file("/PAYLOAD.BIN", b"min-spc ok", fat::Stamp::FAT_EPOCH)
+        .expect("writes");
+    let mut buf = [0u8; 16];
+    let n = fs.read_file("/PAYLOAD.BIN", &mut buf).expect("reads");
+    assert_eq!(&buf[..n], b"min-spc ok");
+}
+
+#[test]
+fn geometry_refuses_non_power_of_two_min_cluster() {
+    use fat::geometry_with;
+    assert_eq!(geometry_with(131_072, 0), Err(Error::BadSectorsPerCluster));
+    assert_eq!(geometry_with(131_072, 3), Err(Error::BadSectorsPerCluster));
+    assert_eq!(
+        geometry_with(131_072, 128),
+        Err(Error::BadSectorsPerCluster)
+    );
+    // A bound that cannot land in the window still fails honestly:
+    // min 64 on 8 MiB leaves far fewer than 4085 clusters.
+    assert_eq!(geometry_with(16_384, 64), Err(Error::TooSmall));
 }
 
 #[test]

@@ -101,12 +101,27 @@ pub struct Geometry {
 ///   above 65524 (or the sector count does not fit FAT16's 32-bit
 ///   total field at all).
 pub fn geometry(total_sectors: u32) -> Result<Geometry, Error> {
+    geometry_with(total_sectors, 1)
+}
+
+/// [`geometry`] with a lower bound on the cluster size (see
+/// [`FormatOpts::min_sectors_per_cluster`]): the same selection,
+/// starting at `min_sectors_per_cluster` instead of 1. Refuses a
+/// bound that is not a power of two in 1..=64.
+pub fn geometry_with(total_sectors: u32, min_sectors_per_cluster: u32) -> Result<Geometry, Error> {
+    if min_sectors_per_cluster == 0
+        || !min_sectors_per_cluster.is_power_of_two()
+        || min_sectors_per_cluster > 64
+    {
+        return Err(Error::BadSectorsPerCluster);
+    }
     if total_sectors == 0 {
         return Err(Error::TooSmall);
     }
     let root_sectors = ROOT_SECTORS;
     let mut too_small = false;
-    for spc in [1u32, 2, 4, 8, 16, 32, 64] {
+    let mut spc = min_sectors_per_cluster;
+    while spc <= 64 {
         // Upper bound on clusters; u64 so `est + 2` can never wrap
         // even for a absurd total.
         let est = u64::from(total_sectors) / u64::from(spc);
@@ -114,14 +129,17 @@ pub fn geometry(total_sectors: u32) -> Result<Geometry, Error> {
         let overhead = u64::from(RESERVED + root_sectors) + u64::from(FAT_COUNT) * fat;
         let Some(data) = u64::from(total_sectors).checked_sub(overhead) else {
             too_small = true; // structures don't even fit at this spc
+            spc *= 2;
             continue;
         };
         let clusters = (data / u64::from(spc)) as u32;
         if clusters > FAT16_MAX_CLUSTERS {
-            continue; // need bigger clusters
+            spc *= 2; // need bigger clusters
+            continue;
         }
         if clusters < FAT16_MIN_CLUSTERS {
             too_small = true; // bigger spc only shrinks the count
+            spc *= 2;
             continue;
         }
         // FAT must hold `clusters + 2` 16-bit entries — by
@@ -159,6 +177,16 @@ pub struct FormatOpts<'a> {
     /// Partition start LBA when formatting inside a partition (the
     /// BPB's "hidden sectors" field); 0 for a superfloppy.
     pub hidden_sectors: u32,
+    /// Lower bound on sectors/cluster (power of two, 1..=64) — the
+    /// mkfs `-s` knob. `1` = finest granularity (the default, what
+    /// `geometry` computes). The installer passes **16** (8 KiB
+    /// clusters): the writer allocates first-fit from cluster 2 on
+    /// every new cluster of a growing chain, so *halving* the cluster
+    /// count quarters those FAT probes — with a ~1.7 MB kernel payload
+    /// that is the difference between millions and a few tens of
+    /// thousands of sector reads (measured while landing the network
+    /// installer, docs/installer.md §8.4).
+    pub min_sectors_per_cluster: u32,
 }
 
 /// Format `dev` as a FAT16 volume ([`FormatOpts`]), writing boot
@@ -185,7 +213,7 @@ pub fn format_fat16<D: BlockDevice + ?Sized>(
     if opts.label.iter().any(|&b| !(0x20..=0x7E).contains(&b)) {
         return Err(Error::InvalidName);
     }
-    let geo = geometry(total64 as u32)?;
+    let geo = geometry_with(total64 as u32, opts.min_sectors_per_cluster)?;
 
     // --- Boot sector (every field `Fat16::mount` validates) ---
     let mut boot = [0u8; BPS as usize];

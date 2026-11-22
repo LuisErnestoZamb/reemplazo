@@ -104,14 +104,27 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
     // re-mounts from scratch and reads it back (plus a README re-check).
     // No drive → `prove` never runs and nothing at all is printed (the
     // diskless neutrality the main smoke requires).
-    if let Some(drive) = crate::ata::probe() {
-        crate::fs::prove(&drive); // FAT_OK + FS_WRITE_OK — or `FATAL: fs:` + halt
+    // The source disk (FS1/FS2's `disk.img`): probed once, kept for
+    // the offline proof *and* the network installer at the end of the
+    // boot chain (I2 needs the NIC, which is not up yet here).
+    let source_drive = crate::ata::probe();
+    // The install target is probed **once, here** — before either
+    // proof runs: the first install rewrites LBA0 (the protective
+    // MBR), which is where the `reemplazo-target-v1` wipe marker
+    // lives, so re-probing after `INST_OK` could never find it again.
+    // No source → never probed; no marked target → `None`, zero
+    // output (the diskless/single-disk neutrality both proofs keep).
+    let target_drive = source_drive
+        .as_ref()
+        .and_then(|drive| crate::ata::probe_target(drive.unit()));
+    if let Some(drive) = source_drive.as_ref() {
+        crate::fs::prove(drive); // FAT_OK + FS_WRITE_OK — or `FATAL: fs:` + halt
         // Installer I1 (docs/installer.md §8.3): GPT + format p2 +
         // payload copy + byte-exact re-read → INST_OK. Silent when no
         // *marked* target disk is attached (single-disk and diskless
         // boots print nothing extra); with one, every failure is
         // `FATAL: install:` + halt.
-        crate::install::prove(&drive);
+        crate::install::prove(drive, target_drive.as_ref());
     }
 
     // QEMU's e1000 first (byte-identical history: on a machine with
@@ -193,6 +206,17 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
     // marker).
     if let Some(stack) = stack.as_mut() {
         apps::editor::ai_edit_boot_proof(stack);
+    }
+
+    // I2 network installer (docs/installer.md §8.4): fetch
+    // `payload.tar` over our own stack (smoltcp + `net::http`, the
+    // in-container responder on 10.0.2.2:8080), walk the ustar
+    // headers, install onto the marked target, read back byte-exact →
+    // NETINST_OK. Gated on the target found above (probed only when
+    // the source disk exists) — silently skipped otherwise, so the
+    // diskless main smoke's marker chain stays untouched.
+    if let (Some(stack), Some(target)) = (stack.as_mut(), target_drive.as_ref()) {
+        crate::install::netprove(stack, Some(target));
     }
 
     // The shell is the kernel's idle state until a scheduler exists;

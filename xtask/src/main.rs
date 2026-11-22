@@ -369,25 +369,80 @@ fn write_chat_mock(iso_dir: &Path) -> std::io::Result<()> {
     std::fs::write(iso_dir.join("chat-mock-response.txt"), chat_mock_response())
 }
 
+/// Build the I2 payload the guest fetches with its own stack:
+/// stage the **actual built kernel** (`target/x86_64-unknown-none/
+/// release/kernel` — the system payload of docs/installer.md §6.1)
+/// plus `README.TXT`, pack both into `payload.tar` with the host's
+/// `tar --format ustar` (the format `install::parse_tar` walks — its
+/// header bytes were pinned against exactly this tool, see
+/// docs/installer.md §8.4), and wrap the tar in a canned
+/// `HTTP/1.1 200` response (`payload-http.txt`) that the
+/// in-container `nc` responder on `:8080` serves verbatim — the chat
+/// mock's pattern with a real body. Called from [`qemu_invocation`]
+/// (after `iso()`), so every boot path has it; nobody connects unless
+/// the network installer runs.
+fn write_payload_mock(root: &Path, iso_dir: &Path) -> std::io::Result<()> {
+    let staging = iso_dir.join("payload-staging");
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging)?;
+    std::fs::copy(
+        root.join("target/x86_64-unknown-none/release/kernel"),
+        staging.join("kernel.elf"),
+    )?;
+    std::fs::write(staging.join("README.TXT"), README_CONTENT)?;
+
+    let tar_path = iso_dir.join("payload.tar");
+    let status = Command::new("tar")
+        .args(["--format", "ustar", "-cf"])
+        .arg(&tar_path)
+        .arg("-C")
+        .arg(&staging)
+        // Arg order = entry order: README first (tiny), kernel second.
+        .args(["README.TXT", "kernel.elf"])
+        .status()?;
+    if !status.success() {
+        return Err(std::io::Error::other(format!(
+            "tar --format ustar failed with {status}"
+        )));
+    }
+
+    let tar = std::fs::read(&tar_path)?;
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        tar.len()
+    );
+    let mut response = head.into_bytes();
+    response.extend_from_slice(&tar);
+    std::fs::write(iso_dir.join("payload-http.txt"), response)
+}
+
 /// The in-container mock: a **bounded** loop of `nc` one-shot servers
-/// on the container's loopback :8099, backgrounded, then QEMU is
-/// `exec`'d — so QEMU becomes the container's main process and, when
-/// the container stops (`--rm` / `docker rm -f`), every process in it
-/// dies with it: no host-side orphans, which this repo checks with
-/// `ps` after every run. `nc` serves the canned response the moment a
-/// connection is accepted (HTTP lets the server write first; the
-/// guest sends-then-reads), exits per connection when the peer
-/// closes, and `|| true` keeps the loop running through a refused
-/// bind. stdout/stderr → `/dev/null` so the request bytes the guest
-/// sends can never pollute the serial log the markers are read from.
-/// Verified end-to-end (`nc -l -s 127.0.0.1 -p 8099` + delayed and
-/// sequential clients) in the A3 commit.
+/// on the container's loopback — `:8099` serves the canned chat
+/// response, `:8080` serves the canned *payload* response (I2: the
+/// guest's `GET /payload.tar` over its own stack) — backgrounded,
+/// then QEMU is `exec`'d, so QEMU becomes the container's main
+/// process and, when the container stops (`--rm` / `docker rm -f`),
+/// every process in it dies with it: no host-side orphans, which this
+/// repo checks with `ps` after every run. `nc` serves the canned
+/// response the moment a connection is accepted (HTTP lets the server
+/// write first; the guest sends-then-reads), exits per connection
+/// when the peer closes, and `|| true` keeps the loop running through
+/// a refused bind. stdout/stderr → `/dev/null` so the request bytes
+/// the guest sends can never pollute the serial log the markers are
+/// read from. Verified end-to-end (`nc -l -s 127.0.0.1 -p 8099` +
+/// delayed and sequential clients) in the A3 commit; `:8080` is the
+/// same shape with `payload-http.txt` (I2).
 const MOCK_LOOP: &str = "for i in 1 2 3 4 5; do \
      nc -l -s 127.0.0.1 -p 8099 < /iso/chat-mock-response.txt > /dev/null 2>&1 || true; \
+     done & \
+     for i in 1 2 3 4 5; do \
+     nc -l -s 127.0.0.1 -p 8080 < /iso/payload-http.txt > /dev/null 2>&1 || true; \
      done & exec qemu-system-x86_64 \"$@\"";
 
 /// The `xtask chat-mock` subcommand (host-QEMU backend): serve
-/// [`chat_mock_response`] on 127.0.0.1:8099 for a bounded number of
+/// [`chat_mock_response`] on 127.0.0.1:8099 **and** the I2 payload
+/// response on 127.0.0.1:8080 (the container backend's `MOCK_LOOP`
+/// does the same two ports with `nc`), for a bounded number of
 /// connections and a bounded lifetime, so a wedged guest can never
 /// leave this process running on its own. Spawned as a child by
 /// [`qemu_invocation`] and killed in `stop_vm`; also reachable
@@ -395,57 +450,77 @@ const MOCK_LOOP: &str = "for i in 1 2 3 4 5; do \
 /// VM.
 fn serve_chat_mock(root: &Path) {
     let file = root.join("target/iso-root/chat-mock-response.txt");
-    let response = match std::fs::read(&file) {
+    let chat = match std::fs::read(&file) {
         Ok(bytes) => bytes,
         Err(e) => {
             eprintln!("xtask chat-mock: cannot read {}: {e}", file.display());
             exit(1);
         }
     };
-    let listener = match std::net::TcpListener::bind(("127.0.0.1", 8099)) {
+    let payload = match std::fs::read(root.join("target/iso-root/payload-http.txt")) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("xtask chat-mock: cannot read payload-http.txt: {e}");
+            exit(1);
+        }
+    };
+    let chat_listener = match std::net::TcpListener::bind(("127.0.0.1", 8099)) {
         Ok(listener) => listener,
         Err(e) => {
             eprintln!("xtask chat-mock: cannot bind 127.0.0.1:8099: {e}");
             exit(1);
         }
     };
-    if listener.set_nonblocking(true).is_err() {
+    let payload_listener = match std::net::TcpListener::bind(("127.0.0.1", 8080)) {
+        Ok(listener) => listener,
+        Err(e) => {
+            eprintln!("xtask chat-mock: cannot bind 127.0.0.1:8080: {e}");
+            exit(1);
+        }
+    };
+    if chat_listener.set_nonblocking(true).is_err()
+        || payload_listener.set_nonblocking(true).is_err()
+    {
         exit(1);
     }
     let deadline = Instant::now() + Duration::from_secs(120);
     let mut served = 0usize;
-    while served < 5 && Instant::now() < deadline {
-        match listener.accept() {
-            Ok((mut stream, _)) => {
-                let _ = stream.set_nonblocking(true); // no client can wedge us
-                let _ = stream.write_all(&response);
-                // Drain the request before closing: closing with
-                // unread inbound data sends RST, which can discard the
-                // response on the client side. Bounded either way.
-                let mut buf = [0u8; 512];
-                let drain_deadline = Instant::now() + Duration::from_secs(5);
-                loop {
-                    match stream.read(&mut buf) {
-                        Ok(0) => break, // peer finished — clean close
-                        Ok(_) => {}
-                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            if Instant::now() >= drain_deadline {
-                                break;
-                            }
-                            std::thread::sleep(Duration::from_millis(20));
-                        }
-                        Err(_) => break,
-                    }
+    while served < 10 && Instant::now() < deadline {
+        let mut connected = false;
+        for (listener, response) in [(&chat_listener, &chat), (&payload_listener, &payload)] {
+            let (mut stream, _) = match listener.accept() {
+                Ok(pair) => pair,
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(e) => {
+                    eprintln!("xtask chat-mock: accept failed: {e}");
+                    continue;
                 }
-                served += 1;
+            };
+            connected = true;
+            let _ = stream.set_nonblocking(true); // no client can wedge us
+            let _ = stream.write_all(response);
+            // Drain the request before closing: closing with
+            // unread inbound data sends RST, which can discard the
+            // response on the client side. Bounded either way.
+            let mut buf = [0u8; 512];
+            let drain_deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) => break, // peer finished — clean close
+                    Ok(_) => {}
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= drain_deadline {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(_) => break,
+                }
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(e) => {
-                eprintln!("xtask chat-mock: accept failed: {e}");
-                break;
-            }
+            served += 1;
+        }
+        if !connected {
+            std::thread::sleep(Duration::from_millis(50));
         }
     }
 }
@@ -502,14 +577,19 @@ fn qemu_invocation(
     container: &str,
     disks: &[&Path],
 ) -> Option<Invocation> {
-    // The A3 mock response must exist before the VM starts: written
-    // after `iso()` wiped the dir (the `disk.img` precedent).
+    // The A3 mock response and the I2 payload response must exist
+    // before the VM starts: written after `iso()` wiped the dir (the
+    // `disk.img` precedent).
     let iso_dir = iso_path.parent()?;
     if let Err(e) = write_chat_mock(iso_dir) {
         eprintln!(
             "xtask: cannot write {}: {e}",
             iso_dir.join("chat-mock-response.txt").display()
         );
+        return None;
+    }
+    if let Err(e) = write_payload_mock(root, iso_dir) {
+        eprintln!("xtask: cannot build the payload mock: {e}",);
         return None;
     }
     let port = monitor_port(root);
@@ -712,8 +792,8 @@ fn smoke(root: &Path) -> bool {
     boot_assert(root, "smoke", &MARKERS, &[], true)
 }
 
-/// Installer milestones 1 + FS1 + FS2 + **I1** (`BLK_OK`, `FAT_OK`,
-/// `FS_WRITE_OK`, `INST_OK`): build the ISO, then write **two** 64 MiB
+/// Installer milestones 1 + FS1 + FS2 + **I1** + **I2** (`BLK_OK`,
+/// `FAT_OK`, `FS_WRITE_OK`, `INST_OK`, `NETINST_OK`): build the ISO, then write **two** 64 MiB
 /// images into `target/iso-root` (after `iso()` wiped it): `disk.img`,
 /// a valid FAT16 *source* volume ([`write_disk_image`]), and
 /// `target.img`, a blank disk carrying only the wipe-marker magic
@@ -727,12 +807,20 @@ fn smoke(root: &Path) -> bool {
 /// GPT written and re-read through `gptwire`, p2 formatted FAT16 with
 /// the shared `fat::format_fat16`, payload copied from the source
 /// volume, p2 re-mounted and read back byte-exact — see
-/// `kernel/src/install.rs`).
+/// `kernel/src/install.rs`), and `NETINST_OK` (I2: after the boot
+/// network chain, the kernel fetches `payload.tar` (the built kernel
+/// and README, served by the in-container responder on `10.0.2.2:8080`
+/// from `payload-http.txt`, written by [`write_payload_mock`]) over
+/// its own stack, walks the ustar headers, reinstalls onto the target
+/// and reads every file back byte-exact).
 ///
 /// After the VM passes, [`verify_installed_image`] re-checks
 /// `target.img` **on the host** — docs/installer.md §7.3's "assert
 /// after QEMU exits": GPT parsed independently of the running kernel,
-/// layout checked, both payload files compared byte-for-byte.
+/// layout checked, and the installed `/KERNEL.ELF` compared
+/// byte-for-byte against the **built kernel binary** (ground truth on
+/// the host — a corrupted download fails here even though the guest
+/// verified its own copy).
 ///
 /// Note both images are created **after** `iso()` (which wipes
 /// `target/iso-root`) and live inside it, so the container's `/iso`
@@ -755,7 +843,7 @@ fn smoke_install(root: &Path) -> bool {
     if !boot_assert(
         root,
         "smoke-install",
-        &["BLK_OK", "FAT_OK", "FS_WRITE_OK", "INST_OK"],
+        &["BLK_OK", "FAT_OK", "FS_WRITE_OK", "INST_OK", "NETINST_OK"],
         &disks,
         false,
     ) {
@@ -807,12 +895,6 @@ fn magic_checksum() -> u8 {
 /// `kernel/src/fs/mod.rs` (host crates cannot depend on the kernel).
 const README_CONTENT: &[u8] = b"reemplazo filesystem ok\n";
 
-/// `/RESULT.TXT`'s content — byte-identical to `RESULT_PAYLOAD` in
-/// `kernel/src/fs/mod.rs`: FS2 wrote these bytes to the source
-/// volume, the installer (I1) copied them to the target, and
-/// [`verify_installed_image`] requires them on the target host-side.
-const RESULT_PAYLOAD: &[u8] = b"reemplazo fs write ok\n";
-
 /// Fixed timestamp for `/README.TXT` (host-side, no RTC — a build
 /// artifact stays byte-reproducible). Fields are FAT's own
 /// (`fat::Stamp`, 1980..=2107 range).
@@ -855,6 +937,7 @@ fn write_disk_image(path: &Path) -> std::io::Result<()> {
             label: b"REEMPLAZO  ",
             volume_id: 0x2026_1121,
             hidden_sectors: 0,
+            min_sectors_per_cluster: 1,
         },
     )
     .map_err(|e| std::io::Error::other(format!("fat::format_fat16: {e:?}")))?;
@@ -1036,7 +1119,10 @@ fn verify_installed_image(path: &Path) -> bool {
         return fail(format_args!("p2 is {}..{}", p2.first_lba, p2.last_lba));
     }
 
-    // Mount p2 and require both payload files byte-exact.
+    // Mount p2 and require the network installer's final state
+    // byte-exact: the payload README, and the installed kernel
+    // against the **built kernel binary** on this host — ground truth
+    // a corrupted download the guest could not detect still fails.
     let part = PartSlice(
         &img,
         p2.first_lba * 512,
@@ -1046,23 +1132,38 @@ fn verify_installed_image(path: &Path) -> bool {
         Ok(fs) => fs,
         Err(e) => return fail(format_args!("p2 does not mount as FAT16: {e:?}")),
     };
-    for (file, expected) in [
-        ("/README.TXT", README_CONTENT),
-        ("/RESULT.TXT", RESULT_PAYLOAD),
-    ] {
+    {
         let mut buf = [0u8; 64];
-        let n = match fs.read_file(file, &mut buf) {
+        let n = match fs.read_file("/README.TXT", &mut buf) {
             Ok(n) => n,
-            Err(e) => return fail(format_args!("{file}: {e:?}")),
+            Err(e) => return fail(format_args!("/README.TXT: {e:?}")),
         };
-        if n != expected.len() || buf[..n] != *expected {
+        if n != README_CONTENT.len() || buf[..n] != *README_CONTENT {
             return fail(format_args!(
-                "{file} read back {n} bytes, expected exactly {}",
-                expected.len()
+                "/README.TXT read back {n} bytes, expected exactly {}",
+                README_CONTENT.len()
             ));
         }
     }
-    println!("smoke-install: host verify ok — GPT + FAT16 p2 + payload byte-exact");
+    let built = match std::fs::read(repo_root().join("target/x86_64-unknown-none/release/kernel")) {
+        Ok(bytes) => bytes,
+        Err(e) => return fail(format_args!("cannot read the built kernel: {e}")),
+    };
+    let mut buf = vec![0u8; built.len()];
+    let n = match fs.read_file("/KERNEL.ELF", &mut buf) {
+        Ok(n) => n,
+        Err(e) => return fail(format_args!("/KERNEL.ELF: {e:?}")),
+    };
+    if n != built.len() || buf[..n] != built[..] {
+        return fail(format_args!(
+            "/KERNEL.ELF read back {n} bytes, expected the built kernel's {}",
+            built.len()
+        ));
+    }
+    println!(
+        "smoke-install: host verify ok — GPT + FAT16 p2 + installed kernel byte-exact ({} B)",
+        built.len()
+    );
     true
 }
 
