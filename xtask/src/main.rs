@@ -3,6 +3,7 @@
 //! Usage (from repo root): `cargo xtask <command>`
 //!   check   fmt --check + clippy + host tests + kernel cross-build
 //!   build   cross-compile the kernel (x86_64-unknown-none, release)
+//!   user    cross-compile user-hello and copy it to boot/hello.elf
 //!   iso     package target image as bootable ISO (GRUB i386-pc)
 //!   smoke   boot the ISO headless; assert serial markers in order,
 //!           then type a command through QEMU's monitor (KEYBOARD_OK)
@@ -135,6 +136,7 @@ fn main() {
     let ok = match cmd.as_str() {
         "check" => check(&root),
         "build" => build_kernel(&root),
+        "user" => build_user(&root),
         "iso" => iso(&root),
         "smoke" => smoke(&root),
         "smoke-install" => smoke_install(&root),
@@ -143,7 +145,7 @@ fn main() {
         "hwtest" => hwtest(&root),
         _ => {
             eprintln!(
-                "usage: cargo xtask <check|build|iso|smoke|smoke-install|smoke-ssh|run|hwtest>"
+                "usage: cargo xtask <check|build|user|iso|smoke|smoke-install|smoke-ssh|run|hwtest>"
             );
             false
         }
@@ -248,6 +250,21 @@ fn check(root: &Path) -> bool {
             root,
             "cargo",
             &[
+                "clippy",
+                "-p",
+                "user-hello",
+                "--release",
+                "--target",
+                "x86_64-unknown-none",
+                "--",
+                "-D",
+                "warnings",
+            ],
+        )
+        && sh(
+            root,
+            "cargo",
+            &[
                 "test",
                 "-p",
                 "xtask",
@@ -305,6 +322,45 @@ fn build_kernel(root: &Path) -> bool {
             "x86_64-unknown-none",
         ],
     )
+}
+
+/// Cross-compile the first userland ELF and stage it at
+/// `target/iso-root/boot/hello.elf`. The integrator adds the
+/// `module2 /boot/hello.elf hello` line to the **new smoke-user** GRUB
+/// config; this command deliberately does not touch the existing
+/// `iso()`/`smoke*` paths, so their ISOs stay byte-identical.
+fn build_user(root: &Path) -> bool {
+    if !sh(
+        root,
+        "cargo",
+        &[
+            "build",
+            "-p",
+            "user-hello",
+            "--release",
+            "--target",
+            "x86_64-unknown-none",
+        ],
+    ) {
+        return false;
+    }
+    let elf = root.join("target/x86_64-unknown-none/release/user-hello");
+    let boot = root.join("target/iso-root/boot");
+    if let Err(e) = std::fs::create_dir_all(&boot) {
+        eprintln!("xtask user: cannot create {}: {e}", boot.display());
+        return false;
+    }
+    let dest = boot.join("hello.elf");
+    if let Err(e) = std::fs::copy(&elf, &dest) {
+        eprintln!(
+            "xtask user: cannot copy {} → {}: {e}",
+            elf.display(),
+            dest.display()
+        );
+        return false;
+    }
+    println!("xtask user: {} → {}", elf.display(), dest.display());
+    true
 }
 
 /// The early config embedded **inside `core.img`** (`grub-mkimage -c`)
