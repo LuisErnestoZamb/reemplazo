@@ -794,6 +794,54 @@ pub(crate) fn probe_target(scan: &Scan, source_port: Option<u8>) -> Option<AhciD
     None
 }
 
+/// Every implemented port that answers `IDENTIFY` as an ATA disk, in
+/// port order — the read-only inventory behind the shell's
+/// `disks`/`install` builtins (docs/installer.md §7.1). Prints nothing
+/// beyond [`controller`]'s own refusal lines (only when a controller
+/// exists but cannot be used).
+///
+/// Re-attaching a port a boot probe already owns is deliberate and
+/// safe: [`bring_up`] stops the running engines *before* it reprograms
+/// `PxCLB`/`PxFB`, so the boot-time `AhciDisk` objects left in
+/// `kernel_main` go stale — by the time the shell runs nothing uses
+/// them any more (the shell is the kernel's idle state), and the objects
+/// returned here own the port from now on. Every step is the bounded
+/// probe [`probe`] already runs, so a wedged port is simply absent from
+/// the listing instead of a hung shell.
+pub(crate) fn list(scan: &Scan) -> alloc::vec::Vec<AhciDisk> {
+    let mut found = alloc::vec::Vec::new();
+    let Some(ctrl) = controller(scan) else {
+        return found; // no AHCI controller (the main smoke) — empty
+    };
+    for port in 0..reg::MAX_PORTS {
+        if !reg::port_implemented(ctrl.pi, port) {
+            continue;
+        }
+        // A listing never *resets* a port: [`bring_up`] issues COMRESET
+        // when `PxSSTS.DET` reports nothing linked and then waits its
+        // whole `wait_device_present` budget for a device that is not
+        // coming — measured **~18 s per empty port** in QEMU/TCG (20M
+        // bounded MMIO polls), i.e. 90 s for ich9-ahci's five empty
+        // ports, which is what the first `disks` run took. The boot
+        // probe pays one such budget at most (it returns on the first
+        // marked disk); the listing checks `DET` in one read instead.
+        // A linked disk (DET = 3, what firmware leaves behind on both
+        // QEMU and the MacBook) is attached exactly as `probe` does.
+        if !reg::device_present(port_read(ctrl.mmio, port, reg::PORT_SSTS).unwrap_or(0)) {
+            continue;
+        }
+        // Frame-pool exhaustion stops the listing rather than halting:
+        // the disks already found are still true.
+        let Some(dma) = Dma::alloc() else {
+            break;
+        };
+        if let Some(disk) = attach(ctrl.mmio, port, dma) {
+            found.push(disk);
+        }
+    }
+    found
+}
+
 /// Bring one port up and `IDENTIFY` its disk. `None` for a port that is
 /// not a ready ATA (non-ATAPI) disk — the caller silently moves on.
 fn attach(mmio: u64, port: u8, dma: Dma) -> Option<AhciDisk> {

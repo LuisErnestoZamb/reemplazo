@@ -21,9 +21,21 @@
 //! (documented limit). Every builtin fails soft: a typo or an
 //! unreachable host prints a line and returns to the prompt; only an
 //! explicit `halt` stops the machine.
+//!
+//! ## Guided installer builtins
+//!
+//! `disks` lists the detected drives with their wipe-marker state;
+//! `install <device> yes` / `netinstall <device> yes` run the guided
+//! installer (docs/installer.md §7.1) against a **wipe-marked** disk
+//! only — device line first, explicit `yes` second, the marker check
+//! always (see [`guided_cmd`]; `crate::install` holds the flow both
+//! share with the boot proofs).
 
+use crate::install::{self, Payloads};
 use crate::netstack::{LinkState, Stack};
-use crate::{keyboard, memory, pit, serial};
+use crate::{ata, keyboard, memory, pit, serial};
+use alloc::string::String;
+use alloc::vec::Vec;
 use smoltcp::wire::Ipv4Address;
 
 /// Bytes accepted per input line; the rest is refused with a bell.
@@ -46,20 +58,26 @@ enum Source {
 }
 
 /// Shared line-editing state for both input sources.
-struct LineDiscipline {
+struct LineDiscipline<'a> {
     line: [u8; LINE_CAP],
     len: usize,
     /// Swallow the LF that follows a CR (terminals send CR, LF, or the
     /// CRLF pair — one Enter must execute exactly once).
     skip_lf: bool,
+    /// The installer's captured ISO modules (`grubpayload` + `payload`),
+    /// needed by the `install`/`netinstall` builtins. Captured before
+    /// the heap existed (`install::capture_modules`) and read-only from
+    /// here on.
+    payloads: &'a Payloads,
 }
 
-impl LineDiscipline {
-    const fn new() -> Self {
+impl<'a> LineDiscipline<'a> {
+    const fn new(payloads: &'a Payloads) -> Self {
         Self {
             line: [0u8; LINE_CAP],
             len: 0,
             skip_lf: false,
+            payloads,
         }
     }
 
@@ -116,6 +134,7 @@ impl LineDiscipline {
         serial_print!("\n");
         execute(
             stack,
+            self.payloads,
             core::str::from_utf8(&self.line[..self.len]).unwrap_or(""),
         );
         self.len = 0;
@@ -128,12 +147,21 @@ impl LineDiscipline {
 /// fails soft where there is no i8042 — the MacBook), prints
 /// `SHELL_OK` (the smoke test's shell marker) and then serves
 /// prompts from **both** input sources until `halt`.
-pub fn run(stack: &mut Stack) -> ! {
+///
+/// `payloads` are the installer's captured ISO modules: the guided
+/// `install`/`netinstall` builtins need GRUB's boot code and the
+/// kernel image from them, and the shell is their only consumer after
+/// boot (see `install::capture_modules`).
+pub fn run(stack: &mut Stack, payloads: &Payloads) -> ! {
     keyboard::init();
     serial_println!("SHELL_OK"); // machine-checked by `cargo xtask smoke`
+    // U1: prove the staged user ELF parses and maps into a user page
+    // table. Prints ELF_OK only when the module is present, so the
+    // diskless/single-purpose smokes keep their original marker chains.
+    crate::userland::boot_proof();
     serial_print!("{PROMPT}");
 
-    let mut disc = LineDiscipline::new();
+    let mut disc = LineDiscipline::new(payloads);
     loop {
         // Serial first (it is where the console lives), keyboard as the
         // second feeder into the same line discipline.
@@ -146,17 +174,61 @@ pub fn run(stack: &mut Stack) -> ! {
                     .map(|c| (c as u8, Source::Keyboard))
             });
         let Some((byte, src)) = incoming else {
-            core::hint::spin_loop();
+            idle();
             continue;
         };
         disc.feed(byte, src, stack);
     }
 }
 
+/// One trip through the shell's idle state, called when **both** input
+/// sources just reported empty.
+///
+/// The loop above is itself the pre-sleep drain: it reads the UART and
+/// the keyboard (PS/2 + the USB pump) until neither has a byte, so by
+/// the time we get here the UART's 16-byte FIFO is empty — nothing
+/// pending is left behind *before* we sleep. Then:
+///
+/// - **`hlt` with RFLAGS.IF set** parks the CPU until the next
+///   interrupt. The PIT ticks at [`pit::HZ`] (100 Hz), so a sleep lasts
+///   at most ~10 ms and the next keystroke/byte is picked up on the
+///   wake-up (both sources are polled, never IRQ-driven — IRQ1/IRQ4
+///   stay masked, `crate::keyboard`/`crate::serial` module docs).
+/// - **IF clear → `spin_loop`, never `hlt`:** with maskable interrupts
+///   disabled nothing would ever wake us, so the guard reads RFLAGS
+///   first (that is the whole point of the guard).
+///
+/// Documented FIFO risk (the note AGENTS.md's optional-idle item asks
+/// for): a byte arriving *during* the sleep waits for the tick, and 16
+/// bytes at 38400 baud is only ~4 ms of line time — shorter than one
+/// 10 ms tick. A sender faster than that (a full-rate paste to a real
+/// UART with no flow control) can overrun the FIFO while we sleep;
+/// QEMU's chardev back-pressures instead of dropping (so `cargo xtask
+/// run` loses nothing), and human typing is orders of magnitude slower
+/// than 3840 B/s either way. Interrupt-driven RX is the documented
+/// serial milestone that removes the window completely.
+fn idle() {
+    let rflags: u64;
+    // SAFETY: `pushfq`/`pop` is the documented way to read RFLAGS; the
+    // output register is written by the `pop` alone, and flags are
+    // preserved (`preserves_flags`). No `nostack`: `pushfq` pushes.
+    unsafe {
+        core::arch::asm!("pushfq", "pop {}", out(reg) rflags, options(preserves_flags));
+    }
+    if rflags & 0x200 != 0 {
+        // SAFETY: IF is set (checked above), and the IDT/PIC/PIT were
+        // armed before the shell ran — an IRQ0 tick resumes right after
+        // this instruction (the `test_interrupts` pattern).
+        unsafe { core::arch::asm!("hlt", options(nomem, nostack)) };
+    } else {
+        core::hint::spin_loop();
+    }
+}
+
 /// Split one input line into a command and its argument text and run
 /// the builtin. Never panics: unknown commands and bad arguments only
 /// print a hint.
-fn execute(stack: &mut Stack, line: &str) {
+pub(crate) fn execute(stack: &mut Stack, payloads: &Payloads, line: &str) {
     let line = line.trim();
     if line.is_empty() {
         return;
@@ -177,6 +249,10 @@ fn execute(stack: &mut Stack, line: &str) {
              \x20 netinfo           DHCP lease + NIC/link state\n\
              \x20 ping <a.b.c.d>    ICMP echo roundtrip\n\
              \x20 resolve <host>    DNS A lookup\n\
+             \x20 disks             list disks: id, model, size, wipe-marker state\n\
+             \x20 install <dev> yes guided install onto a wipe-marked disk\n\
+             \x20 netinstall <dev> yes  same, payload fetched over the network\n\
+             \x20 apps              application launcher (top bar)\n\
              \x20 tui               full-screen TUI demo (Esc quits)\n\
              \x20 edit              in-memory text editor (Esc quits)\n\
              \x20 ai <message>      chat: mock, or the configured endpoint over TLS\n\
@@ -275,6 +351,13 @@ fn execute(stack: &mut Stack, line: &str) {
                 }
             }
         }
+        // Guided installer (docs/installer.md §7.1): a read-only
+        // inventory, then the two write paths — same flow, same
+        // fail-closed rules (see `guided_cmd`).
+        "disks" => list_disks(),
+        "install" => guided_cmd(stack, payloads, "install", rest),
+        "netinstall" => guided_cmd(stack, payloads, "netinstall", rest),
+        "apps" => crate::apps::launcher::run(stack, payloads),
         "tui" => crate::apps::tui::run(),
         "edit" => crate::apps::editor::run(),
         // B4: the interactive browser. Its navigation errors are pages,
@@ -301,5 +384,221 @@ fn execute(stack: &mut Stack, line: &str) {
             crate::halt();
         }
         other => serial_println!("unknown command: {other} (try `help`)"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Guided installer builtins (docs/installer.md §7.1): `disks`,
+// `install <device> yes`, `netinstall <device> yes`
+// ---------------------------------------------------------------------------
+
+/// What a disk's LBA0 says about the installer's two magics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Marker {
+    /// The installer's *source* volume (`reemplazo-disk-v1`) — listed,
+    /// read from, never written by these builtins.
+    Source,
+    /// The wipe marker (`reemplazo-target-v1`) — the only state an
+    /// install may write.
+    Target,
+    /// Neither magic: a disk the installer knows nothing about.
+    Unmarked,
+    /// LBA0 could not be read — fail-closed, treated like "no".
+    Unreadable,
+}
+
+impl Marker {
+    /// The word `disks` prints for this state.
+    fn as_str(self) -> &'static str {
+        match self {
+            Marker::Source => "source",
+            Marker::Target => "target",
+            Marker::Unmarked => "unmarked",
+            Marker::Unreadable => "unreadable",
+        }
+    }
+}
+
+/// One disk of the inventory: the id the user types (`ide0`/`ide1`/
+/// `ahci<port>`), the block device, and what its LBA0 carries.
+struct Entry {
+    id: String,
+    disk: ata::Disk,
+    marker: Marker,
+}
+
+/// Read-only inventory behind `disks` and the guided builtins: every
+/// drive that answers `IDENTIFY` on the legacy primary channel and on
+/// each implemented AHCI port, each with its marker state. Nothing here
+/// writes to a disk, and nothing here can fail loudly — a drive that
+/// does not answer is simply not listed (`ata::list`/`ahci::list` are
+/// the bounded probes the boot proofs already run).
+fn inventory() -> Vec<Entry> {
+    let mut entries = Vec::new();
+    for drive in ata::list().into_iter().flatten() {
+        let id = alloc::format!("ide{}", drive.unit());
+        let disk = ata::Disk::Ide(drive);
+        let marker = marker_of(&disk);
+        entries.push(Entry { id, disk, marker });
+    }
+    // The AHCI side needs the bus for the controller's ABAR — a quiet
+    // re-scan: the boot already printed the device list once.
+    let scan = crate::pci::scan_quiet();
+    for disk in crate::ahci::list(&scan) {
+        let id = alloc::format!("ahci{}", disk.port());
+        let disk = ata::Disk::ahci(disk);
+        let marker = marker_of(&disk);
+        entries.push(Entry { id, disk, marker });
+    }
+    entries
+}
+
+/// What LBA0 carries — source magic first (a disk can only be one
+/// thing), then the wipe marker. A failed read is [`Marker::Unreadable`]:
+/// the guided builtins refuse it instead of assuming a state.
+fn marker_of(disk: &ata::Disk) -> Marker {
+    let mut sector = [0u8; 512];
+    if !disk.read_sectors(0, &mut sector) {
+        return Marker::Unreadable;
+    }
+    if ata::has_magic(&sector) {
+        Marker::Source
+    } else if ata::has_target_magic(&sector) {
+        Marker::Target
+    } else {
+        Marker::Unmarked
+    }
+}
+
+/// The `disks` builtin: one line per detected disk, or a single line
+/// when there is none. Read-only by construction (see [`inventory`]).
+fn list_disks() {
+    let entries = inventory();
+    if entries.is_empty() {
+        serial_println!("disks: no disks detected");
+        return;
+    }
+    for entry in &entries {
+        print_entry("disks", entry);
+    }
+}
+
+/// The one canonical device line — id, model, size, marker state —
+/// printed for every disk `disks` lists and for the device the guided
+/// builtins resolve, **before** anything may be written (AGENTS.md:
+/// show the exact device and its size before acting).
+fn print_entry(cmd: &str, entry: &Entry) {
+    let mut name_buf = [0u8; 40];
+    // Model bytes come from the device (untrusted) and `serial_print!`
+    // evaluates its arguments twice, so sanitize into the buffer once
+    // and pass the `&str` — `ata::Drive::model_name`'s contract.
+    let model = entry.disk.model_name(&mut name_buf);
+    let sectors = u64::from(entry.disk.sectors());
+    serial_println!(
+        "{cmd}: {} '{model}' {sectors} sectors ({} MiB) {}",
+        entry.id,
+        sectors / 2048,
+        entry.marker.as_str(),
+    );
+}
+
+/// Shared front half of `install` / `netinstall`
+/// (docs/installer.md §7.1): parse `<device> [yes]`, resolve the
+/// device, show its line, and refuse — **before any write** —
+/// everything that is not a confirmed, wipe-marked target. Only then
+/// does the real install run (`install::guided_install` or
+/// `install::netinstall_run`), which shares the boot proofs' GPT →
+/// format → copy → read-back → GRUB flow.
+///
+/// The rules, in order:
+///
+/// 1. at most two words — the device id and the literal `yes`; no
+///    arguments print the usage line,
+/// 2. the id must resolve against the read-only inventory,
+/// 3. the disk must carry the `reemplazo-target-v1` wipe marker: an
+///    unmarked (or unreadable) disk is refused **even with** the
+///    confirmation typed out. This is the fail-closed rule that makes
+///    a guided installer safe at all — the machine may only ever
+///    format a disk someone deliberately marked (AGENTS.md),
+/// 4. the confirmation must be the literal `yes`.
+///
+/// Every refusal above is a line and a fresh prompt (the shell's
+/// fail-soft discipline); only a *disk* failure after the writes start
+/// is `FATAL:` + halt inside `install_payload`, exactly like the boot
+/// proofs — a half-installed target must never look like a success.
+fn guided_cmd(stack: &mut Stack, payloads: &Payloads, cmd: &str, rest: &str) {
+    let mut words = rest.split_whitespace();
+    let Some(id) = words.next() else {
+        serial_println!("usage: {cmd} <device> yes   (list devices with `disks`)");
+        return;
+    };
+    let confirm = words.next();
+    if words.next().is_some() {
+        serial_println!("usage: {cmd} <device> yes   (list devices with `disks`)");
+        return;
+    }
+
+    let entries = inventory();
+    let Some(entry) = entries.iter().find(|e| e.id == id) else {
+        serial_println!("{cmd}: unknown device '{id}' (list devices with `disks`)");
+        return;
+    };
+    // Show the exact device and its size first — before any check
+    // decides whether it may be written.
+    print_entry(cmd, entry);
+
+    // Rule 1 (hard): only a wipe-marked disk may be formatted, with or
+    // without the confirmation.
+    match entry.marker {
+        Marker::Target => {}
+        Marker::Unreadable => {
+            serial_println!("{cmd}: cannot read LBA0 of {} — refusing", entry.id);
+            return;
+        }
+        Marker::Source => {
+            serial_println!(
+                "{cmd}: {} holds the installer source volume — refusing to format it",
+                entry.id
+            );
+            return;
+        }
+        Marker::Unmarked => {
+            serial_println!(
+                "{cmd}: {} has no wipe marker ({}) — refusing to format an unmarked disk",
+                entry.id,
+                ata::TARGET_MARKER_TEXT
+            );
+            return;
+        }
+    }
+
+    // Rule 2: explicit confirmation, the literal `yes`.
+    if confirm != Some("yes") {
+        serial_println!(
+            "{cmd}: refusing without confirmation — type `{cmd} {} yes`",
+            entry.id
+        );
+        return;
+    }
+
+    // The install itself. The offline path copies the source volume's
+    // payload files when one is attached (the boot proof's set); with
+    // none — the real-hardware case, DVD ISO plus an empty disk — only
+    // `/KERNEL.ELF` goes to p2, which is all the boot path needs.
+    let source = entries
+        .iter()
+        .find(|e| e.marker == Marker::Source)
+        .map(|e| &e.disk);
+    let result = if cmd == "netinstall" {
+        install::netinstall_run(stack, &entry.disk, payloads)
+    } else {
+        install::guided_install(&entry.disk, payloads, source)
+    };
+    match result {
+        Ok(()) => serial_println!(
+            "{cmd}: done — {} now holds GPT + FAT16 + GRUB (reboot from it)",
+            entry.id
+        ),
+        Err(e) => serial_println!("{cmd}: {e}"),
     }
 }

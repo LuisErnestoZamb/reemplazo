@@ -79,7 +79,10 @@ ISR_NOERR 45                /* IRQ13: FPU */
 ISR_NOERR 46                /* IRQ14: primary ATA */
 ISR_NOERR 47                /* IRQ15: secondary ATA */
 
-/* --- Shared fallback for vectors >= 48 ------------------------------ */
+/* --- User syscall gate (IDT entry 0x80, DPL3 interrupt gate) ---------- */
+ISR_NOERR 128               /* int 0x80: ring 3 → ring 0 syscall entry */
+
+/* --- Shared fallback for all other vectors --------------------------- */
 .global isr_unexpected
 isr_unexpected:
     pushq $0
@@ -104,10 +107,12 @@ isr_common:
     pushq %r14
     pushq %r15
     movq %rsp, %rdi         /* arg1: *mut Frame (points at saved r15) */
-    movq %rsp, %rbx         /* keep frame pointer; old rbx is on the stack */
     andq $-16, %rsp         /* SysV: 16-byte aligned before `call` */
-    call interrupt_dispatch
-    movq %rbx, %rsp         /* rbx is callee-saved: frame pointer intact */
+    call interrupt_dispatch /* rax = *mut Frame to resume */
+    /* The dispatcher returns the frame to resume: the same one on the
+     * ordinary path, or another task's frame after a context switch.
+     * Switching rsp here makes every GPR restore read from that frame. */
+    movq %rax, %rsp
     popq %r15
     popq %r14
     popq %r13
@@ -124,6 +129,11 @@ isr_common:
     popq %rcx
     popq %rax
     addq $16, %rsp          /* drop vector + error code */
+    /* Mixed CPL: iretq always pops RIP/CS/RFLAGS, and additionally pops
+     * RSP/SS when the saved CS has RPL=3 (a ring-3→ring-0 entry did a
+     * stack switch). Frame therefore carries user_rsp/user_ss at +160/
+     * +168 for user frames; a ring-0 frame has only the first three
+     * words there and the CPU never reads past them. */
     iretq
 
 /* --- Stub address table for the IDT builder -------------------------- */
@@ -179,4 +189,8 @@ isr_stub_table:
     .quad isr_45
     .quad isr_46
     .quad isr_47
-    .quad isr_unexpected    /* index 48: fallback for vectors >= 48 */
+    /* 48..127: unused vectors, all point at the shared fallback. */
+    .rept 80
+    .quad isr_unexpected
+    .endr
+    .quad isr_128           /* index 128 = 0x80: user syscall gate */

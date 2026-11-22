@@ -148,10 +148,20 @@ static mut CONSOLE: Option<TextConsole> = None;
 /// Fail-soft: without a usable text framebuffer (no tag, unexpected
 /// pitch) the serial console stays the only output — never panic.
 pub fn init(addr: usize, cols: usize, rows: usize, pitch: usize) {
-    if cols == 0 || rows == 0 || pitch < cols * CELL || addr == 0 {
+    // Audit H1: the bootloader supplies these through the MBI framebuffer
+    // tag, so multiply with checked arithmetic — in release the plain
+    // product wraps and the overflow guard below passes, installing a
+    // console ~4 G cells wide that faults on the first newline.
+    let Some(cols_bytes) = cols.checked_mul(CELL) else {
+        return;
+    };
+    let Some(total) = cols_bytes.checked_mul(rows) else {
+        return;
+    };
+    if cols == 0 || rows == 0 || pitch < cols_bytes || addr == 0 {
         return;
     }
-    if addr > usize::MAX - cols * rows * CELL {
+    if addr > usize::MAX - total {
         return;
     }
     // SAFETY: `base` covers cols*rows cells inside the reported buffer,

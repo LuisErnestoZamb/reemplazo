@@ -49,6 +49,7 @@ mod ssh;
 mod sshd;
 mod tls;
 mod usb;
+mod userland;
 mod vga;
 
 // The network chain runs on smoltcp (docs/smoltcp-eval.md — M2):
@@ -140,6 +141,10 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
             // Copied before the frame allocator for the same reason as
             // the installer payloads.
             let sshd_len = capture_sshd_module(&info);
+            // U1: capture the userland ELF module before the frame
+            // allocator exists — GRUB module frames are not in the MBI
+            // memory map (same reason as the sshd/payload modules).
+            crate::userland::module::capture_hello(&info);
             memory::init(&info, mbi_addr);
             memory::selftest(&info, mbi_addr); // MEM_OK
             heap::init(); // carve a contiguous run, init the global heap
@@ -153,6 +158,9 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
     };
 
     arm_interrupts();
+    // Userland boundary (GDT6/TSS + int 0x80 gate already installed by
+    // entry.S/idt.rs): register the syscall and scheduler callbacks.
+    crate::userland::install_hooks();
     report_rtc(); // pure port I/O: no PCI needed, and RTC_OK precedes PCI_OK
     let scan = crate::pci::scan();
     crate::pci::selftest(&scan);
@@ -407,9 +415,11 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
     }
 
     // The shell is the kernel's idle state until a scheduler exists;
-    // without a NIC there is nothing to drive, so just park.
+    // without a NIC there is nothing to drive, so just park. The
+    // installer's captured ISO modules go along: the guided
+    // `install`/`netinstall` builtins write GRUB + the kernel from them.
     match stack.as_mut() {
-        Some(stack) => shell::run(stack),
+        Some(stack) => shell::run(stack, &payloads),
         None => {
             serial_println!("kernel_main: idle (no scheduler yet)");
             halt()
@@ -558,11 +568,21 @@ fn read_mbi(addr: u64) -> Result<BootInformation<'static>, MbiError> {
     // The spec places the structure below 4 GiB (EBX is 32-bit); reject
     // anything the identity map or sanity bound wouldn't cover. Runs
     // *before* the first read at `addr` — untrusted pointer first.
+    // Audit H2: `check_addr` only bounds the address itself; the first
+    // read below covers `addr..addr+4`, so require the full 4 bytes to
+    // stay inside the identity map (addr == 0xFFFF_FFFF would reach
+    // 0x1_0000_0002 — PML4[1] is absent → #PF before `check_range`).
+    if addr > 0xFFFF_FFFF - 4 {
+        return Err(MbiError::Range(mbi::RangeError::CrossesMap {
+            addr,
+            total: 4,
+        }));
+    }
     mbi::check_addr(addr).map_err(MbiError::Range)?;
 
-    // SAFETY: `check_addr` proved addr ∈ (0, 4 GiB], inside the identity
-    // map built in entry.S; reading 4 bytes there cannot fault and no one
-    // mutates it concurrently.
+    // SAFETY: the guards above proved `addr..addr+4` lies inside the
+    // identity map built in entry.S (≤ 0xFFFF_FFFF); no one mutates it
+    // concurrently (single-core boot, interrupts off).
     let total = unsafe { core::ptr::read_unaligned((addr as *const u8).cast::<u32>()) } as usize;
 
     // `total_size` sanity (8..= mbi::MBI_MAX_BYTES) plus the whole

@@ -84,6 +84,18 @@ fn probe(loc: Location) -> Option<Device> {
 /// Prints each device as found; ~65k config reads worst case, well under
 /// a second on both QEMU and the real chipset.
 pub fn scan() -> Scan {
+    scan_inner(true)
+}
+
+/// [`scan`] without the per-device lines — the re-scan the shell's
+/// `disks`/`install` builtins do for the AHCI inventory, where the
+/// boot-time dump would only be noise. Same read-only config-space
+/// walk, same result.
+pub fn scan_quiet() -> Scan {
+    scan_inner(false)
+}
+
+fn scan_inner(report: bool) -> Scan {
     let mut devices = [None; MAX_DEVICES];
     let mut count = 0usize;
 
@@ -97,7 +109,9 @@ pub fn scan() -> Scan {
             let Some(dev0) = probe(func0) else {
                 continue;
             };
-            serial_println!("pci: {dev0}");
+            if report {
+                serial_println!("pci: {dev0}");
+            }
             count += 1;
             if count <= MAX_DEVICES {
                 devices[count - 1] = Some(dev0);
@@ -113,7 +127,9 @@ pub fn scan() -> Scan {
                     let Some(dev) = probe(loc) else {
                         continue;
                     };
-                    serial_println!("pci: {dev}");
+                    if report {
+                        serial_println!("pci: {dev}");
+                    }
                     count += 1;
                     if count <= MAX_DEVICES {
                         devices[count - 1] = Some(dev);

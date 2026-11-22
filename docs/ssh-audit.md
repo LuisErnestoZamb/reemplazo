@@ -144,7 +144,7 @@ closed, and `service`/`method`/`algorithm` are all checked before the decision.
   `USERAUTH_FAILURE`), and carry the authenticated name into `channel_phase`
   for the eventual shell.
 
-## F5 — Unsupported channel request/type with payload → drop instead of failure reply (**bajo**)
+## F5 — Unsupported channel request/type with payload → drop instead of failure reply (**bajo**, **FIXED** by the `env` fix in 301e9d4 — non-exec requests now parse with opaque args and get CHANNEL_FAILURE when want_reply)
 
 - **Where:** `kernel/src/sshd.rs:726-732` (any `parse_channel_request` `Err` →
   disconnect), `:689-691` (non-`session` type → disconnect); root cause in

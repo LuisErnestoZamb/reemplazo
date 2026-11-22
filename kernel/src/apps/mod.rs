@@ -18,5 +18,6 @@ pub mod ai;
 pub mod browse;
 pub mod browser;
 pub mod editor;
+pub mod launcher;
 pub mod screen;
 pub mod tui;

@@ -3,6 +3,7 @@
 //! Usage (from repo root): `cargo xtask <command>`
 //!   check   fmt --check + clippy + host tests + kernel cross-build
 //!   build   cross-compile the kernel (x86_64-unknown-none, release)
+//!   user    cross-compile user-hello and copy it to boot/hello.elf
 //!   iso     package target image as bootable ISO (GRUB i386-pc)
 //!   smoke   boot the ISO headless; assert serial markers in order,
 //!           then type a command through QEMU's monitor (KEYBOARD_OK)
@@ -135,6 +136,8 @@ fn main() {
     let ok = match cmd.as_str() {
         "check" => check(&root),
         "build" => build_kernel(&root),
+        "user" => build_user(&root),
+        "smoke-user" => smoke_user(&root),
         "iso" => iso(&root),
         "smoke" => smoke(&root),
         "smoke-install" => smoke_install(&root),
@@ -143,7 +146,7 @@ fn main() {
         "hwtest" => hwtest(&root),
         _ => {
             eprintln!(
-                "usage: cargo xtask <check|build|iso|smoke|smoke-install|smoke-ssh|run|hwtest>"
+                "usage: cargo xtask <check|build|user|iso|smoke|smoke-user|smoke-install|smoke-ssh|run|hwtest>"
             );
             false
         }
@@ -248,6 +251,21 @@ fn check(root: &Path) -> bool {
             root,
             "cargo",
             &[
+                "clippy",
+                "-p",
+                "user-hello",
+                "--release",
+                "--target",
+                "x86_64-unknown-none",
+                "--",
+                "-D",
+                "warnings",
+            ],
+        )
+        && sh(
+            root,
+            "cargo",
+            &[
                 "test",
                 "-p",
                 "xtask",
@@ -307,6 +325,63 @@ fn build_kernel(root: &Path) -> bool {
     )
 }
 
+/// Cross-compile the first userland ELF and stage it at
+/// `target/iso-root/boot/hello.elf`. The integrator adds the
+/// `module2 /boot/hello.elf hello` line to the **new smoke-user** GRUB
+/// config; this command deliberately does not touch the existing
+/// `iso()`/`smoke*` paths, so their ISOs stay byte-identical.
+fn build_user(root: &Path) -> bool {
+    // The user ELF is linked at USER_BASE = 0x8000_0000_0000 (512 GiB),
+    // outside the small code model's signed-32-bit absolute relocation
+    // range. `code-model=large` is scoped to THIS cargo invocation via
+    // RUSTFLAGS — setting it in the global .cargo/config.toml changed the
+    // kernel's codegen (2.4 -> 3.6 MiB) and broke boot. Keep the two
+    // targets strictly separate.
+    let status = Command::new("cargo")
+        .args([
+            "build",
+            "-p",
+            "user-hello",
+            "--release",
+            "--target",
+            "x86_64-unknown-none",
+        ])
+        .env(
+            "RUSTFLAGS",
+            "-C target-cpu=x86-64 -C relocation-model=static -C code-model=large",
+        )
+        .current_dir(root)
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => {
+            eprintln!("xtask user: cargo build failed with {s}");
+            return false;
+        }
+        Err(e) => {
+            eprintln!("xtask user: cannot run cargo: {e}");
+            return false;
+        }
+    }
+    let elf = root.join("target/x86_64-unknown-none/release/user-hello");
+    let boot = root.join("target/iso-root/boot");
+    if let Err(e) = std::fs::create_dir_all(&boot) {
+        eprintln!("xtask user: cannot create {}: {e}", boot.display());
+        return false;
+    }
+    let dest = boot.join("hello.elf");
+    if let Err(e) = std::fs::copy(&elf, &dest) {
+        eprintln!(
+            "xtask user: cannot copy {} → {}: {e}",
+            elf.display(),
+            dest.display()
+        );
+        return false;
+    }
+    println!("xtask user: {} → {}", elf.display(), dest.display());
+    true
+}
+
 /// The early config embedded **inside `core.img`** (`grub-mkimage -c`)
 /// — this is what boots the *installed* disk (§4, §8.6):
 ///
@@ -360,7 +435,79 @@ ls -l /work/boot/boot.img /work/boot/core.img /work/boot/grubpayload.bin
 ";
 
 fn iso(root: &Path) -> bool {
-    iso_inner(root, false)
+    iso_inner(root, false, false)
+}
+
+/// Hard cap on the `hello` module: the kernel's capture buffer is 4 MiB
+/// (`kernel/src/userland/module.rs::HELLO_MODULE_CAP`). Keep both in sync.
+const HELLO_MODULE_CAP: u64 = 4 * 1024 * 1024;
+
+/// Where the userland agent's build puts the first user ELF. The first hit
+/// wins; `target/iso-root/hello.elf` lets a caller pre-stage the binary
+/// without owning `user/hello/`.
+const HELLO_SOURCES: &[&str] = &[
+    // The real cargo artifact (built by `xtask user` / `iso_inner`).
+    "target/x86_64-unknown-none/release/user-hello",
+    "user/hello/target/x86_64-unknown-none/release/hello",
+    "user/hello/target/x86_64-unknown-none/release/hello.elf",
+    "user/hello/hello.elf",
+    "target/iso-root/boot/hello.elf",
+    "target/iso-root/hello.elf",
+];
+
+/// First existing path for the userland `hello` build, if any.
+fn hello_source(root: &Path) -> Option<std::path::PathBuf> {
+    HELLO_SOURCES
+        .iter()
+        .map(|src| root.join(src))
+        .find(|path| path.is_file())
+}
+
+/// Copy the `hello` ELF into the ISO and add `module2 /boot/hello.elf hello`
+/// to GRUB's config (the name is the module's command line, matched by the
+/// kernel before its frame allocator exists). Missing binary → silent
+/// no-op; present but too large → loud ISO-build failure.
+fn stage_hello_module(root: &Path, iso_root: &Path, cfg_path: &Path) {
+    let Some(relative) = hello_source(root) else {
+        eprintln!("xtask: no user hello ELF found; skipping ELF_OK module");
+        return;
+    };
+    let bytes = match std::fs::read(&relative) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("xtask: cannot read {}: {e}", relative.display());
+            return;
+        }
+    };
+    if bytes.len() as u64 > HELLO_MODULE_CAP {
+        eprintln!(
+            "xtask: user hello ELF is {} B, above the {HELLO_MODULE_CAP} B module cap",
+            bytes.len()
+        );
+        return;
+    }
+    if let Err(e) = std::fs::write(iso_root.join("boot/hello.elf"), bytes) {
+        eprintln!("xtask: cannot write boot/hello.elf: {e}");
+        return;
+    }
+    let cfg = match std::fs::read_to_string(cfg_path) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("xtask: cannot read {}: {e}", cfg_path.display());
+            return;
+        }
+    };
+    if cfg.contains("module2 /boot/hello.elf hello") {
+        return;
+    }
+    let cfg = cfg.replacen(
+        "    boot\n",
+        "    module2 /boot/hello.elf hello\n    boot\n",
+        1,
+    );
+    if let Err(e) = std::fs::write(cfg_path, cfg) {
+        eprintln!("xtask: cannot write {}: {e}", cfg_path.display());
+    }
 }
 
 /// [`iso`] with the hardware bring-up module: when `hwtest` is set,
@@ -368,8 +515,14 @@ fn iso(root: &Path) -> bool {
 /// authorized client's raw public key) and the GRUB config loads it
 /// as the multiboot2 module `sshd`, which switches the kernel into
 /// `crate::hwtest` (static address, sshd, no smoke chain).
-fn iso_inner(root: &Path, hwtest: bool) -> bool {
+fn iso_inner(root: &Path, hwtest: bool, user_mode: bool) -> bool {
     if !build_kernel(root) {
+        return false;
+    }
+    // U1: build/stage the userland ELF only in the dedicated smoke-user
+    // ISO. The standard smoke/install/ssh/hwtest ISOs stay byte-identical
+    // (no hello module -> no ELF_OK -> original marker chains).
+    if user_mode && !build_user(root) {
         return false;
     }
     let kernel = root.join("target/x86_64-unknown-none/release/kernel");
@@ -449,6 +602,14 @@ fn iso_inner(root: &Path, hwtest: bool) -> bool {
             eprintln!("xtask hwtest: cannot write {}: {e}", cfg_path.display());
             return false;
         }
+    }
+    // U1: stage the first userland ELF as multiboot2 module `hello`.
+    // `m-userland-elf` owns `user/hello/`; until that binary lands this is
+    // a silent no-op, so diskless/installed-system boots keep their marker
+    // chains. With the ELF present the kernel's ELF_OK proof runs after
+    // SHELL_OK (the module is captured before `memory::init`).
+    if user_mode {
+        stage_hello_module(root, &iso_root, &boot_dir.join("grub.cfg"));
     }
     // I1b: the config embedded in the installed disk's core.img.
     if let Err(e) = std::fs::write(iso_root.join("boot/early.cfg"), GRUB_EARLY_CFG) {
@@ -1423,7 +1584,11 @@ fn run(root: &Path) -> bool {
 /// interactive browser's own state driven through the keyboard path —
 /// two kernel-owned fixture pages followed/back/forward with history
 /// depths asserted, and an unreachable endpoint rendering the error
-/// page instead of halting; offline, no internet needed) — within
+/// page instead of halting; offline, no internet needed), `SHELL_OK`
+/// (the shell's prompt loop) and — only when `user/hello/` produced the
+/// module staged by [`stage_hello_module`] — `ELF_OK` (U1: the `hello`
+/// multiboot2 module parsed as ET_EXEC with all `PT_LOAD` pages mapped
+/// user-accessible in a private PML4, plus user/kernel stacks) — within
 /// [`SMOKE_TIMEOUT`]. Then the keyboard milestone:
 /// once `SHELL_OK` matches, connect to QEMU's HMP monitor
 /// ([`monitor_port`]) and type `echo KEYBOARD_OK` key by key with
@@ -1476,7 +1641,7 @@ fn run(root: &Path) -> bool {
 /// server's serial (with every drop/auth reason — the exact
 /// diagnosis the real MacBook needs) is printed live as `hwtest| …`.
 fn hwtest(root: &Path) -> bool {
-    if !iso_inner(root, true) {
+    if !iso_inner(root, true, false) {
         return false;
     }
     let iso_dir = root.join("target/iso-root");
@@ -1732,8 +1897,45 @@ fn netlog_probe(container: &str) -> Result<usize, String> {
     Ok(first + second)
 }
 
+/// U1 smoke: boots the dedicated ISO with the `hello` userland module
+/// and asserts the userland markers (ELF_OK, USER_RUN_OK, SYSCALL_OK,
+/// USER_RETURN_OK) after the unchanged boot chain.
+fn smoke_user(root: &Path) -> bool {
+    let markers: Vec<&str> = vec![
+        "BOOT_OK",
+        "VGA_OK",
+        "MEM_OK",
+        "ALLOC_OK",
+        "RTC_OK",
+        "PCI_OK",
+        "USB_KBD_OK",
+        "E1000_OK",
+        "NET_OK",
+        "PING_OK",
+        "DHCP_OK",
+        "DNS_OK",
+        "TCP_OK",
+        "TLS_OK",
+        "HTTP_OK",
+        "GIT_LSREMOTE_OK",
+        "GIT_FETCH_OK",
+        "SSH_KEXINIT_OK",
+        "SSH_KEX_OK",
+        "INT_OK",
+        "SHELL_OK",
+        "ELF_OK",
+        "USER_RUN_OK",
+        "SYSCALL_OK",
+        "USER_RETURN_OK",
+    ];
+    if !iso_inner(root, false, true) {
+        return false;
+    }
+    boot_assert(root, "smoke-user", &markers, SMOKE_TIMEOUT, &[], &[], true)
+}
+
 fn smoke(root: &Path) -> bool {
-    const MARKERS: [&str; 30] = [
+    const BASE_MARKERS: [&str; 30] = [
         "BOOT_OK",
         "VGA_OK",
         "MEM_OK",
@@ -1765,10 +1967,16 @@ fn smoke(root: &Path) -> bool {
         "SHELL_OK",
         "KEYBOARD_OK",
     ];
+    // The U1 marker is only meaningful when the ISO actually carries the
+    // `hello` module. Before `user/hello/` lands (or on a boot without it)
+    // the chain stays exactly the original 30 markers.
+    // The normal smoke never stages the hello module, so its marker
+    // chain is the original 30 — byte-identical, no ELF_OK.
+    let markers: Vec<&str> = BASE_MARKERS.to_vec();
     if !iso(root) {
         return false;
     }
-    boot_assert(root, "smoke", &MARKERS, SMOKE_TIMEOUT, &[], &[], true)
+    boot_assert(root, "smoke", &markers, SMOKE_TIMEOUT, &[], &[], true)
 }
 
 /// Installer milestones 1 + FS1 + FS2 + **I1** + **I2** (`BLK_OK`,
