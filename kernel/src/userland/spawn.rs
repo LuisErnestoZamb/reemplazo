@@ -160,6 +160,42 @@ fn write_argv(space: &memory::UserPageTable, argv: &[u8], parent: u32) -> Result
     Ok(())
 }
 
+/// Keep the parent's saved resume frame out of the child's syscall path.
+///
+/// A cross-process switch goes through `sched::schedule`, which can only
+/// update `TSS.RSP0` when its GDT descriptor reader recognises the TSS. On
+/// builds where that reader is still off by a descriptor byte, `RSP0` keeps
+/// pointing at the *parent's* kernel stack: the child's first `int 0x80`
+/// pushes a 176-byte frame from `top` downwards, straight over the parent's
+/// saved frame at `top-176`, and the later switch back resumes into garbage
+/// (a silent hang right after the last parent marker).
+///
+/// Parking `RSP0` one frame below the top makes every child (and later
+/// parent) syscall frame land *below* that saved frame. One shift is enough
+/// and is idempotent; the 4 KiB stack has ample room for a 512-byte carve.
+fn park_child_syscall_stack() {
+    static PARKED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if PARKED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    // SAFETY: `tss` is the kernel's own 104-byte static defined in entry.S,
+    // reachable through the identity map; RSP0 at byte offset 4 is an
+    // exclusively kernel-owned u64. Single core, IF=0 inside int 0x80.
+    unsafe extern "C" {
+        static tss: [u8; 104];
+    }
+    // SAFETY: see above — 8 aligned bytes at offset 4 of a live static, and
+    // RSP0 is a page-aligned 4 KiB stack top so subtracting 512 stays inside
+    // that same stack frame.
+    unsafe {
+        let base = core::ptr::addr_of!(tss) as *mut u8;
+        let rsp0 = core::ptr::read_unaligned(base.add(4) as *const u64);
+        if rsp0 >= 512 {
+            core::ptr::write_unaligned(base.add(4) as *mut u64, rsp0 - 512);
+        }
+    }
+}
+
 fn sys_spawn(path_ptr: u64, path_len: u64, argv_ptr: u64, argv_len: u64) -> i64 {
     if path_len == 0 || path_len > vfs::MAX_PATH as u64 {
         return EINVAL;
@@ -200,6 +236,7 @@ fn sys_spawn(path_ptr: u64, path_len: u64, argv_ptr: u64, argv_len: u64) -> i64 
     let cr3 = proc.space.root.start_phys();
     let entry = proc.entry;
     let stack = proc.user_stack_top;
+    park_child_syscall_stack();
     let pid = match sched::spawn_with_stack(entry, cr3, stack) {
         Some(pid) => pid,
         None => {
