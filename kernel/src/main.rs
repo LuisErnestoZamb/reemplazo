@@ -406,9 +406,11 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
     }
 
     // The shell is the kernel's idle state until a scheduler exists;
-    // without a NIC there is nothing to drive, so just park.
+    // without a NIC there is nothing to drive, so just park. The
+    // installer's captured ISO modules go along: the guided
+    // `install`/`netinstall` builtins write GRUB + the kernel from them.
     match stack.as_mut() {
-        Some(stack) => shell::run(stack),
+        Some(stack) => shell::run(stack, &payloads),
         None => {
             serial_println!("kernel_main: idle (no scheduler yet)");
             halt()

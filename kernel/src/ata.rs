@@ -82,8 +82,14 @@ const MAGIC: &[u8] = b"reemplazo-disk-v1";
 /// that carries this marker (fail-closed — an unmarked second disk is
 /// ignored, never wiped). Real-hardware installs with an unmarked disk
 /// go through the guided `install <id>` shell builtin instead
-/// (docs/installer.md §7.1, future milestone).
-const TARGET_MAGIC: &[u8] = b"reemplazo-target-v1";
+/// (docs/installer.md §7.1), which enforces this same marker before
+/// it writes anything.
+///
+/// It doubles as the text the shell prints when it *refuses* an
+/// unmarked disk ([`TARGET_MARKER_TEXT`]) — one literal, so the
+/// message can never drift from the check.
+pub(crate) const TARGET_MARKER_TEXT: &str = "reemplazo-target-v1";
+const TARGET_MAGIC: &[u8] = TARGET_MARKER_TEXT.as_bytes();
 
 /// Byte offset of [`MAGIC`] inside LBA0 — the FAT boot sector's
 /// **bootstrap area** (62..510, the region after the BPB that FAT never
@@ -338,6 +344,18 @@ pub(crate) fn probe() -> Option<Drive> {
         }
     }
     None
+}
+
+/// Both units on the primary channel that answer `IDENTIFY`, in unit
+/// order — the read-only inventory behind the shell's `disks`/`install`
+/// builtins (docs/installer.md §7.1). Unlike [`probe`]/[`probe_target`]
+/// this neither prints nor filters on LBA0: an unmarked disk belongs in
+/// the *listing* (it just can never be installed onto — the marker
+/// check is the caller's, via [`has_magic`]/[`has_target_magic`]).
+/// `IDENTIFY` is bounded port I/O with no side effects, so calling it
+/// again after a boot probe is harmless (a `Drive` owns no resources).
+pub(crate) fn list() -> [Option<Drive>; 2] {
+    [identify(0), identify(1)]
 }
 
 /// Find the installer's *target* disk: the unit on the primary

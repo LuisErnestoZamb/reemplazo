@@ -6,7 +6,8 @@ smoke marker (§8.1) + **FS2 landed** — FAT16 write path and its `FS_WRITE_OK`
 **I2 landed** — the network installer and its `NETINST_OK` marker (§8.4) +
 **FS3 landed** — directories/LFN writes and `FS_TREE_OK` + the full-tree git checkout (§8.5) +
 **I1b landed** — GRUB boot code on the installed target and the standalone
-disk-boot proof (§8.6).
+disk-boot proof (§8.6) + **shell-install landed** — the guided `disks` / `install` /
+`netinstall` shell builtins (§8.7).
 Scope: the two installer deliverables from
 AGENTS.md — *a bootable ISO* and *a network installer that fetches the system over the
 network with the OS's own stack*. Target: 2007 MacBook2,1, GRUB i386-pc boot chain
@@ -906,6 +907,86 @@ that makes "install" mean "bootable".
   (recorded in the commit message); `cargo xtask smoke-ssh` PASS (ISO boot path unchanged);
   `mbi` unit tests now 9 (4 range + 5 module) plus its 10 adversarial `tests/hostile.rs`
   cases.
+
+### 8.7 shell-install landed — the guided builtins (`disks` / `install` / `netinstall`)
+
+§7.1's interactive path is in: three builtins in `kernel/src/shell.rs` on top of
+`install::guided_install` / `install::netinstall_run`, sharing the *same*
+`install_payload` the boot proofs run (GPT → format → copy → byte-exact re-read → GRUB
+last). No marker was added and none moved — `cargo xtask smoke` stays exactly 30 markers,
+because everything here runs only when someone types it.
+
+- **`disks` (read-only).** One line per detected disk:
+  `disks: ide0 'QEMU HARDDISK' 131072 sectors (64 MiB) source` — id, IDENTIFY model
+  (sanitized), size, and what LBA0 carries: `source` (`reemplazo-disk-v1`), `target`
+  (`reemplazo-target-v1`), `unmarked`, `unreadable`. Inventory = `ata::list()` (both IDE
+  units, new) + `ahci::list(&scan)` (every *linked* AHCI port, new) over a **quiet** PCI
+  re-scan (`pci::scan_quiet()` — `scan()`'s per-device lines stay boot-only). Neither
+  prints nor writes; a drive that does not answer is simply absent from the listing.
+  Ids are what the other two builtins take: `ide0`/`ide1`, `ahci<port>`.
+- **`ahci::list` does not reset ports** — the one measured performance fix this
+  milestone needed. `bring_up` issues COMRESET when `PxSSTS.DET` reports nothing linked
+  and then waits its whole 20M-poll `wait_device_present` budget for a device that is
+  not coming: **18 s per empty port in QEMU/TCG**, i.e. 90 s for ich9-ahci's five empty
+  ports (the first `disks` run took exactly that; the boot's `probe` only ever pays one
+  such budget because it returns on the first marked disk — 18 s of the
+  `PCI_OK → AHCI_OK` gap, pre-existing). The listing checks `DET` in one read and skips
+  linked-less ports instead of resetting them; a linked disk is attached exactly as
+  `probe` does. After the fix `disks` measures **0 ticks** on the same VM.
+- **`install <device> yes`** — the guided offline install. Safety rules, in order
+  (`guided_cmd`): usage with no/extra arguments → resolve the id against the inventory
+  (unknown → "list devices with `disks`") → **print the device line** (id, model, size,
+  marker) → the wipe-marker check → the literal `yes`. The marker check comes *before*
+  the confirmation and beats it: an unmarked disk is refused **even as
+  `install ide1 yes`**, with `install: ide1 has no wipe marker (reemplazo-target-v1)
+  — refusing to format an unmarked disk` (`ata::TARGET_MARKER_TEXT` is the same literal
+  the check compares, so message and rule cannot drift). Without the marker rule this
+  builtin could not exist at all (AGENTS.md: never format an unmarked disk).
+- **The pre-flight is fail-soft, the write is fail-closed.** Capacity
+  (`install::check_size`), the installer ISO's modules (`grubpayload` + `payload` — a
+  boot of the *installed* system has neither and is refused with a line, not a `FATAL`)
+  and, when a source volume is attached, its `/README.TXT` + `/RESULT.TXT`
+  (`install::offline_files`, factored out of `prove` so both paths install the same
+  files) are `Result`s the shell prints before anything is written. Once
+  `install_payload` starts, a disk failure stays `FATAL: install: …` + `halt()`, exactly
+  like `INST_OK` — a half-installed target must never look like a success. With **no**
+  source volume (the real-hardware case: DVD ISO + empty disk) only `/KERNEL.ELF` goes to
+  p2, which is all I1b's embedded GRUB config opens.
+- **`netinstall <device> yes`** — the same front half, then `install::netinstall_run`,
+  the fallible core `NETINST_OK` now shares with `netprove` (whose boot contract is
+  unchanged: same report line before `netinstall: GET …`, same `FATAL:` + halt on every
+  refusal, same `NETINST_OK`). It fetches `payload.tar` from the same in-container
+  responder (`10.0.2.2:8080`, §8.4) — the builtin is therefore a QEMU/dev path today;
+  the real `api.github.com` HTTPS payload (§6.2 v1) is still the open milestone-7 work,
+  so on real hardware the download fails *soft* ("connection refused by the payload
+  server") instead of halting.
+- **Shell idle: `hlt`.** The shell's spin loop now parks the CPU when both input
+  sources report empty — `hlt` only with RFLAGS.IF set (with IF clear nothing would
+  wake us, so it falls back to `spin_loop`), after the loop has drained both sources
+  (the UART's 16-byte FIFO is empty by construction at that point). Wakes on the PIT's
+  100 Hz tick. **Documented FIFO risk:** a byte arriving *during* the ≤10 ms sleep waits
+  for the tick, and 16 bytes at 38400 baud is only ~4 ms of line time — a full-rate
+  paste to a real UART without flow control can overrun it while asleep; QEMU's chardev
+  back-pressures instead of dropping (`cargo xtask run` loses nothing) and typing is
+  orders of magnitude slower either way. Interrupt-driven RX (the documented serial
+  milestone) removes the window entirely.
+- **Verified** (QEMU, `reemplazo-tools` image, driven over the guest's serial console —
+  a temporary harness outside the repo, same device set and mock loop as
+  `qemu_invocation`): `disks` listing all three disks of a smoke-install-shaped VM
+  (IDE source, unmarked IDE target, AHCI source) with correct marker words; every
+  refusal (`usage`, unknown id, unmarked target, source volume, missing `yes`, and
+  `netinstall` refusing before any network I/O); `install ide0 yes` on a freshly marked
+  64 MiB target → `GPT ok … FAT16 formatted … copied 1 files … GRUB on disk … done`,
+  with the host re-checking the protective MBR, both GPT CRCs, the GRUB LBA0 patch and
+  `/KERNEL.ELF` **byte-for-byte (sha256) against the built kernel**; `netinstall ide0
+  yes` → `2476544 bytes received` → `payload carries 2 files` → same install flow →
+  `done`. Plus `cargo xtask check` exit 0 and `cargo xtask smoke` PASS with all 30
+  markers (the `hlt` idle included in the keyboard phase).
+- **Not in this milestone:** driving the builtins from an automated xtask gate (they are
+  covered by the manual harness above; a `smoke-shell` marker chain would touch the
+  30-marker contract), an `install` that *unmarks* nothing (re-running against an
+  already-installed disk is refused: the marker is gone with LBA0 = `boot.img`, by
+  design), a target-size/`disks` selection menu, and the §6.2 HTTPS payload fetch.
 
 ---
 
