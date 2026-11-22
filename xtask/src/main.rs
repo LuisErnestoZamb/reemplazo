@@ -142,11 +142,12 @@ fn main() {
         "smoke" => smoke(&root),
         "smoke-install" => smoke_install(&root),
         "smoke-ssh" => smoke_ssh(&root),
+        "smoke-netinstall-real" => smoke_netinstall_real(&root),
         "run" => run(&root),
         "hwtest" => hwtest(&root),
         _ => {
             eprintln!(
-                "usage: cargo xtask <check|build|user|iso|smoke|smoke-user|smoke-install|smoke-ssh|run|hwtest>"
+                "usage: cargo xtask <check|build|user|iso|smoke|smoke-user|smoke-install|smoke-ssh|smoke-netinstall-real|run|hwtest>"
             );
             false
         }
@@ -1541,6 +1542,79 @@ fn run(root: &Path) -> bool {
             false
         }
     }
+}
+
+/// `cargo xtask smoke-netinstall-real` — host-side **preflight** for the
+/// real HTTPS payload source used by `install::netprove_https`
+/// (docs/installer.md §8.8). It is deliberately NOT a QEMU smoke: the
+/// kernel entry point is opt-in (the shell/hardware integrator wires
+/// it), so this command only proves the endpoint's *current* shape with
+/// the exact headers the kernel will send — status 200, raw media type,
+/// no redirect — and prints what is still required for the end-to-end
+/// hardware proof. No mocks, no credentials, no disk is touched and no
+/// existing smoke marker is affected.
+fn smoke_netinstall_real(_root: &Path) -> bool {
+    // Duplicated on purpose: host crates cannot depend on the kernel.
+    const URL: &str =
+        "https://api.github.com/repos/LuisErnestoZamb/reemplazo/contents/payload.tar?ref=main";
+    println!("smoke-netinstall-real: endpoint {URL}");
+    println!(
+        "smoke-netinstall-real: GET with User-Agent + Accept: application/vnd.github.raw, no credentials"
+    );
+    let output = Command::new("curl")
+        .args([
+            "-sS",
+            "--max-time",
+            "20",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code} %{content_type} %{num_redirects}",
+            "-H",
+            "Accept: application/vnd.github.raw",
+            "-H",
+            "User-Agent: reemplazo-netinstall/0.1",
+            "-H",
+            "X-GitHub-Api-Version: 2022-11-28",
+            URL,
+        ])
+        .output();
+    let output = match output {
+        Ok(output) => output,
+        Err(e) => {
+            eprintln!("smoke-netinstall-real: cannot run curl: {e}");
+            return false;
+        }
+    };
+    if !output.status.success() {
+        eprintln!(
+            "smoke-netinstall-real: curl failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        return false;
+    }
+    let line = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    println!("smoke-netinstall-real: status/content-type/redirects = {line}");
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    let ok = fields.first() == Some(&"200")
+        && fields.last() == Some(&"0")
+        && fields.iter().any(|f| f.contains("raw"));
+    if ok {
+        println!(
+            "smoke-netinstall-real: PASS (host preflight only) — kernel TLS/JSON/tar path \
+             still needs the payload published at that path and a real-hardware run"
+        );
+    } else if fields.first() == Some(&"404") {
+        eprintln!(
+            "smoke-netinstall-real: 404 — publish payload.tar at that repo path before \
+             the real installer can fetch it; the mock netprove remains the CI gate"
+        );
+    } else {
+        eprintln!(
+            "smoke-netinstall-real: FAIL — expected HTTP 200 with the raw media type and zero redirects"
+        );
+    }
+    ok
 }
 
 /// Machine-checked boot test: boot the ISO headless and require each
