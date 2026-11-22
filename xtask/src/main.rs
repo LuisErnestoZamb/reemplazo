@@ -1538,29 +1538,44 @@ fn smoke_install(root: &Path) -> bool {
     true
 }
 
-/// S5: the two-VM sshd proof (`cargo xtask smoke-ssh`).
+/// S5 + the OpenSSH interop phase: the two-VM sshd proof
+/// (`cargo xtask smoke-ssh`).
 ///
 /// One container, two QEMUs started together:
 ///
 /// - **VM1 (server)** boots with a FAT16 disk carrying `/HOST.BIN` (a
 ///   generated ed25519 host-key seed) and `/AUTH.KEY` (the *client*
 ///   key's `ssh-ed25519 <blob>` line). Its kernel starts the sshd on
-///   guest :2222 and waits one connection.
+///   guest :2222 and waits for connections — first VM2's own client,
+///   then the interop phase below.
 /// - **VM2 (client)** boots with a disk carrying `/CLIENT.BIN` (the
 ///   matching seed). After its normal boot chain it connects to
 ///   `10.0.2.2:2222` — slirp's gateway is the container's loopback,
 ///   where VM1's `-netdev user,...,hostfwd=tcp:0.0.0.0:2222-:2222`
 ///   listens — authenticates with `publickey`, execs
 ///   `echo SSHD_EXEC_OK` and prints `SSHD_OK` / `SSHD_EXEC_OK`.
+/// - **Interop**: once VM2's chain passed, xtask `docker exec`s a
+///   **real OpenSSH client** inside the same container (its loopback
+///   is where :2222 is published) against the same sshd, as the
+///   second connection of the same boot, and requires the exec output
+///   `INTEROP_OK` — plus the kernel's `SSHD_INTEROP_OK` on VM1's
+///   serial. This is the regression net for the live-hardware finding
+///   (Debian's OpenSSH got `Permission denied (publickey)` against the
+///   real MacBook while our own client passed; see
+///   docs/git-ssh-deps.md §B).
 ///
 /// VM1's serial goes to `target/iso-root/sshd-server-serial.log` (the
 /// bind mount at `/iso`, so the host can read it); VM2's serial is the
 /// container's stdout, drained exactly like `boot_assert`'s. Both VMs
 /// die with the container (`docker rm -f`), on every exit path.
 ///
-/// Keys are generated per run (from `/dev/urandom`), live only inside
-/// the two disk images `iso()` wipes on the next build, and are never
-/// printed or committed — only the fingerprint the kernels log.
+/// Keys are generated per run from **one** `ssh-keygen` invocation:
+/// the OpenSSH private file `target/iso-root/interop_key` (the
+/// interop client's `-i` key, never on any disk image the guest
+/// reads), `/CLIENT.BIN`'s seed and `/AUTH.KEY`'s line all come from
+/// that same key; VM1's host-key seed still comes from
+/// `/dev/urandom`. None of it is printed or committed — only the
+/// fingerprint the kernels log.
 fn smoke_ssh(root: &Path) -> bool {
     if !iso(root) {
         return false;
@@ -1572,7 +1587,12 @@ fn smoke_ssh(root: &Path) -> bool {
     let mut client_seed = [0u8; 32];
     let mut server_seed = [0u8; 32];
     let mut authorized = Vec::new();
-    if let Err(e) = generate_ssh_smoke_keys(&mut client_seed, &mut server_seed, &mut authorized) {
+    if let Err(e) = generate_ssh_smoke_keys(
+        &iso_dir,
+        &mut client_seed,
+        &mut server_seed,
+        &mut authorized,
+    ) {
         eprintln!("xtask: smoke-ssh: cannot generate the keypair: {e}");
         return false;
     }
@@ -1609,17 +1629,56 @@ fn smoke_ssh(root: &Path) -> bool {
 /// (DNS_OK, SSH_KEX_OK), then the S5 leg prints SSHD_OK after auth and
 /// SSHD_EXEC_OK after the exec output came back.
 const SSH_CLIENT_MARKERS: [&str; 4] = ["DNS_OK", "SSH_KEX_OK", "SSHD_OK", "SSHD_EXEC_OK"];
-/// The server VM's chain, asserted from its serial file.
-const SSH_SERVER_MARKERS: [&str; 3] = ["SSHD_LISTEN_OK", "SSHD_KEXINIT_OK", "SSHD_SESSION_OK"];
+/// The server VM's chain, asserted from its serial file: listen →
+/// VM2's session → the **OpenSSH interop** session (`SSHD_INTEROP_OK`
+/// is printed by the kernel after the second connection authenticated
+/// and ran its exec — the interop client's own `INTEROP_OK` output is
+/// asserted separately by [`run_openssh_interop`]).
+const SSH_SERVER_MARKERS: [&str; 4] = [
+    "SSHD_LISTEN_OK",
+    "SSHD_KEXINIT_OK",
+    "SSHD_SESSION_OK",
+    "SSHD_INTEROP_OK",
+];
 /// Budget for the whole two-VM exchange (both boots + KEX + auth +
 /// exec). The client's own boot chain (GitHub TLS/git/ssh) is the bulk.
 const SSH_SMOKE_TIMEOUT: Duration = Duration::from_secs(90);
+/// The OpenSSH interop phase's own budget: it starts only after VM2's
+/// chain finished, and retries `ssh` while the server is still closing
+/// session 1 / opening its second accept window.
+const SSH_INTEROP_TIMEOUT: Duration = Duration::from_secs(60);
+/// The per-run interop key file: host path `<iso>/interop_key`,
+/// container path [`INTEROP_KEY_CONTAINER`] — one `ssh-keygen` keypair
+/// shared by `/CLIENT.BIN`, `/AUTH.KEY` and this file.
+const INTEROP_KEY_FILE: &str = "interop_key";
+/// Where the tools container sees [`INTEROP_KEY_FILE`] (the bind mount
+/// at `/iso`).
+const INTEROP_KEY_CONTAINER: &str = "/iso/interop_key";
+/// The exec command the interop client runs — its echoed output is the
+/// assertion token.
+const INTEROP_COMMAND: &str = "echo INTEROP_OK";
+/// The token the remote `echo` must produce back on the client's
+/// stdout.
+const INTEROP_TOKEN: &str = "INTEROP_OK";
 
-/// One ed25519 keypair for the harness: client seed, server (host-key)
-/// seed, and the `authorized_keys` line holding the client's **public**
-/// half. `ed25519-dalek` is xtask-only (review in `xtask/Cargo.toml`);
-/// the seed bytes come straight from `/dev/urandom` — no RNG crate.
+/// One ed25519 keypair for the harness, from **one** `ssh-keygen`
+/// invocation: the OpenSSH private-key file (`<iso>/interop_key`,
+/// read by the real `ssh` of the interop phase), VM2's `/CLIENT.BIN`
+/// seed, and the `/AUTH.KEY` line VM1 compares against all carry the
+/// same key; only VM1's host-key seed still comes from
+/// `/dev/urandom`. `ed25519-dalek` is xtask-only (review in
+/// `xtask/Cargo.toml`).
+///
+/// The OpenSSH file is parsed here (not converted with another tool)
+/// because its `openssh-key-v1` private section is exactly the module
+/// layout of `keyfile::module_config`: a 64-byte block of
+/// `seed ‖ pub`. Three independent checks must agree before anything
+/// is written — the file's own public half, the seed's
+/// `ed25519-dalek` derivation, and the `.pub` line ssh-keygen wrote —
+/// so a parser bug fails loudly at generation time instead of looking
+/// like an auth failure later.
 fn generate_ssh_smoke_keys(
+    iso_dir: &Path,
     client_seed: &mut [u8; 32],
     server_seed: &mut [u8; 32],
     authorized: &mut Vec<u8>,
@@ -1627,15 +1686,68 @@ fn generate_ssh_smoke_keys(
     use ed25519_dalek::SigningKey;
     use std::io::{Error, Read};
 
-    let mut bytes = [0u8; 64];
+    let key_path = iso_dir.join(INTEROP_KEY_FILE);
+    let pub_path = format!("{}.pub", key_path.display());
+    // ssh-keygen refuses to overwrite; the previous run's key is
+    // dead the moment this one exists.
+    let _ = std::fs::remove_file(&key_path);
+    let _ = std::fs::remove_file(&pub_path);
+    let status = Command::new("ssh-keygen")
+        .args([
+            "-q",
+            "-t",
+            "ed25519",
+            "-N",
+            "",
+            "-C",
+            "reemplazo-smoke",
+            "-f",
+        ])
+        .arg(&key_path)
+        .status()?;
+    if !status.success() {
+        return Err(Error::other("ssh-keygen could not write the interop key"));
+    }
+
+    let (seed, public) = parse_openssh_ed25519(&std::fs::read(&key_path)?)?;
+
+    // Cross-check 1: the seed must derive the public key it ships
+    // with (this is the same math the kernel client and sshd do).
+    if SigningKey::from_bytes(&seed).verifying_key().to_bytes() != public {
+        return Err(Error::other(
+            "interop key: seed does not derive the bundled public key",
+        ));
+    }
+    // Cross-check 2: the `.pub` line must carry the same key blob.
+    let pub_text = std::fs::read_to_string(&pub_path)?;
+    let mut parts = pub_text.split_whitespace();
+    let (alg, b64) = match (parts.next(), parts.next()) {
+        (Some(alg), Some(b64)) => (alg, b64),
+        _ => return Err(Error::other("interop key: malformed .pub line")),
+    };
+    if alg != "ssh-ed25519" {
+        return Err(Error::other("interop key: .pub line is not ssh-ed25519"));
+    }
+    let mut blob = [0u8; ssh_wire::ED25519_KEY_BLOB_LEN];
+    let m = ssh_wire::base64_decode(b64.as_bytes(), &mut blob)
+        .ok_or_else(|| Error::other("interop key: .pub line is not base64"))?;
+    let from_pub_line =
+        ssh_wire::parse_ed25519_key_blob(&blob[..m]).map_err(|_| Error::other("interop key"))?;
+    if from_pub_line != public {
+        return Err(Error::other(
+            "interop key: .pub line and private key disagree",
+        ));
+    }
+
+    client_seed.copy_from_slice(&seed);
+
+    let mut bytes = [0u8; 32];
     std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-    client_seed.copy_from_slice(&bytes[..32]);
-    server_seed.copy_from_slice(&bytes[32..]);
+    server_seed.copy_from_slice(&bytes);
     bytes.fill(0);
 
-    let client = SigningKey::from_bytes(client_seed);
-    let mut blob = [0u8; ssh_wire::ED25519_KEY_BLOB_LEN];
-    let n = ssh_wire::ed25519_key_blob(&client.verifying_key().to_bytes(), &mut blob)
+    // The authorized-keys line from the same public half.
+    let n = ssh_wire::ed25519_key_blob(&public, &mut blob)
         .ok_or_else(|| Error::other("key blob does not fit"))?;
     let mut b64 = [0u8; 96];
     let m = ssh_wire::base64_encode(&blob[..n], true, &mut b64)
@@ -1645,6 +1757,131 @@ fn generate_ssh_smoke_keys(
     authorized.extend_from_slice(&b64[..m]);
     authorized.extend_from_slice(b" reemplazo-smoke\n");
     Ok(())
+}
+
+/// Parse an unencrypted `openssh-key-v1` ed25519 private key (what
+/// `ssh-keygen -t ed25519 -N ''` writes) into `(seed, public)`.
+///
+/// Layout (PROTOCOL.key + sshkey.c, verified against a live
+/// ssh-keygen file): magic, `ciphername = none`, `kdfname = none`,
+/// empty KDF options, `nkeys = 1`, the public section
+/// `string "ssh-ed25519" ‖ string <32>`, then the private section:
+/// two equal `checkint` words, `string "ssh-ed25519"`, `string <32>`
+/// (the public key again), `string <64>` (`seed ‖ pub`), the comment
+/// string, and `1,2,3,…` padding to an 8-byte boundary. Fail-closed:
+/// every one of those is checked, trailing bytes are refused, and the
+/// key bytes themselves never reach an error message.
+fn parse_openssh_ed25519(file: &[u8]) -> std::io::Result<([u8; 32], [u8; 32])> {
+    use std::io::{Error, ErrorKind};
+
+    fn bad(msg: &'static str) -> Error {
+        Error::new(ErrorKind::InvalidData, msg)
+    }
+    fn take<'a>(buf: &'a [u8], at: &mut usize, n: usize) -> std::io::Result<&'a [u8]> {
+        let end = at
+            .checked_add(n)
+            .ok_or_else(|| bad("key offset overflow"))?;
+        let slice = buf.get(*at..end).ok_or_else(|| bad("key file truncated"))?;
+        *at = end;
+        Ok(slice)
+    }
+    fn word(buf: &[u8], at: &mut usize) -> std::io::Result<u32> {
+        let s = take(buf, at, 4)?;
+        Ok(u32::from_be_bytes([s[0], s[1], s[2], s[3]]))
+    }
+    fn field<'a>(buf: &'a [u8], at: &mut usize) -> std::io::Result<&'a [u8]> {
+        let n = usize::try_from(word(buf, at)?).map_err(|_| bad("key field length"))?;
+        take(buf, at, n)
+    }
+
+    // The PEM armor: take the base64 between the BEGIN/END lines and
+    // drop interior whitespace (the strict decoder allows it only at
+    // the ends).
+    let text = std::str::from_utf8(file).map_err(|_| bad("key file is not PEM text"))?;
+    let begin = "-----BEGIN OPENSSH PRIVATE KEY-----";
+    let end = "-----END OPENSSH PRIVATE KEY-----";
+    let body = text
+        .split_once(begin)
+        .and_then(|(_, rest)| rest.split_once(end))
+        .map(|(body, _)| body)
+        .ok_or_else(|| bad("key file has no OPENSSH PRIVATE KEY armor"))?;
+    let mut b64 = String::with_capacity(body.len());
+    for c in body.chars() {
+        if !c.is_whitespace() {
+            b64.push(c);
+        }
+    }
+    let mut raw = [0u8; 512];
+    let n = ssh_wire::base64_decode(b64.as_bytes(), &mut raw)
+        .ok_or_else(|| bad("key body is not base64"))?;
+    let key = &raw[..n];
+
+    const MAGIC: &[u8] = b"openssh-key-v1\0";
+    let mut at = 0usize;
+    if take(key, &mut at, MAGIC.len())? != MAGIC {
+        return Err(bad("key body is not openssh-key-v1"));
+    }
+    if field(key, &mut at)? != b"none" {
+        return Err(bad("interop key is encrypted (want none cipher)"));
+    }
+    if field(key, &mut at)? != b"none" {
+        return Err(bad("interop key uses a KDF (want none)"));
+    }
+    let _kdf_options = field(key, &mut at)?;
+    if word(key, &mut at)? != 1 {
+        return Err(bad("interop key must hold exactly one key"));
+    }
+
+    // The public section: `string "ssh-ed25519" ‖ string <32>`.
+    let public_section = field(key, &mut at)?;
+    let public = ssh_wire::parse_ed25519_key_blob(public_section)
+        .map_err(|_| bad("interop key public section is malformed"))?;
+
+    // The private section.
+    let priv_section = field(key, &mut at)?;
+    let mut p = 0usize;
+    let check1 = word(priv_section, &mut p)?;
+    let check2 = word(priv_section, &mut p)?;
+    if check1 != check2 {
+        return Err(bad("interop key checkints differ (corrupt key)"));
+    }
+    if field(priv_section, &mut p)? != b"ssh-ed25519" {
+        return Err(bad("interop key private section is not ed25519"));
+    }
+    let section_public = field(priv_section, &mut p)?;
+    if section_public != public {
+        return Err(bad("interop key public halves disagree"));
+    }
+    let block = field(priv_section, &mut p)?;
+    let block: [u8; 64] = block
+        .try_into()
+        .map_err(|_| bad("private block is not 64 bytes"))?;
+    let _comment = field(priv_section, &mut p)?;
+    // Trailing padding: 1,2,3,… to the 8-byte boundary.
+    let mut pad = 1u8;
+    while p < priv_section.len() {
+        if priv_section[p] != pad {
+            return Err(bad("interop key padding is wrong"));
+        }
+        pad = pad.wrapping_add(1);
+        p += 1;
+    }
+    if at != key.len() {
+        return Err(bad("trailing bytes after the openssh key"));
+    }
+
+    // `seed ‖ pub` — the same split `keyfile::module_config` makes of
+    // the hardware `sshd` module.
+    let seed: [u8; 32] = block[..32]
+        .try_into()
+        .map_err(|_| bad("seed half is not 32 bytes"))?;
+    let block_public: [u8; 32] = block[32..]
+        .try_into()
+        .map_err(|_| bad("public half is not 32 bytes"))?;
+    if block_public != public {
+        return Err(bad("private block's public half disagrees"));
+    }
+    Ok((seed, public))
 }
 
 /// Build and run the two QEMUs in one container; assert the client's
@@ -1759,6 +1996,28 @@ fn run_two_vm_ssh(root: &Path, iso_dir: &Path, server_disk: &Path, client_disk: 
         false,
     );
 
+    // OpenSSH interop phase — while the container (and VM1's sshd,
+    // now opening its second accept window) is still alive. The real
+    // `ssh` runs *inside* the container: guest :2222 is published on
+    // that network namespace's loopback, which the host cannot reach,
+    // so `docker exec` is the clean way in (no sidecar needed).
+    let interop_ok = if client_ok {
+        run_openssh_interop(&container)
+    } else {
+        eprintln!("smoke-ssh: interop skipped (the client VM's chain failed first)");
+        false
+    };
+    if interop_ok {
+        // The kernel prints SSHD_INTEROP_OK only after the interop
+        // session completed; get it into the bind-mounted serial file
+        // before the container is killed.
+        let _ = wait_for_file_markers(
+            &server_log,
+            &["SSHD_INTEROP_OK"],
+            Instant::now() + Duration::from_secs(5),
+        );
+    }
+
     let mut no_mock = None;
     stop_vm(&mut child, Some(&container), &mut no_mock);
 
@@ -1771,9 +2030,9 @@ fn run_two_vm_ssh(root: &Path, iso_dir: &Path, server_disk: &Path, client_disk: 
         Instant::now() + Duration::from_secs(5),
     );
 
-    if client_ok && server_ok {
+    if client_ok && interop_ok && server_ok {
         println!(
-            "smoke-ssh: PASS — client {}; server {}",
+            "smoke-ssh: PASS — client {}; server {}; interop OpenSSH echoed {INTEROP_TOKEN}",
             SSH_CLIENT_MARKERS.join(" + "),
             SSH_SERVER_MARKERS.join(" + ")
         );
@@ -1782,6 +2041,12 @@ fn run_two_vm_ssh(root: &Path, iso_dir: &Path, server_disk: &Path, client_disk: 
         if !client_ok {
             let missing = SSH_CLIENT_MARKERS[next_marker..].join(" + ");
             eprintln!("smoke-ssh: FAIL — client missing {missing} within {SSH_SMOKE_TIMEOUT:?}");
+        }
+        if client_ok && !interop_ok {
+            eprintln!(
+                "smoke-ssh: FAIL — OpenSSH interop phase failed within {SSH_INTEROP_TIMEOUT:?} \
+                 (server verdicts are in the serial dump below)"
+            );
         }
         if !server_ok {
             eprintln!(
@@ -1798,6 +2063,104 @@ fn run_two_vm_ssh(root: &Path, iso_dir: &Path, server_disk: &Path, client_disk: 
             }
         }
         false
+    }
+}
+
+/// The OpenSSH interop phase of `smoke-ssh`: run a **real** OpenSSH
+/// client (the tools container's `ssh`, Debian's own package) against
+/// VM1's sshd as its *second* connection, and require the exec output
+/// to come back.
+///
+/// Why `docker exec`: VM1's `-netdev user,...,hostfwd=tcp:0.0.0.0:2222`
+/// publishes guest :2222 on the **container's** loopback (that is
+/// where VM2's slirp gateway leads too), and on Docker Desktop the
+/// container's loopback is not reachable from the host — so the
+/// client must run inside that network namespace. The container is
+/// still alive here (`stop_vm` comes later), so a plain `docker exec`
+/// is the whole story; no sidecar container is needed.
+///
+/// Retry policy: `ssh` exits for two very different reasons.
+/// Connection-level failures (`refused`/`timed out` — the server is
+/// still closing session 1 or opening its second accept window) are
+/// retried until [`SSH_INTEROP_TIMEOUT`]; an **auth verdict** —
+/// `Permission denied` after a full handshake — is definitive and
+/// ends the loop at once, so the exact failure the real MacBook hit
+/// is reported verbatim instead of being masked by later retries.
+/// Every attempt's output is echoed into the harness log either way.
+fn run_openssh_interop(container: &str) -> bool {
+    // Belt and braces: bind-mounted files can surface with loose
+    // modes on some Docker Desktop filesystems, and ssh refuses a
+    // private key that is not its owner's to read only.
+    let _ = Command::new("docker")
+        .args(["exec", container, "chmod", "600", INTEROP_KEY_CONTAINER])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+
+    let ssh_args = [
+        "exec",
+        container,
+        "ssh",
+        "-i",
+        INTEROP_KEY_CONTAINER,
+        "-p",
+        "2222",
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "GlobalKnownHostsFile=/dev/null",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "IdentitiesOnly=yes",
+        "-o",
+        "PreferredAuthentications=publickey",
+        "-o",
+        "ConnectTimeout=3",
+        "reemplazo@127.0.0.1",
+        INTEROP_COMMAND,
+    ];
+    let deadline = Instant::now() + SSH_INTEROP_TIMEOUT;
+    let mut attempt = 0usize;
+    loop {
+        attempt += 1;
+        let out = Command::new("docker").args(ssh_args).output();
+        match out {
+            Ok(o) => {
+                let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
+                text.push_str(&String::from_utf8_lossy(&o.stderr));
+                for line in text.lines() {
+                    println!("smoke-ssh|interop| {line}");
+                }
+                if o.status.success() && text.contains(INTEROP_TOKEN) {
+                    println!(
+                        "smoke-ssh|interop: PASS — real OpenSSH authenticated (attempt {attempt})"
+                    );
+                    return true;
+                }
+                // A full handshake that ends in `Permission denied` is
+                // the server's verdict on the auth path itself — no
+                // retry can change it, and retrying would bury it.
+                if text.contains("Permission denied") {
+                    eprintln!("smoke-ssh: FAIL — OpenSSH got a publickey verdict from the sshd");
+                    return false;
+                }
+            }
+            Err(e) => {
+                eprintln!("smoke-ssh: cannot run the interop ssh in {container}: {e}");
+                return false;
+            }
+        }
+        if Instant::now() >= deadline {
+            eprintln!(
+                "smoke-ssh: FAIL — OpenSSH interop gave up after {attempt} attempts \
+                 within {SSH_INTEROP_TIMEOUT:?} (last output above)"
+            );
+            return false;
+        }
+        std::thread::sleep(Duration::from_secs(1));
     }
 }
 

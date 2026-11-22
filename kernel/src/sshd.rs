@@ -1,12 +1,21 @@
 //! SSH **server** — milestone S5 of docs/git-ssh-deps.md §B.4: the
 //! mirror image of `kernel/src/ssh.rs`.
 //!
-//! One connection, one session, on guest TCP port **2222**, and only
+//! Up to [`SESSIONS_PER_CALL`] sequential sessions on guest TCP port
+//! **2222**, and only
 //! when the attached FAT16 volume carries a server key set
 //! (`/HOST.BIN` + `/AUTH.KEY`, see `crate::keyfile`). With no disk —
-//! the 29-marker `cargo xtask smoke` — or with the installer smoke's
+//! the 30-marker `cargo xtask smoke` — or with the installer smoke's
 //! disk (README only) this module is never called: no listener, no log
 //! line, nothing on the wire.
+//!
+//! [`serve_once`] accepts up to [`SESSIONS_PER_CALL`] connections
+//! sequentially: the smoke path calls it once, so `cargo xtask
+//! smoke-ssh` gets VM2's own client first and then its **OpenSSH
+//! interop** phase (a real `ssh` from the tools container), which is
+//! what prints `SSHD_INTEROP_OK`. The hardware bring-up loop
+//! (`hwtest::run`) already called it repeatedly; the second window
+//! only widens the same bounded accept budget there.
 //!
 //! Protocol shape (RFC4253, RFC4252, RFC4254):
 //!
@@ -25,8 +34,8 @@
 //! 5. `ssh-userauth` service request/accept; `none` is answered with
 //!    `USERAUTH_FAILURE(publickey)`, the `publickey` probe with
 //!    `PK_OK` when the key matches `authorized_keys`, and the signed
-//!    request is verified over `session_id ‖ request` before
-//!    `USERAUTH_SUCCESS`,
+//!    request verified over `string session_id ‖ request`
+//!    (RFC4252 §7) before `USERAUTH_SUCCESS`,
 //! 6. (S5b) one `session` channel: an `exec` request runs the tiny
 //!    internal handler (`echo …`), and its output is sent as channel
 //!    data with `exit-status`, EOF and close.
@@ -41,10 +50,12 @@
 //! is the only failure type, so the reason text is ours and no wire
 //! byte can reach the log unsanitized.
 //!
-//! One connection per boot: smoltcp hands a listening socket one
-//! connection at a time, and `serve_once` waits a bounded 45 s for it.
-//! A real accept loop is a later milestone (it needs the shell/scheduler
-//! to run beside it); this is the end-to-end proof our client needs.
+//! Two connections per [`serve_once`] call at most: smoltcp hands a
+//! listening socket one connection at a time, so each is accepted,
+//! served and closed before the next window opens, and every window
+//! waits a bounded 45 s. A real concurrent accept loop is a later
+//! milestone (it needs the shell/scheduler to run beside it); this is
+//! the end-to-end proof our client and the OpenSSH interop need.
 
 use crate::clock;
 use crate::keyfile::ServerConfig;
@@ -60,9 +71,18 @@ use x25519_dalek::{PublicKey, StaticSecret};
 /// Guest-side listener port (the two-VM harness forwards the
 /// container's loopback :2222 to it — see `cargo xtask smoke-ssh`).
 pub(crate) const LISTEN_PORT: u16 = 2222;
-/// How long the boot waits for the one client (`smoke-ssh` starts both
-/// VMs together; the client needs ~20 s to finish its own boot).
+/// How long each accept window waits for its client (`smoke-ssh`
+/// starts both VMs together; the client needs ~20 s to finish its own
+/// boot).
 const ACCEPT_DEADLINE_MS: u64 = 45_000;
+/// Connections served per [`serve_once`] call. The smoke path calls
+/// it once, so this is the whole budget `cargo xtask smoke-ssh` gets:
+/// window 0 is VM2's own client (the original S5 phase), window 1 is
+/// the **OpenSSH interop** phase — a real `ssh` run by xtask from
+/// inside the tools container against the same sshd, which is what
+/// prints `SSHD_INTEROP_OK`. Each window gets its own bounded accept
+/// deadline, so the interop client can never wedge the boot.
+const SESSIONS_PER_CALL: u32 = 2;
 /// Per-receive budget inside a session: a client that stalls is
 /// dropped, never wedged into the boot.
 const STEP_DEADLINE_MS: u64 = OP_DEADLINE_MS;
@@ -87,8 +107,12 @@ const SERVER_CHANNEL: u32 = 0;
 /// IRQ0 never touches it, one connection at a time).
 static mut RX: [u8; RX_CAP] = [0; RX_CAP];
 
-/// Serve exactly one client, or give up after [`ACCEPT_DEADLINE_MS`].
-/// Called from the boot chain only when a disk carried a server key.
+/// Serve up to [`SESSIONS_PER_CALL`] clients, each inside its own
+/// bounded accept window, or give up after [`ACCEPT_DEADLINE_MS`].
+/// Returns `true` when at least one session ran to completion — the
+/// hardware bring-up loop counts `false` as an idle window
+/// (`hwtest::run`). Called from the boot chain only when a disk
+/// carried a server key.
 pub(crate) fn serve_once(stack: &mut Stack, cfg: &ServerConfig) -> bool {
     // The fingerprint is public material: it is what an operator
     // compares out of band. The seed behind it is never printed.
@@ -111,75 +135,105 @@ pub(crate) fn serve_once(stack: &mut Stack, cfg: &ServerConfig) -> bool {
         return false;
     }
     serial_println!(
-        "sshd: listening on :{LISTEN_PORT} (one connection, {} s budget)",
+        "sshd: listening on :{LISTEN_PORT} (up to {SESSIONS_PER_CALL} connections, {} s per window)",
         ACCEPT_DEADLINE_MS / 1000
     );
     // machine-checked by `cargo xtask smoke-ssh` (server VM)
     serial_println!("SSHD_LISTEN_OK");
 
     let handle = stack.listen_handle;
-    let deadline = clock::now_ms() + ACCEPT_DEADLINE_MS;
-    loop {
-        stack.poll();
-        let state = stack.sockets.get::<tcp::Socket>(handle).state();
-        if state == tcp::State::Established {
+    let mut served = false;
+    for window in 0..SESSIONS_PER_CALL {
+        // Window ≥ 1 starts from the previous session's socket, which
+        // may still be closing (or dead mid-close): `listen_ssh`
+        // aborts whatever is open before listening again.
+        if window > 0 && !stack.listen_ssh(LISTEN_PORT) {
+            serial_println!("sshd: cannot re-listen on :{LISTEN_PORT}");
             break;
         }
-        // A SYN that immediately resets leaves the socket closed;
-        // put it back into Listen (bounded by the overall deadline).
-        if matches!(state, tcp::State::Closed | tcp::State::TimeWait)
-            && !stack.listen_ssh(LISTEN_PORT)
-        {
-            serial_println!("sshd: cannot re-listen on :{LISTEN_PORT}");
-            return false;
+        let deadline = clock::now_ms() + ACCEPT_DEADLINE_MS;
+        let mut connected = false;
+        loop {
+            stack.poll();
+            let state = stack.sockets.get::<tcp::Socket>(handle).state();
+            if state == tcp::State::Established {
+                connected = true;
+                break;
+            }
+            // A SYN that immediately resets leaves the socket closed;
+            // put it back into Listen (bounded by the window deadline).
+            if matches!(state, tcp::State::Closed | tcp::State::TimeWait)
+                && !stack.listen_ssh(LISTEN_PORT)
+            {
+                serial_println!("sshd: cannot re-listen on :{LISTEN_PORT}");
+                return served;
+            }
+            if clock::now_ms() > deadline {
+                break;
+            }
         }
-        if clock::now_ms() > deadline {
+        if !connected {
+            if window == 0 {
+                serial_println!(
+                    "sshd: no client within {} s; not serving",
+                    ACCEPT_DEADLINE_MS / 1000
+                );
+                return false;
+            }
             serial_println!(
-                "sshd: no client within {} s; not serving",
+                "sshd: no second client within {} s; interop window expired",
                 ACCEPT_DEADLINE_MS / 1000
             );
-            return false;
-        }
-    }
-
-    if let Some(remote) = stack.sockets.get::<tcp::Socket>(handle).remote_endpoint() {
-        serial_println!("sshd: client connected from {remote}");
-    } else {
-        serial_println!("sshd: client connected");
-    }
-
-    match session(stack, handle, &signing, &blob[..blob_len], cfg) {
-        Ok(()) => {
-            serial_println!("sshd: session complete");
-            // machine-checked by `cargo xtask smoke-ssh` (server VM)
-            serial_println!("SSHD_SESSION_OK");
-        }
-        Err(reason) => {
-            serial_println!("sshd: connection dropped: {reason}");
-            return false;
-        }
-    }
-
-    // Orderly close: FIN if the peer is still there; a dead connection
-    // is simply released.
-    {
-        let sock = stack.sockets.get_mut::<tcp::Socket>(handle);
-        if sock.is_open() {
-            sock.close();
-        }
-    }
-    let deadline = clock::now_ms() + STEP_DEADLINE_MS;
-    loop {
-        stack.poll();
-        let state = stack.sockets.get::<tcp::Socket>(handle).state();
-        if matches!(state, tcp::State::Closed | tcp::State::TimeWait) {
             break;
         }
-        if clock::now_ms() > deadline {
-            break; // release anyway: one session, then back to boot
+
+        if let Some(remote) = stack.sockets.get::<tcp::Socket>(handle).remote_endpoint() {
+            serial_println!("sshd: client connected from {remote}");
+        } else {
+            serial_println!("sshd: client connected");
+        }
+
+        match session(stack, handle, &signing, &blob[..blob_len], cfg) {
+            Ok(()) => {
+                served = true;
+                serial_println!("sshd: session complete");
+                // machine-checked by `cargo xtask smoke-ssh` (server VM)
+                serial_println!("SSHD_SESSION_OK");
+                if window == 1 {
+                    // Window 1 of the smoke path is `cargo xtask
+                    // smoke-ssh`'s OpenSSH interop phase (VM2's own
+                    // client had window 0): a real `ssh` authenticated
+                    // and ran its exec to completion.
+                    serial_println!("SSHD_INTEROP_OK");
+                }
+            }
+            Err(reason) => {
+                serial_println!("sshd: connection dropped: {reason}");
+                return served;
+            }
+        }
+
+        // Orderly close: FIN if the peer is still there; a dead
+        // connection is simply released.
+        {
+            let sock = stack.sockets.get_mut::<tcp::Socket>(handle);
+            if sock.is_open() {
+                sock.close();
+            }
+        }
+        let deadline = clock::now_ms() + STEP_DEADLINE_MS;
+        loop {
+            stack.poll();
+            let state = stack.sockets.get::<tcp::Socket>(handle).state();
+            if matches!(state, tcp::State::Closed | tcp::State::TimeWait) {
+                break;
+            }
+            if clock::now_ms() > deadline {
+                break; // release anyway: one session, then the next window
+            }
         }
     }
-    true
+    served
 }
 
 /// One wire failure reason — ours, static, safe to log.
@@ -509,9 +563,10 @@ fn auth_request(
         return Ok(AuthOutcome::ProbeAccepted);
     }
 
-    // The client signs `session_id || request-without-signature`
-    // (RFC4252 §7). Buffers are bounded by the parser's own caps.
-    let mut signed = [0u8; 32 + PAYLOAD_CAP];
+    // The client signs `string session_id || request-without-signature`
+    // (RFC4252 §7 — the session id is an RFC4251 `string`, so it is
+    // length-prefixed). Buffers are bounded by the parser's own caps.
+    let mut signed = [0u8; 4 + 32 + PAYLOAD_CAP];
     let Some(n) = ssh_wire::userauth_signed_data(session_id, req.signed_prefix, &mut signed) else {
         return Err("signed-data buffer is too small");
     };

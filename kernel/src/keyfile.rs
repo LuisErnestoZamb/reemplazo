@@ -154,11 +154,11 @@ impl fat::BlockDevice for KeyDisk<'_> {
 // ---- S5: the sshd's on-disk configuration -------------------------
 //
 // A disk that carries a **host key seed** and an `authorized_keys`-style
-// file turns the kernel into an sshd for one connection (`cargo xtask
-// smoke-ssh`); a disk that carries only a client seed makes the boot
+// file turns the kernel into an sshd for the harness' connections
+// (`cargo xtask smoke-ssh`); a disk that carries only a client seed makes the boot
 // auto-run the two-VM probe client. Everything else — including the
 // installer smoke's disk, which has neither — is silent: no listener,
-// no probe, no log line (the 29-marker `smoke` and `smoke-install`
+// no probe, no log line (the 30-marker `smoke` and `smoke-install`
 // chains stay untouched).
 //
 // File names are 8.3 (the `fat` crate writes/reads short names only):

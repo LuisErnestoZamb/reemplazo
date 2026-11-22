@@ -1313,10 +1313,21 @@ fn userauth_publickey_payload_inner(
 }
 
 /// The data an ed25519 `publickey` signature covers (RFC4252 §7 with
-/// RFC4253 §8's "session identifier"): `session_id || request`, where
-/// `request` is the signed `SSH_MSG_USERAUTH_REQUEST` payload **without**
+/// RFC4253 §8's "session identifier"): `string session_id ‖ request`,
+/// where `request` is the signed `SSH_MSG_USERAUTH_REQUEST` payload **without**
 /// its signature field — [`userauth_signed_prefix`], *not* the probe
 /// (the probe carries boolean FALSE, the signed form TRUE).
+///
+/// RFC4252 §7 spells the first field **`string session identifier`**,
+/// and a `string` is `uint32 length ‖ bytes` (RFC4251 §5) — so the
+/// session id is *length-prefixed*, not raw. OpenSSH assembles the
+/// same bytes with `sshbuf_put_stringb(b, ssh->kex->session_id)` in
+/// `sign_and_send_pubkey` (`sshconnect2.c`). Writing the raw 32 bytes
+/// here made our own client and server agree with each other (both
+/// sides shared the bug, so `cargo xtask smoke-ssh` stayed green)
+/// while every third-party peer rejected the signature — the
+/// 2026-11-22 live-hardware failure where Debian's OpenSSH got
+/// `Permission denied (publickey)` against our sshd.
 pub fn userauth_signed_data(
     session_id: &[u8],
     request_without_signature: &[u8],
@@ -1325,13 +1336,14 @@ pub fn userauth_signed_data(
     if session_id.is_empty() || request_without_signature.is_empty() {
         return None;
     }
-    let total = session_id
-        .len()
+    let total = 4usize
+        .checked_add(session_id.len())?
         .checked_add(request_without_signature.len())?;
+    let slen = u32::try_from(session_id.len()).ok()?;
     let dst = out.get_mut(..total)?;
-    dst.get_mut(..session_id.len())?.copy_from_slice(session_id);
-    dst.get_mut(session_id.len()..)?
-        .copy_from_slice(request_without_signature);
+    dst[..4].copy_from_slice(&slen.to_be_bytes());
+    dst[4..4 + session_id.len()].copy_from_slice(session_id);
+    dst[4 + session_id.len()..].copy_from_slice(request_without_signature);
     Some(total)
 }
 
@@ -4564,21 +4576,24 @@ mod tests {
     }
 
     #[test]
-    fn signed_data_is_the_session_id_prefixed_to_the_probe() {
+    fn signed_data_length_prefixes_the_session_id_before_the_probe() {
         let blob = fixture_blob();
         let mut probe = [0u8; 256];
         let plen = userauth_publickey_payload(AUTH_USER, &blob, None, &mut probe).expect("fits");
         let session = [0x5Au8; 32];
         let mut data = [0u8; 256];
         let dlen = userauth_signed_data(&session, &probe[..plen], &mut data).expect("fits");
-        assert_eq!(dlen, 32 + 110);
-        assert_eq!(&data[..32], &session);
-        assert_eq!(&data[32..dlen], &probe[..plen]);
+        // RFC4252 §7's first field is `string session identifier` —
+        // uint32 length ‖ bytes (RFC4251 §5), then the signed request.
+        assert_eq!(dlen, 4 + 32 + 110);
+        assert_eq!(&data[..4], &32u32.to_be_bytes());
+        assert_eq!(&data[4..36], &session);
+        assert_eq!(&data[36..dlen], &probe[..plen]);
         // No session id, no request, or a short buffer: refused.
         assert_eq!(userauth_signed_data(b"", &probe[..plen], &mut data), None);
         assert_eq!(userauth_signed_data(&session, b"", &mut data), None);
         assert_eq!(
-            userauth_signed_data(&session, &probe[..plen], &mut data[..141]),
+            userauth_signed_data(&session, &probe[..plen], &mut data[..145]),
             None
         );
     }
@@ -4626,10 +4641,11 @@ mod tests {
                 .is_err()
         );
 
-        // So does one flipped bit anywhere in the request itself.
+        // So does one flipped bit anywhere in the request itself
+        // (byte 4+32 = past the length-prefixed session id).
         for i in [0usize, 1 + 7 + 18 + 13, plen - 1] {
             let mut tampered = data;
-            tampered[32 + i] ^= 1;
+            tampered[4 + 32 + i] ^= 1;
             assert!(
                 vk.verify(&tampered[..dlen], &Signature::from_bytes(&parsed))
                     .is_err(),

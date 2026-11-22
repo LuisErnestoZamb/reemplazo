@@ -169,14 +169,24 @@ the second boots with the matching `/CLIENT.BIN` seed and, after its
 normal boot chain, dials `10.0.2.2:2222` — the first VM publishes its
 guest `:2222` with QEMU's `hostfwd` on the container loopback, which is
 exactly where slirp's gateway leads — authenticates with `publickey`,
-execs `echo SSHD_EXEC_OK` and prints `SSHD_OK` + `SSHD_EXEC_OK`. The
-keypair is generated per run into those two disk images only (never
-printed, never committed), and a disk without `/HOST.BIN`/`/AUTH.KEY`
-gets no listener at all — the 29-marker `smoke` and `smoke-install`
-chains are untouched. The peer is trusted on first use **for the
-session** (its key and fingerprint are printed); a persisted
-`known_hosts` with change detection is pending with the filesystem
-milestone.
+execs `echo SSHD_EXEC_OK` and prints `SSHD_OK` + `SSHD_EXEC_OK`. Then
+an **OpenSSH interop phase**: xtask `docker exec`s a *real* Debian
+OpenSSH client (the tools image's `ssh`) inside that same container
+against the same sshd, as the sshd's second connection, and requires
+the exec output `INTEROP_OK` plus the kernel's `SSHD_INTEROP_OK`
+marker — the regression net for the 2026-11-22 live-hardware finding
+(OpenSSH got `Permission denied (publickey)` from our sshd while our
+own client passed; root cause: the `publickey` signature covered a raw
+session id where RFC4252 §7 requires `string session identifier`
+— RFC4251 `uint32 length ‖ bytes` — and our client and server shared
+the bug). One per-run `ssh-keygen` keypair feeds all of it: the
+`/CLIENT.BIN` seed, the `/AUTH.KEY` line and the interop client's
+`target/iso-root/interop_key` file (never printed, never committed),
+and a disk without `/HOST.BIN`/`/AUTH.KEY` gets no listener at all —
+the 30-marker `smoke` and `smoke-install` chains are untouched. The
+peer is trusted on first use **for the session** (its key and
+fingerprint are printed); a persisted `known_hosts` with change
+detection is pending with the filesystem milestone.
 
 **Notes:**
 
@@ -233,7 +243,7 @@ Milestones landed so far (see `git log` for details):
 - [x] git over HTTPS — smart-HTTP `ls-remote` advertisement (GIT_LSREMOTE_OK), depth-1 `fetch` via v0 `want`/`deepen 1`/`done` → `git-pack` decode → iterative tree walk (GIT_FETCH_OK), a **full-tree** checkout into FAT16 — directories, long names, every blob — with a re-mount read-back (GIT_CHECKOUT_OK, `smoke-install`), the **local object store**: loose objects for every fetched commit/tree/blob, refs/HEAD, the v2 index, rebuilt trees checked byte-exact, and one local commit on top of the fetched head, all proved from a fresh mount (GIT_STORE_OK, `smoke-install`), and **push**: a v2 pack of full (non-delta) objects written by `git-pack`'s new encoder from the on-disk store, the v0 `receive-pack` command list + `report-status` exchange against an in-container smart-HTTP mock, the host decoding the captured upload with `git-pack` **and** real `git index-pack --strict`/`cat-file`/`ls-tree -r` (GIT_PUSH_OK, `smoke-install`). Real GitHub push (credentials + TLS) and delta/side-band encoding remain open
 - [x] Shell — serial-console REPL with minimal builtins (ping, resolve, netinfo, …)
 - [x] Keyboard — polled i8042 + set-1 decode feeding the shell's line discipline (QEMU `sendkey` → `KEYBOARD_OK`; MacBook needs UHCI/HID)
-- [x] SSH server (S5) — ed25519 host key + `authorized_keys` read from a FAT16 volume, listener on `:2222`, KEX as responder, encrypted `publickey` auth, one `session` channel with `exec`; `cargo xtask smoke-ssh` proves our client → our server across two QEMUs (`SSHD_OK` + `SSHD_EXEC_OK`). One connection per boot; TOFU only for the harness peer. S4 (git-over-ssh's `git-upload-pack`) and multi-connection accept are still open.
+- [x] SSH server (S5) — ed25519 host key + `authorized_keys` read from a FAT16 volume, listener on `:2222`, KEX as responder, encrypted `publickey` auth, one `session` channel with `exec`; `cargo xtask smoke-ssh` proves our client → our server across two QEMUs (`SSHD_OK` + `SSHD_EXEC_OK`) **and a real Debian OpenSSH client → our server** (`INTEROP_OK` + `SSHD_INTEROP_OK`), which caught and now guards the RFC4252 §7 session-id `string`-framing fix. Up to two sequential connections per boot (VM2's client, then the interop client); TOFU only for the harness peer. S4 (git-over-ssh's `git-upload-pack`) and a concurrent accept loop are still open.
 - [ ] sky2 driver (real hardware only)
 - [ ] git, ssh, browser, AI client + editor
 - [ ] ISO installer + network installer

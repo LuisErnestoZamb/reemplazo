@@ -1422,9 +1422,10 @@ fn publickey_step(
         return false;
     }
 
-    // 2. The signed request: ed25519 over `session_id || request`
-    //    where `request` is the signed form (boolean TRUE) with its
-    //    signature field omitted — RFC4252 §7. Signing the probe
+    // 2. The signed request: ed25519 over `string session_id || request`
+    //    (RFC4252 §7 — the session id is a length-prefixed `string`,
+    //    RFC4251 §5) where `request` is the signed form (boolean TRUE)
+    //    with its signature field omitted. Signing the probe
     //    (boolean FALSE) is *not* what the RFC specifies and no server
     //    accepts it; `userauth_signed_prefix` builds the exact bytes.
     let mut prefix = [0u8; 256];

@@ -549,9 +549,10 @@ impl Stack {
     ///
     /// smoltcp gives a listening socket to exactly one connection at a
     /// time: after the sshd closes it, the socket is `Closed`/`TimeWait`
-    /// and a later `listen_ssh` would need it reset first. The milestone
-    /// therefore serves **one** connection per boot (documented in
-    /// `kernel/src/sshd.rs`).
+    /// and a later `listen_ssh` would need it reset first — which this
+    /// method does (abort anything open, then listen), so
+    /// `serve_once` can accept its next window's client (the
+    /// sequencing is documented in `kernel/src/sshd.rs`).
     pub fn listen_ssh(&mut self, port: u16) -> bool {
         let sock = self.sockets.get_mut::<tcp::Socket>(self.listen_handle);
         if sock.is_open() {
