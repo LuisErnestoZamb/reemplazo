@@ -265,6 +265,20 @@ pub(crate) fn serve_once(stack: &mut Stack, cfg: &ServerConfig) -> bool {
             Err(reason) => {
                 serial_println!("sshd: connection dropped: {reason}");
                 remember_fail(reason);
+                // Close before returning (audit F2): a failed session
+                // must not leave the socket `Established` — the peer
+                // sees the death immediately (RST instead of a silent
+                // hang) and the next accept window cannot mistake the
+                // stale half-dead connection for a fresh client.
+                // `abort` (not `close`): the session died on an error,
+                // there is no data to drain and no orderly FIN worth
+                // waiting for.
+                {
+                    let sock = stack.sockets.get_mut::<tcp::Socket>(handle);
+                    if sock.is_open() {
+                        sock.abort();
+                    }
+                }
                 return served;
             }
         }

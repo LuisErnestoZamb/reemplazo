@@ -2497,6 +2497,15 @@ pub struct ChannelRequest<'a> {
 
 /// Parse a complete `SSH_MSG_CHANNEL_REQUEST` **payload**. An `exec`
 /// request must carry a non-empty command within [`EXEC_COMMAND_MAX`].
+///
+/// Only `exec` has a fully-known grammar here: for **any other type**
+/// the trailing bytes are that request's arguments, which this crate
+/// deliberately does not interpret (RFC4254 §6.5 — the server answers
+/// requests it does not implement with `CHANNEL_FAILURE` when
+/// `want_reply` is set, without reading their arguments). Treating
+/// them as `TrailingGarbage` dropped the connection on a well-formed
+/// `env LANG=…` request — the live-hardware exec failure — so only an
+/// `exec` command's trailing bytes are rejected.
 pub fn parse_channel_request(payload: &[u8]) -> Result<ChannelRequest<'_>, ChannelError> {
     let read = |_: KexError| ChannelError::Truncated;
     let mut r = Reader {
@@ -2521,13 +2530,18 @@ pub fn parse_channel_request(payload: &[u8]) -> Result<ChannelRequest<'_>, Chann
         if clen == 0 || clen > EXEC_COMMAND_MAX {
             return Err(ChannelError::BadCommand);
         }
-        r.take(clen).map_err(read)?
+        let cmd = r.take(clen).map_err(read)?;
+        // `exec` is the one fully-parsed type: bytes after its
+        // command are malformed, not arguments.
+        if r.pos != payload.len() {
+            return Err(ChannelError::TrailingGarbage);
+        }
+        cmd
     } else {
+        // Opaque arguments for every other type: parsed no further,
+        // never acted upon (the caller replies CHANNEL_FAILURE).
         &[]
     };
-    if r.pos != payload.len() {
-        return Err(ChannelError::TrailingGarbage);
-    }
     Ok(ChannelRequest {
         recipient_channel,
         request_type,
@@ -5593,11 +5607,37 @@ mod tests {
         let req = parse_channel_request(&bare).expect("bare break");
         assert_eq!(req.request_type, b"break");
         assert!(req.exec_command.is_empty());
-        // ...with arguments it is TrailingGarbage → sshd drops the
-        // connection instead of CHANNEL_FAILURE (docs/ssh-audit.md).
+        // ...and **with** arguments too: for every type but `exec`
+        // the arguments are opaque (RFC4254 §6.5 — the server replies
+        // CHANNEL_FAILURE without interpreting them). Rejecting them as
+        // TrailingGarbage dropped the connection on the well-formed
+        // `env LANG=…` macOS sends before `exec` — the live-hardware
+        // exec failure, pinned here as the regression test.
         let with_args = chan_req(b"pty-req", 1, Some(b"term"));
+        let req = parse_channel_request(&with_args).expect("pty-req with args");
+        assert_eq!(req.request_type, b"pty-req");
+        assert!(req.exec_command.is_empty());
+        // The exact shape the MacBook's client sends (env + LANG value).
+        let mut env = Vec::new();
+        env.push(SSH_MSG_CHANNEL_REQUEST);
+        env.extend_from_slice(&0u32.to_be_bytes()); // recipient channel
+        env.extend_from_slice(&(3u32).to_be_bytes()); // "env"
+        env.extend_from_slice(b"env");
+        env.push(1); // want_reply
+        env.extend_from_slice(&(4u32).to_be_bytes()); // name length
+        env.extend_from_slice(b"LANG");
+        env.extend_from_slice(&(11u32).to_be_bytes()); // value length
+        env.extend_from_slice(b"en_CA.UTF-8");
+        let req = parse_channel_request(&env).expect("env LANG with value");
+        assert_eq!(req.request_type, b"env");
+        assert!(req.want_reply);
+        assert!(req.exec_command.is_empty());
+        // An `exec` command followed by trailing bytes is still refused
+        // (its grammar is fully known — nothing may follow the command).
+        let mut exec_tail = chan_req(b"exec", 1, Some(b"ls"));
+        exec_tail.push(0);
         assert_eq!(
-            parse_channel_request(&with_args),
+            parse_channel_request(&exec_tail),
             Err(ChannelError::TrailingGarbage)
         );
     }

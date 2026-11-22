@@ -2411,6 +2411,15 @@ fn run_openssh_interop(container: &str, port: &str) -> bool {
 
     let ssh_args = [
         "exec",
+        // The macOS client sends `env LANG=…` before `exec` (its
+        // ssh_config has `SendEnv LANG LC_*`); the container shipped
+        // without LANG, so the env request never happened here and a
+        // server that drops on it (the `TrailingGarbage` bug behind
+        // the live-hardware exec failure) passed QEMU. Setting LANG
+        // makes this harness exercise the same request path as the
+        // real machine.
+        "-e",
+        "LANG=en_US.UTF-8",
         container,
         "ssh",
         "-i",
