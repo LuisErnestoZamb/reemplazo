@@ -179,6 +179,7 @@ fn execute(stack: &mut Stack, line: &str) {
              \x20 ai <message>      chat completion via the mock endpoint\n\
              \x20 ai apply          insert a chat completion into the editor\n\
              \x20 ssh-auth <hex|path>  ssh publickey auth to github.com (S3)\n\
+             \x20 browse <url>      text browser (Tab links, Enter follow, Esc quits)\n\
              \x20 halt              park the CPU"
         ),
         "echo" => serial_println!("{rest}"),
@@ -268,6 +269,9 @@ fn execute(stack: &mut Stack, line: &str) {
         }
         "tui" => crate::apps::tui::run(),
         "edit" => crate::apps::editor::run(),
+        // B4: the interactive browser. Its navigation errors are pages,
+        // never `FATAL` (the fail-closed fetch is only the boot proofs').
+        "browse" => crate::apps::browse::run(stack, rest),
         // A5: `ai apply` is the editor-integration builtin (quote the
         // retained document → mock exchange → insert at its cursor);
         // anything else after `ai` is a chat message, exactly as before.

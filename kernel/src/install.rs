@@ -136,10 +136,12 @@ const PAYLOAD_PATH: &str = "/payload.tar";
 /// payload GET reuses it the same way the `ai` builtin does.
 const PAYLOAD_HANDLE_LOCAL_PORT: u16 = 49163;
 /// Byte bound on the whole download — the `payload.tar` the builder
-/// emits is kernel (≈1.7 MB) + a README ≈ 1.71 MB, so 2 MiB leaves
-/// headroom while keeping a hostile/truncating server from growing
-/// the static. Refused, never truncated.
-const DOWNLOAD_CAP: usize = 2 * 1024 * 1024;
+/// emits is kernel + a README; the kernel has grown past 2 MiB with
+/// the browser/AI/TUI milestones (≈2.06 MB at the time of writing), so
+/// the cap is 4 MiB: still a refusal (never a truncation) for a
+/// hostile or misbehaving server, with headroom for further growth
+/// before this needs revisiting.
+const DOWNLOAD_CAP: usize = 4 * 1024 * 1024;
 /// Per-read staging for `ResponseParser::feed` — the `ai.rs`
 /// `SCRATCH` value (feed requires `body_out ≥ input.len()`).
 const NET_SCRATCH: usize = 1460;

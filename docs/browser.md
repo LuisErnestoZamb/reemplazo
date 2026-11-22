@@ -119,6 +119,15 @@ problem:
 - `User-Agent: reemplazo-browser/0.1`, `Accept: text/html,*/*;q=0.5`.
 - Response body bounded (`READ_CAP`-style) — a hostile server cannot exhaust
   the heap; over-bound = fatal with a clear message.
+- **Two front-ends, one hop loop** (B4): the boot proofs keep the fail-closed
+  `FATAL: browser:` semantics above; the interactive app gets the same errors
+  as `NavError` values it renders as pages, with a 3 s connect bound, an RST
+  close after every hop and a rotating local port (~`49300..49363`), because a
+  browser revisits the same host:port and a graceful close would leave the
+  tuple in TIME-WAIT on both sides. `https` is refused with a page before any
+  socket work: `tls.rs`'s only entry point is fail-closed by design, and a
+  certificate the single pinned root refuses would halt the machine from a
+  user's keystroke (see §8 row B4).
 
 ## 8. Milestone plan
 
@@ -128,7 +137,7 @@ problem:
 | B1 | URL parse/resolve + fetch with redirect loop against real hosts (GET only) | **`BROWSER_FETCH_OK`** (resolve+fetch github.com through ≥1 redirect, print status/final URL) | `url` probe, TLS |
 | B2 | HTML tree builder crate (host tests) + text layout + render in the TUI viewport | **`BROWSER_RENDER_OK`** (landed: `dom` arena tree over the tokenizer, word-wrapped layout rendered in the viewport and read back from `0xb8000` — real page *and* a feature fixture, since today's example.com carries no `<h1>`/`<a>`) | B0, B1 |
 | B3 | CSS subset: parser + cascade + attribute mapping | **`BROWSER_CSS_OK`** (landed: `csscore` parses/selects/cascades — type/class/id/`*`/compound/descendant/comma, specificity + source order + inline + `!important`; `display`, `color`, `background-color`→VGA attribute, `font-weight`→bright bit, `font-style`→dim, `text-decoration` parsed/no-op, `list-style-type`, `width`/`height`, `margin`/`padding` in cells; styled fixture vs unstyled twin asserted on exact attribute bytes/positions from `0xb8000`; real-page sheet applied as an unchecked robustness pass) | B2 |
-| B4 | Navigation polish: history, link jump, status bar, error pages (DNS/refused/timeout → friendly page, never a hang) | **`BROWSER_NAV_OK`** (scripted key sequence follows a link and goes back) | B2 |
+| B4 | Navigation polish: history, link jump, status bar, error pages (DNS/refused/timeout → friendly page, never a hang) | **`BROWSER_NAV_OK`** (landed: the `browse` builtin and the boot proof drive one key path — fixture A rendered, Tab selects and highlights its link, Enter follows it to fixture B through `Url::join`, `b` back / `f` forward with the depths asserted, a new navigation clearing the forward tail, and an unreachable endpoint rendering the error page instead of halting; every frame read back from `0xb8000`, offline) | B2 |
 | later | GUI (A6), images, cookies, HTTP cache, keep-alive, JS stance revisit | separate research | — |
 
 Order rationale: B1 is smoke-testable without the UI and de-risks `url`+redirects
@@ -154,6 +163,61 @@ so the AI-client track (A1→A2→A3) and the browser track interleave cleanly:
 
 ## Appendix: verification log
 
+- 2026-11-22 — **B4 landed** (`BROWSER_NAV_OK`, 30-marker chain, between
+  `BROWSER_CSS_OK` and `SHELL_OK`): the **`browse <url>` builtin**
+  (`kernel/src/apps/browse.rs`) is the interactive browser over B2/B3's
+  render path — one `Page` (laid-out cells + numbered `<a href>` list +
+  title) drawn through a session-owned `Terminal`, with full-redraw
+  frames (`Terminal::clear` resets ratatui's back buffer) because the
+  shell's serial mirror lands in the same text buffer between keys.
+  Keys: arrows/`PgUp`/`PgDn`/`Home`/`End` scroll (clamped), `Tab`/`n`
+  and `p` cycle the link selection (the selected link's inverse cells
+  become black-on-yellow `0x30` and are scrolled into view), `Enter`
+  resolves the selected href against the page URL with `Url::join` and
+  loads it, `b`/`Backspace` back, `f` forward, `Esc` exits (screen
+  self-heals like `tui`/`edit`). History is a fixed **16-slot** stack
+  of parsed `Url`s (`[Option<Url>; 16]`, no growth): a new navigation
+  truncates the forward tail, at the cap the oldest entry is dropped,
+  back/forward **re-fetch** (no cache, §1). The status bar shows the
+  history markers (`<`/`>`), the URL and, while a link is selected, its
+  target. The fetch path was made fallible once
+  (`browser::hop_loop` → `NavError`, `Display` text is fixed ASCII):
+  `fetch` (boot) keeps the pre-B4 `FATAL:` strings and semantics,
+  `navigate` (app) returns the error, so every failure — bad URL, DNS,
+  refused/reset, timeout, HTTP framing, status, body cap, `https` —
+  renders the **error page** "Could not load page" + cause + attempted
+  URL (sanitized) instead of halting. `https` is refused by policy
+  (module docs): `tls::tls_open` is the only entry point and halts on a
+  refused chain, and `tls.rs` is outside B4's change set; the follow-up
+  is a `Result` entry point plus a multi-root store. Two socket
+  deviations, both `FetchPolicy` fields, found in the manual session: the
+  app **RST-closes** after every hop (a graceful close left the tuple in
+  TIME-WAIT on both sides, and the second visit to the same page timed
+  out on the connect — observed, then fixed) and **rotates local ports**
+  (64, `49300..`), so neither our failed hop nor the boot chain's
+  TIME-WAIT can swallow the next SYN. IPv4 literals skip DNS
+  (`net::parse_ipv4`). Proof (offline): two kernel-owned fixtures
+  (`fixture://site/a` ↔ `/b`, relative hrefs, custom scheme resolved in
+  the app) driven through `App::open_url`/`App::key` — the same calls
+  the keys make — asserting titles/bodies/attributes from `0xb8000`,
+  link highlight `0x30` vs unselected `0x70`, the status target, the
+  history depths at every step (1/0/0 → 2/1/0 → back 2/0/1 → forward
+  2/1/0 → new navigation 2/1/0 with the tail cleared), and an
+  unreachable endpoint (`http://10.0.2.2:9/`, slirp's gateway with no
+  service there) rendering the error page with its cause line and URL
+  within the 3 s connect bound (in practice the RST arrives in
+  milliseconds). Manual QEMU session (`cargo xtask run` + HMP
+  `sendkey`, screenshots via `screendump`): `browse http://example.com`
+  rendered the real page (title/paragraph/status); `browse
+  http://10.0.2.2:9/` showed the error page ("Connection failed or
+  timed out", `URL: http://10.0.2.2:9/`); `browse http://info.cern.ch/`
+  rendered the 4-link list, Tab highlighted link 1 with `1/4 … -> URL`
+  in the status bar, Enter fetched TheProject, `PgDn` scrolled, `b`
+  restored the home page (`>` marker), `f` went forward again, `Esc`
+  returned to a working prompt; two consecutive visits to the same page
+  both fetched after the RST/port fix. Out of scope (unchanged): cookies,
+  HTTP cache, keep-alive, forms, JS, images; anchors past `LINK_CAP`
+  (128) render inverse but are not selectable.
 - 2026-11-22 — **B3 landed** (`BROWSER_CSS_OK`, 27-marker chain):
   `csscore` (new workspace crate, exception (a) of §5) — `no_std` +
   `alloc`, zero deps, `forbid(unsafe_code)`, bounded input/rules/

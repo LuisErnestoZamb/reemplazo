@@ -69,6 +69,19 @@
 //!    frame" is machine-checked, not eyeballed. Then the real page is
 //!    rendered once more with its own sheet applied (robustness pass;
 //!    nothing is asserted about wire CSS).
+//!
+//! # B4: the navigation view
+//!
+//! [`Page`] is the render unit the interactive browser
+//! (`apps::browse`) holds: the laid-out lines plus the **numbered link
+//! list** and the title-bar text. Every `<a href>` the layout actually
+//! renders is registered in document order (`apps/browser` assigns the
+//! id at flatten time, so the list and the cells can never disagree);
+//! [`draw`] takes the current selection and the scroll offset — the
+//! selected link's inverse cells become black-on-yellow (`0x30`), the
+//! rest stay inverse (`0x70`). With `sel: None` and `top: 0` the frame
+//! is byte-identical to B2/B3, which is what keeps those proofs the
+//! regression net.
 
 use crate::apps::screen::{self, ScreenError};
 use crate::apps::tui::VgaBackend;
@@ -110,7 +123,14 @@ const HEADING_ATTR: u8 = 0x0F;
 /// Inline `<code>` attribute: dark grey (`fg 8`).
 const CODE_ATTR: u8 = 0x08;
 /// `<a>` link attribute: default colors reversed (`fg 0 | bg 7 << 4`).
-const LINK_ATTR: u8 = 0x70;
+pub(crate) const LINK_ATTR: u8 = 0x70;
+/// The **selected** link's attribute (B4): black on yellow
+/// (`fg 0 | bg 3 << 4`) — inverse like every link, but unmistakable.
+pub(crate) const LINK_SELECTED_ATTR: u8 = 0x30;
+/// Links tracked per page (`apps::browse` navigates the numbered
+/// list). Past the cap an anchor still renders inverse but is not
+/// navigable — bounded memory, documented in docs/browser.md §8.
+pub(crate) const LINK_CAP: usize = 128;
 /// Title shown when the page carries no `<title>`.
 const DEFAULT_TITLE: &str = "reemplazo browser";
 
@@ -201,6 +221,11 @@ struct S {
     /// `font-style: italic` (rendered as the dim half — VGA has no
     /// italics).
     dim: bool,
+    /// Which entry of the page's link list this cell belongs to (B4;
+    /// `Some` only inside an `<a href>` that fits [`LINK_CAP`]). The
+    /// attribute mapping ignores it — it exists so [`draw`] can
+    /// highlight the selected link without a second geometry pass.
+    link: Option<u16>,
 }
 
 impl S {
@@ -211,6 +236,7 @@ impl S {
             bg: None,
             bold: None,
             dim: false,
+            link: None,
         }
     }
 
@@ -231,6 +257,11 @@ impl S {
 
     const fn with_dim(mut self, dim: bool) -> Self {
         self.dim = dim;
+        self
+    }
+
+    const fn with_link(mut self, link: Option<u16>) -> Self {
+        self.link = link;
         self
     }
 }
@@ -356,11 +387,11 @@ fn push_kids(doc: &Document, node: &dom::Node, work: &mut Vec<Cmd>) {
 
 /// The `dom` arena seen through `csscore`'s selector-matching trait
 /// (zero dependencies in `csscore` — the adapter lives here).
-struct Page<'a> {
+struct CssPage<'a> {
     doc: &'a Document,
 }
 
-impl CssTree for Page<'_> {
+impl CssTree for CssPage<'_> {
     fn parent_element(&self, node: usize) -> Option<usize> {
         let parent = self.doc.node(node)?.parent?;
         match self.doc.node(parent)?.kind {
@@ -428,11 +459,17 @@ fn collect_styles(doc: &Document) -> String {
 /// B3 cascade overlay) and list context are saved/restored through
 /// `Leave` commands, skipped subtrees never enter the stream. Heap-only
 /// state, bounded by `dom`'s caps.
-fn flatten(doc: &Document, sheet: &Stylesheet, width: usize) -> Vec<Item> {
+///
+/// Returns the item stream plus the page's **link list** (B4): one
+/// `href` per rendered `<a href>`, in document order, bounded by
+/// [`LINK_CAP`]. `apps::browse` indexes it with the id stored in
+/// [`S::link`], so a selectable link always has cells on screen.
+fn flatten(doc: &Document, sheet: &Stylesheet, width: usize) -> (Vec<Item>, Vec<String>) {
     let mut items: Vec<Item> = Vec::new();
+    let mut links: Vec<String> = Vec::new();
     let mut work: Vec<Cmd> = Vec::new();
     work.push(Cmd::Visit(doc.root()));
-    let page = Page { doc };
+    let page = CssPage { doc };
     let mut style = S::normal();
     // (ordered?, item count, list-style from the ul/ol) per open list.
     let mut lists: Vec<(bool, usize, Option<ListStyle>)> = Vec::new();
@@ -553,7 +590,20 @@ fn flatten(doc: &Document, sheet: &Stylesheet, width: usize) -> Vec<Item> {
                                 }
                             }
                             "code" => child.base = Base::Code,
-                            "a" => child.base = Base::Link,
+                            "a" => {
+                                child.base = Base::Link;
+                                // B4: a navigable link needs a non-empty
+                                // href and a slot in the bounded list; past
+                                // `LINK_CAP` the cells stay inverse but are
+                                // not selectable (documented).
+                                if let Some(href) = e.attr("href").filter(|h| !h.is_empty())
+                                    && links.len() < LINK_CAP
+                                    && let Ok(id) = u16::try_from(links.len())
+                                {
+                                    links.push(href.to_string());
+                                    child = child.with_link(Some(id));
+                                }
+                            }
                             "br" => items.push(Item::Break),
                             "b" | "strong" => child.base = Base::Bold,
                             "p" => {
@@ -587,7 +637,7 @@ fn flatten(doc: &Document, sheet: &Stylesheet, width: usize) -> Vec<Item> {
             }
         }
     }
-    items
+    (items, links)
 }
 
 // ---------------------------------------------------------------------------
@@ -892,12 +942,13 @@ impl LineBuilder {
 }
 
 /// Flatten + line-build: the whole layout pipeline, iterative and
-/// bounded on both ends.
-fn layout(doc: &Document, width: usize, cap: usize) -> Vec<Vec<Cell>> {
+/// bounded on both ends. Returns the lines plus the page's link list
+/// (same order as [`S::link`] ids).
+fn layout(doc: &Document, width: usize, cap: usize) -> (Vec<Vec<Cell>>, Vec<String>) {
     // One parse per render (docs/browser.md §5): every `<style>`
     // subtree's text, then the cascade per element during the walk.
     let sheet = Stylesheet::parse(&collect_styles(doc));
-    let items = flatten(doc, &sheet, width);
+    let (items, links) = flatten(doc, &sheet, width);
     let mut builder = LineBuilder::new(width, cap);
     for item in items {
         match item {
@@ -908,7 +959,7 @@ fn layout(doc: &Document, width: usize, cap: usize) -> Vec<Vec<Cell>> {
             Item::PopWidth => builder.pop_width(),
         }
     }
-    builder.finish()
+    (builder.finish(), links)
 }
 
 // ---------------------------------------------------------------------------
@@ -928,12 +979,16 @@ fn layout(doc: &Document, width: usize, cap: usize) -> Vec<Vec<Cell>> {
 /// | Bold | 7 + bright | 0 | 0x0F |
 /// | Code | 8 | 0 | 0x08 |
 /// | Link (inverse) | 0 | 7 | 0x70 |
+/// | Link, selected (B4) | 0 | 3 | 0x30 |
 ///
 /// CSS adds `color` (fg), `background-color` (bg), `font-weight` (the
 /// bright bit, the only "bold" text mode has) and `font-style: italic`
 /// (the dim half — VGA has no italics). Underline/blink are dropped
-/// (documented in `apps/tui.rs`).
-fn rs(s: S) -> Style {
+/// (documented in `apps/tui.rs`). `selected` is the navigation
+/// highlight: it overrides both halves of the *selected* link's cell
+/// only, so `B2`/`B3`'s frames (`selected == false` everywhere) are
+/// unchanged.
+fn rs(s: S, selected: bool) -> Style {
     let mut fg = match (s.base, s.fg) {
         (_, Some(fg)) => fg,
         (Base::Code, None) | (Base::Heading(3..=6), None) => 0x08,
@@ -952,40 +1007,63 @@ fn rs(s: S) -> Style {
     if matches!(s.base, Base::Link) {
         core::mem::swap(&mut fg, &mut bg);
     }
+    if selected {
+        fg = 0x00;
+        bg = 0x03;
+    }
     Style::new().fg(Color::Indexed(fg)).bg(Color::Indexed(bg))
 }
 
 /// Layout cells → ratatui lines, merging runs of equal style into one
 /// span each (bounded: ≤ width cells per line, ≤ viewport lines).
-fn ratatui_lines(lines: &[Vec<Cell>], width: usize, max: usize) -> Vec<Line<'static>> {
+/// `top` is the scroll offset in layout lines; `sel` the highlighted
+/// link id (`None` = no highlight).
+fn ratatui_lines(
+    lines: &[Vec<Cell>],
+    top: usize,
+    width: usize,
+    max: usize,
+    sel: Option<usize>,
+) -> Vec<Line<'static>> {
     lines
         .iter()
+        .skip(top)
         .take(max)
         .map(|cells| {
             let mut spans: Vec<Span<'static>> = Vec::new();
             let mut run = String::new();
             let mut run_style: Option<S> = None;
+            let mut run_selected = false;
             for cell in cells.iter().take(width) {
-                if run_style != Some(cell.s) {
+                let selected =
+                    matches!((cell.s.link, sel), (Some(id), Some(sel)) if usize::from(id) == sel);
+                if run_style != Some(cell.s) || run_selected != selected {
                     if let Some(prev) = run_style.take() {
-                        spans.push(Span::styled(core::mem::take(&mut run), rs(prev)));
+                        spans.push(Span::styled(
+                            core::mem::take(&mut run),
+                            rs(prev, run_selected),
+                        ));
                     }
                     run_style = Some(cell.s);
+                    run_selected = selected;
                 }
                 run.push(cell.ch);
             }
             if !run.is_empty() {
-                spans.push(Span::styled(run, rs(run_style.unwrap_or(S::normal()))));
+                spans.push(Span::styled(
+                    run,
+                    rs(run_style.unwrap_or(S::normal()), run_selected),
+                ));
             }
             Line::from(spans)
         })
         .collect()
 }
 
-/// One frame: title bar (row 0), viewport (the first `height-2`
-/// layout lines), status bar (last row). Degenerate geometry draws
+/// One frame: title bar (row 0), viewport (the `height-2` layout lines
+/// from `top` down), status bar (last row). Degenerate geometry draws
 /// nothing instead of panicking.
-fn render(frame: &mut Frame, title: &str, status: &str, lines: &[Vec<Cell>]) {
+fn render(frame: &mut Frame, page: &Page, status: &str, sel: Option<usize>, top: usize) {
     let area = frame.area();
     let Some(status_off) = usize::from(area.height).checked_sub(1) else {
         return;
@@ -1010,11 +1088,17 @@ fn render(frame: &mut Frame, title: &str, status: &str, lines: &[Vec<Cell>]) {
         1,
     );
     frame.render_widget(
-        Paragraph::new(title).style(Style::new().fg(Color::Cyan)),
+        Paragraph::new(page.title.as_str()).style(Style::new().fg(Color::Cyan)),
         title_area,
     );
-    let page = Text::from(ratatui_lines(lines, usize::from(area.width), page_h));
-    frame.render_widget(Paragraph::new(page), page_area);
+    let body = Text::from(ratatui_lines(
+        &page.lines,
+        top,
+        usize::from(area.width),
+        page_h,
+        sel,
+    ));
+    frame.render_widget(Paragraph::new(body), page_area);
     frame.render_widget(
         Paragraph::new(status).style(Style::new().fg(Color::White).bg(Color::Blue)),
         status_area,
@@ -1023,8 +1107,9 @@ fn render(frame: &mut Frame, title: &str, status: &str, lines: &[Vec<Cell>]) {
 
 /// Title bar text from wire data: printable ASCII only, truncated to
 /// the viewport width (the same `?`-for-everything-else policy as
-/// `browser::sanitize`, applied per char).
-fn sanitize_display(s: &str, max: usize) -> String {
+/// `browser::sanitize`, applied per char). Shared with the app's status
+/// bar and error pages.
+pub(crate) fn sanitize_display(s: &str, max: usize) -> String {
     let mut out = String::new();
     for c in s.chars().take(max) {
         out.push(if c.is_ascii_graphic() || c == ' ' {
@@ -1036,19 +1121,105 @@ fn sanitize_display(s: &str, max: usize) -> String {
     out
 }
 
-/// Build → layout → draw one page into the viewport. The staged
-/// screen buffer is cleared first, so `flush_diff` overwrites every
-/// cell of the previous frame (or of the mirrored serial log).
-fn draw_page(html: &[u8], status: &str, cols: usize) -> Result<(), &'static str> {
-    let doc = dom::build(html).map_err(|e| e.as_str())?;
-    let lines = layout(&doc, cols, LINE_CAP);
-    let title = sanitize_display(doc.title().as_deref().unwrap_or(DEFAULT_TITLE), cols);
-    screen::clear();
+// ---------------------------------------------------------------------------
+// The page the apps layer draws (B4's unit of navigation)
+// ---------------------------------------------------------------------------
+
+/// One page ready to draw: the laid-out cells, the numbered link list
+/// and the title-bar text. Owned heap state — the `dom` tree is dropped
+/// after layout — rebuilt once per navigation, never per frame.
+pub(crate) struct Page {
+    lines: Vec<Vec<Cell>>,
+    links: Vec<String>,
+    title: String,
+}
+
+impl Page {
+    /// Build the tree, lay it out for a `cols`-wide viewport and keep
+    /// what drawing needs. Every bound is `dom`'s / [`LINE_CAP`]'s;
+    /// the error string is a fixed `FATAL:`-worthy line.
+    pub(crate) fn load(html: &[u8], cols: usize) -> Result<Self, &'static str> {
+        let doc = dom::build(html).map_err(|e| e.as_str())?;
+        let (lines, links) = layout(&doc, cols, LINE_CAP);
+        let title = sanitize_display(doc.title().as_deref().unwrap_or(DEFAULT_TITLE), cols);
+        Ok(Page {
+            lines,
+            links,
+            title,
+        })
+    }
+
+    /// Laid-out line count — the scroll clamp's upper bound.
+    pub(crate) fn line_count(&self) -> usize {
+        self.lines.len()
+    }
+
+    /// Number of navigable links on the page.
+    pub(crate) fn link_count(&self) -> usize {
+        self.links.len()
+    }
+
+    /// The raw `href` of link `i` (as authored — the caller resolves it
+    /// against the page URL through `url`).
+    pub(crate) fn link_target(&self, i: usize) -> Option<&str> {
+        self.links.get(i).map(String::as_str)
+    }
+
+    /// The first layout row holding link `i`'s cells (the app scrolls a
+    /// newly selected link into view). `None` when the layout never
+    /// painted it (e.g. inside `display:none`) — then nothing is
+    /// scrolled.
+    pub(crate) fn link_row(&self, i: usize) -> Option<usize> {
+        let id = u16::try_from(i).ok()?;
+        self.lines
+            .iter()
+            .position(|cells| cells.iter().any(|cell| cell.s.link == Some(id)))
+    }
+}
+
+/// Draw `page` into the viewport from scroll offset `top`, with link
+/// `sel` highlighted. The staged screen buffer is cleared first, so
+/// `flush_diff` overwrites every cell of the previous frame (or of the
+/// mirrored serial log).
+pub(crate) fn draw(
+    page: &Page,
+    status: &str,
+    sel: Option<usize>,
+    top: usize,
+) -> Result<(), &'static str> {
     let mut terminal = Terminal::new(VgaBackend::default()).map_err(|_| "terminal init failed")?;
+    draw_with(&mut terminal, page, status, sel, top)
+}
+
+/// [`draw`] on a caller-owned terminal (the interactive app allocates
+/// ratatui's buffers once per session, not per frame).
+///
+/// Every frame is a **full** redraw: `Terminal::clear` blanks the staged
+/// buffer, flushes it and resets ratatui's back buffer, so the diff in
+/// the following `draw` covers every cell. That is required here because
+/// the shell's serial log mirrors into the same text buffer between
+/// frames (a fetch's `browser:` lines land on the viewport), and because
+/// a reused `Terminal` would otherwise emit only the cells that changed
+/// since the previous page.
+pub(crate) fn draw_with(
+    terminal: &mut Terminal<VgaBackend>,
+    page: &Page,
+    status: &str,
+    sel: Option<usize>,
+    top: usize,
+) -> Result<(), &'static str> {
+    terminal.clear().map_err(|_| "browser frame failed")?;
     terminal
-        .draw(|frame| render(frame, &title, status, &lines))
-        .map_err(|_| "browser frame failed")?;
-    Ok(())
+        .draw(|frame| render(frame, page, status, sel, top))
+        .map(|_| ())
+        .map_err(|_| "browser frame failed")
+}
+
+/// Build → layout → draw one page into the viewport, unscrolled and
+/// with no link selected — the B2/B3 proofs' entry point.
+fn draw_page(html: &[u8], status: &str, cols: usize) -> Result<(), &'static str> {
+    let page = Page::load(html, cols)?;
+    draw(&page, status, None, 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -1366,7 +1537,7 @@ fn prove_css(real: Option<&[u8]>) -> Result<(), &'static str> {
 
 /// First `(x, y)` of the actual text buffer holding `needle` as
 /// consecutive glyph bytes. Bounded by the screen geometry.
-fn locate(needle: &[u8]) -> Option<(usize, usize)> {
+pub(crate) fn locate(needle: &[u8]) -> Option<(usize, usize)> {
     let (cols, rows) = screen::dims()?;
     if needle.is_empty() || needle.len() > cols {
         return None;
@@ -1392,12 +1563,12 @@ fn locate(needle: &[u8]) -> Option<(usize, usize)> {
 }
 
 /// The attribute byte of one cell, or `None` out of range.
-fn attr_at(x: usize, y: usize) -> Option<u8> {
+pub(crate) fn attr_at(x: usize, y: usize) -> Option<u8> {
     crate::vga::peek_cell(x, y).map(|(_, attr)| attr)
 }
 
 /// Do the cells of `needle` starting at `(x, y)` all carry `attr`?
-fn run_holds_attr(x: usize, y: usize, needle: &[u8], attr: u8) -> bool {
+pub(crate) fn run_holds_attr(x: usize, y: usize, needle: &[u8], attr: u8) -> bool {
     needle.iter().enumerate().all(|(i, _)| {
         x.checked_add(i)
             .and_then(|cell| attr_at(cell, y))
@@ -1407,7 +1578,7 @@ fn run_holds_attr(x: usize, y: usize, needle: &[u8], attr: u8) -> bool {
 
 /// Does row `y` of the *actual* text buffer hold `needle` as
 /// consecutive glyph bytes? (The `VGA_OK`/`TUI_OK` readback style.)
-fn row_holds(y: usize, needle: &[u8]) -> bool {
+pub(crate) fn row_holds(y: usize, needle: &[u8]) -> bool {
     let Some((cols, rows)) = screen::dims() else {
         return false;
     };
@@ -1433,18 +1604,18 @@ fn row_holds(y: usize, needle: &[u8]) -> bool {
 }
 
 /// The first row of the *actual* text buffer holding `needle`.
-fn row_with(needle: &[u8]) -> Option<usize> {
+pub(crate) fn row_with(needle: &[u8]) -> Option<usize> {
     let (_, rows) = screen::dims()?;
     (0..rows).find(|&y| row_holds(y, needle))
 }
 
 /// Does any row hold `needle`?
-fn screen_anywhere(needle: &[u8]) -> bool {
+pub(crate) fn screen_anywhere(needle: &[u8]) -> bool {
     row_with(needle).is_some()
 }
 
 /// Does any cell of row `y` of the actual text buffer carry `attr`?
-fn row_holds_attr(y: usize, attr: u8) -> bool {
+pub(crate) fn row_holds_attr(y: usize, attr: u8) -> bool {
     let Some((cols, rows)) = screen::dims() else {
         return false;
     };

@@ -241,6 +241,16 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
         // it costs no network and can sit inside the same `Some(stack)`
         // branch; the screen is cleared after the proof.
         browser::css_smoke(); // BROWSER_CSS_OK
+        // B4 navigation (docs/browser.md §8 row B4): the interactive
+        // browser's own state driven through the keyboard path — two
+        // kernel-owned fixture pages (no network) rendered/followed/back/
+        // forward with the history depths asserted, then an unreachable
+        // endpoint that must render the error page within the bounded
+        // connect deadline (BROWSER_NAV_OK lands between BROWSER_CSS_OK
+        // and SHELL_OK). It needs the stack only for that last,
+        // deliberately-failing connect; the fixtures are offline. The
+        // proof clears the screen afterwards, so the shell starts clean.
+        apps::browse::boot_proof(stack); // BROWSER_NAV_OK
     }
 
     // I2 network installer (docs/installer.md §8.4): fetch

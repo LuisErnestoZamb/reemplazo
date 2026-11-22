@@ -29,6 +29,15 @@ use std::time::{Duration, Instant};
 const TOOLS_IMAGE: &str = "reemplazo-tools";
 /// Boot-phase budget: every serial marker up to `SHELL_OK` must appear
 /// within this. The keyboard phase afterwards has its own deadline
+/// Boot-phase budget for `smoke-install`: everything the plain smoke
+/// does **plus** the two-disk work (full depth-1 git checkout of ~114
+/// files onto FAT16, the I1 install, and the I2 network install
+/// writing a ~2 MiB kernel through single-sector PIO — the
+/// multi-sector DRQ handshake is deliberately never assumed). 30 s
+/// proved too tight the day the kernel crossed 2 MiB; 60 s keeps the
+/// failure mode honest (the guest is still *working*, not hung — every
+/// poll/socket wait has its own bound).
+const INSTALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// ([`KEYBOARD_PHASE_TIMEOUT`]) because it starts only once the shell
 /// is up.
 const SMOKE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -774,7 +783,11 @@ fn run(root: &Path) -> bool {
 /// `background-color` and `font-weight`, the margin/padding cell shift,
 /// `display:none` absence — then the same body without its sheet,
 /// proving the defaults return; the real page's own sheet is applied
-/// as a robustness pass) — within
+/// as a robustness pass), `BROWSER_NAV_OK` (B4 navigation: the
+/// interactive browser's own state driven through the keyboard path —
+/// two kernel-owned fixture pages followed/back/forward with history
+/// depths asserted, and an unreachable endpoint rendering the error
+/// page instead of halting; offline, no internet needed) — within
 /// [`SMOKE_TIMEOUT`]. Then the keyboard milestone:
 /// once `SHELL_OK` matches, connect to QEMU's HMP monitor
 /// ([`monitor_port`]) and type `echo KEYBOARD_OK` key by key with
@@ -804,7 +817,10 @@ fn run(root: &Path) -> bool {
 /// viewport frame read back from `0xb8000`), the B3 CSS subset (sheet
 /// parsing, specificity/source-order/inline cascade, VGA attribute
 /// mapping and the styled-vs-unstyled fixture pair read back from
-/// `0xb8000`), the serial
+/// `0xb8000`), the B4 navigation state (fixture link follow through
+/// `Url::join`, the bounded history's back/forward depths and the
+/// forward-tail rule, the error page rendered for an unreachable
+/// endpoint — all read back from `0xb8000`; offline), the serial
 /// shell coming up, or the keyboard path (i8042 bring-up, scancode
 /// decode, input multiplexing) — so it gates every milestone in the
 /// chain.
@@ -812,7 +828,7 @@ fn run(root: &Path) -> bool {
 /// It runs **without a disk**, so the `ata::probe` that sits between
 /// `PCI_OK` and `E1000_OK` stays silent here.
 fn smoke(root: &Path) -> bool {
-    const MARKERS: [&str; 29] = [
+    const MARKERS: [&str; 30] = [
         "BOOT_OK",
         "VGA_OK",
         "MEM_OK",
@@ -840,13 +856,14 @@ fn smoke(root: &Path) -> bool {
         "AI_EDIT_OK",
         "BROWSER_RENDER_OK",
         "BROWSER_CSS_OK",
+        "BROWSER_NAV_OK",
         "SHELL_OK",
         "KEYBOARD_OK",
     ];
     if !iso(root) {
         return false;
     }
-    boot_assert(root, "smoke", &MARKERS, &[], true)
+    boot_assert(root, "smoke", &MARKERS, SMOKE_TIMEOUT, &[], true)
 }
 
 /// Installer milestones 1 + FS1 + FS2 + **I1** + **I2** (`BLK_OK`,
@@ -909,6 +926,7 @@ fn smoke_install(root: &Path) -> bool {
             "GIT_CHECKOUT_OK",
             "NETINST_OK",
         ],
+        INSTALL_TIMEOUT,
         &disks,
         false,
     ) {
@@ -1252,6 +1270,7 @@ fn boot_assert(
     root: &Path,
     label: &str,
     markers: &[&str],
+    timeout: Duration,
     disks: &[&Path],
     keyboard: bool,
 ) -> bool {
@@ -1314,7 +1333,7 @@ fn boot_assert(
     } else {
         markers.len()
     };
-    let boot_deadline = Instant::now() + SMOKE_TIMEOUT;
+    let boot_deadline = Instant::now() + timeout;
     let boot_ok = wait_for_markers(
         &rx,
         markers,
@@ -1352,7 +1371,7 @@ fn boot_assert(
         let budget = if keyboard && next_marker == markers.len() - 1 {
             format!("within {KEYBOARD_PHASE_TIMEOUT:?} of SHELL_OK")
         } else {
-            format!("within {SMOKE_TIMEOUT:?}")
+            format!("within {timeout:?}")
         };
         eprintln!("{label}: FAIL — missing {missing} {budget}");
         for line in &collected {

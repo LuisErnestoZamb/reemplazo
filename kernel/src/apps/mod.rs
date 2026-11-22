@@ -7,13 +7,15 @@
 //! A1 commit) plus the first full-screen frame. [`editor`] (A2) builds
 //! on both: the gap-buffer text editor rendered through the same
 //! `VgaBackend`, and [`browser`] (B2) renders the fetched page's
-//! layout through it.
+//! layout through it. [`browse`] (B4) is the interactive browser on top
+//! of that view: link list, history, error pages.
 //!
 //! These modules move to userland behind syscalls when that milestone
 //! lands (documented in docs/ai-client.md §1 — deliberate, not an
 //! accident).
 
 pub mod ai;
+pub mod browse;
 pub mod browser;
 pub mod editor;
 pub mod screen;
