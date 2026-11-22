@@ -20,7 +20,7 @@ Estado: **hito 1 completado** (`e53295e`).kernel+apps separados por una frontera
 | Gate | cadena |
 |---|---|
 | `cargo xtask smoke` | 30 markers originales, byte-idénticos — el ISO no lleva módulo `hello` |
-| `cargo xtask smoke-user` | 33 marcadores: `… SHELL_OK, ELF_OK, USER_RUN_OK, SYSCALL_OK, USER_CONSOLE_OK, USER_SHELL_OK, USER_FS_OK, USER_EDITOR_OK, USER_RETURN_OK, SCHED_RR_OK, USER_YIELD_OK, USER_FAULT_OK` |
+| `cargo xtask smoke-user` | 34 marcadores: `… SHELL_OK, ELF_OK, USER_RUN_OK, SYSCALL_OK, USER_CONSOLE_OK, USER_SHELL_OK, USER_FS_OK, USER_EDITOR_OK, USER_RETURN_OK, SCHED_RR_OK, USER_YIELD_OK, USER_FAULT_OK` |
 | `cargo xtask smoke-ssh` | PASS (interop OpenSSH real, intento 1) |
 | `cargo xtask smoke-install` | temporalmente limitado por el presupuesto de 60 s con carga de host >7 (documentado; no es regresión) |
 
@@ -33,7 +33,7 @@ Estado: **hito 1 completado** (`e53295e`).kernel+apps separados por una frontera
 | 3 · consola de usuario | ✅ (mergeado) | syscalls 4–9 (`Read`, `VgaDims/PutCell/Clear/Flush/Peek`), `vgaservice.rs` con diff contra `0xb8000`, proceso `user/shell` con REPL; deuda: publicar `owns_console` desde el PCB |
 | 4 · FS | ✅ (mergeado) | syscalls 10–15, fds opacos por PID, volumen RAM acotado, `user/edit` con readback byte-exacto; deuda: volumen FAT-backed real, `Seek`, persistencia |
 | 5 · red/TLS | 📋 | handles opacos para `netstack`/`tls`, estados `Blocked`, migrar AI y browser |
-| 6 · git/ssh/instalador | 📋 | `Spawn/Waitpid`, IPC acotado, ELFs de usuario en p2 y `GRUB_EARLY_CFG` |
+| 6 · git/ssh/instalador | ✅ (mergeado) | syscalls 22–27 (`Spawn/Waitpid/Kill/IpcSend/Recv/Close`), `user/git` con hijo real + readback byte-exacto; deuda: `/GIT.ELF` usa el slot único del módulo `hello`, falta segundo módulo/p2 FAT-backed; migrar ABI a `userlib` |
 | 7 · corte total | 📋 | migrar apps interactivas a userland; **conservar los boot proofs** (`apps::{tui,editor,ai,browse}::boot_proof` en `main.rs`, productores de la cadena de 30) o convertirlos en módulos `#[cfg]`; `shell::run` solo fallback; `USER_ONLY_OK` |
 
 ## Deuda y decisiones

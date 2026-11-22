@@ -47,7 +47,7 @@ const QUANTUM_TICKS: u32 = 10;
 /// 64-bit TSS descriptor in the GDT. m-privilege installs GDT6; before that
 /// lands, `tss_rsp0_addr` returns `None` and the RSP0 write is skipped
 /// (documented deviation, no effect on the milestone-1 proof).
-const TSS_GDT_INDEX: usize = 6;
+const TSS_GDT_INDEX: usize = 5; // 0x28 / 8 = 5 (GDT6+TSS has 7 slots)
 /// `RSP0` sits at byte offset 4 in the 64-bit TSS.
 const TSS_RSP0_OFFSET: u64 = 4;
 
@@ -219,14 +219,19 @@ fn tss_rsp0_addr() -> Option<u64> {
     // SAFETY: the GDT is in the kernel's identity map for the whole boot;
     // a 16-byte system descriptor is aligned there and readable.
     let raw = unsafe { core::ptr::read_unaligned(desc_addr as *const [u8; 16]) };
-    let access = raw[6];
-    if access & 0x1f != 0x09 || access & 0x80 == 0 {
-        return None; // not a present available 64-bit TSS yet
+    // Byte 5 of the 16-byte TSS descriptor is its access byte (0x8b
+    // after `ltr`: present + busy); byte 6 is the limit/flags nibble
+    // (0x00). With raw[6] the mask yields 0, tss_rsp0_addr returns
+    // None and TSS.RSP0 is never updated on a switch — a child's
+    // int 0x80 then overwrites the parent's saved resume frame.
+    let access = raw[5];
+    if !matches!(access & 0x0f, 0x09 | 0x0b) || access & 0x80 == 0 {
+        return None;
     }
     let base = u64::from(raw[2])
         | (u64::from(raw[3]) << 8)
         | (u64::from(raw[4]) << 16)
-        | (u64::from(raw[5]) << 24)
+        | (u64::from(raw[7]) << 24)
         | (u64::from(raw[8]) << 32)
         | (u64::from(raw[9]) << 40)
         | (u64::from(raw[10]) << 48)
