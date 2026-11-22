@@ -988,6 +988,97 @@ because everything here runs only when someone types it.
   already-installed disk is refused: the marker is gone with LBA0 = `boot.img`, by
   design), a target-size/`disks` selection menu, and the §6.2 HTTPS payload fetch.
 
+### 8.8 I2b landed (code only) — the real HTTPS source, opt-in
+
+The real-network fetch is implemented as a **separate fallible entry
+point**, `install::netprove_https`, not as a change to `netprove`. The
+mock `10.0.2.2:8080` path, its `NETINST_OK` marker and every smoke chain
+are untouched; this code is never called by the boot chain today.
+
+- **Endpoint chosen: the contents API raw route**
+  `https://api.github.com/repos/LuisErnestoZamb/reemplazo/contents/payload.tar?ref=main`
+  with `User-Agent: reemplazo-netinstall/0.1`,
+  `Accept: application/vnd.github.raw` and
+  `X-GitHub-Api-Version: 2022-11-28` — **no credentials**. This is §6.2
+  v1 and is the only GitHub route compatible with the single pinned
+  `USERTrust ECC` root: verified live on 2026-11-22 that
+  `api.github.com` chains Sectigo DV E36 → Sectigo Root E46 → USERTrust
+  ECC, that the raw contents request answers `200` with
+  `Content-Type: application/vnd.github.raw`, `Content-Length` and
+  **zero redirects**. `?ref=main` is required (without it the API
+  answers 404 for this repo). `payload.tar` is not published there yet,
+  so the request currently returns 404 — publishing the artifact is a
+  prerequisite, not a code change.
+- **Why not `releases/latest` → `browser_download_url` as the primary
+  route.** That JSON branch is implemented too, but the asset URL it
+  yields (`https://github.com/<o>/<r>/releases/download/<tag>/…`) 302s
+  to `release-assets.githubusercontent.com`, whose leaf chains Let's
+  Encrypt `YR1` → ISRG Root `YR` → **ISRG Root X1** — verified live
+  2026-11-22 with `curl -I` and `openssl s_client`. Our verifier pins
+  exactly one anchor, so that host is refused **by name** before any
+  connection is opened; a second-root verifier is a separate milestone
+  (§6.2 option 1, §9 item 2). The JSON path is still useful today as a
+  fail-closed diagnostic: it reports a clear error instead of silently
+  downloading from an unauthenticated host.
+- **URL/JSON/tar validation (all fail-closed, all bounded).** The
+  starting URL must parse as absolute `https` on port 443 with no
+  userinfo/fragment and on `api.github.com`, with a
+  `/repos/<owner>/<repo>/{contents/…|releases/latest}` path (owner/repo
+  charset-checked). Every hop — including `Location` targets, resolved
+  with `Url::join` (relative redirects included) — is re-checked against
+  the host allowlist `api.github.com`, `github.com`,
+  `objects.githubusercontent.com`, with at most two redirects and no
+  https→http downgrade; `release-assets.githubusercontent.com` has a
+  dedicated refusal message. The metadata body is capped at 128 KiB and
+  scanned by a small strict JSON reader (string-length, number, escape
+  and nesting caps; whole document validated before the URL is
+  returned; unknown fields skipped structurally). The tar goes through
+  the **same** bounded `DOWNLOAD` static and `parse_tar` as the mock —
+  note the code's current cap is **4 MiB**, not the 2 MiB the I2 prose
+  quoted, because the kernel image outgrew 2 MiB (§8.4 already raised
+  it). Oversize, bad status, missing `Content-Length`/early EOF and bad
+  ustar headers are all refusals, never truncations.
+- **Failure policy / target safety.** Capacity + GRUB-module pre-flight
+  run first; then all network, DNS, TLS, JSON and tar work; only then
+  does `install_payload` write. A DNS failure, 404, rate limit, bad
+  JSON, disallowed host or malformed tar returns `Err(<clear message>)`
+  with **zero disk writes**, so the mock remains the CI gate and an
+  offline/rate-limited field install cannot destroy the target. A disk
+  failure after the copy still `FATAL:` + halts, exactly like I1/I2.
+- **Integrator lines (outside this worktree's scope, intentionally not
+  edited here):**
+  - `kernel/src/shell.rs:593`: replace
+    `install::netinstall_run(stack, &entry.disk, payloads)` with
+    `install::netprove_https(stack, Some(&entry.disk), payloads, install::NETINSTALL_REAL_URL)`
+    to make `netinstall <dev> yes` use the real source (keep the mock
+    call as the fallback branch if both are wanted).
+  - `kernel/src/main.rs:414` (hardware bring-up opt-in only): replace
+    `crate::install::netprove(stack, Some(target), &payloads);` with
+    `let _ = crate::install::netprove_https(stack, Some(target), &payloads, crate::install::NETINSTALL_REAL_URL);`
+    — this deliberately prints no smoke marker and leaves the 30/32
+    marker chains alone.
+- **Host preflight command.** `cargo xtask smoke-netinstall-real`
+  performs the exact GET with the exact headers from the host and
+  requires `200` + raw media type + zero redirects; it does **not**
+  boot QEMU, touch a mock or change a marker. Its 404 today is the
+  expected "publish `payload.tar` first" signal.
+- **Verified here:** `cargo xtask check` exit 0; `cargo xtask smoke` PASS
+  with all 30 markers unchanged; `cargo xtask smoke-install` PASS —
+  `BLK_OK … NETINST_OK` + host verify + standalone disk boot (it needed
+  one retry: the fixed 60 s budget is wall-clock tight on this host, and
+  unmodified `3bdd90d` failed at `NETINST_OK` on a separate run, so this
+  is pre-existing timing flakiness, not a new-path regression — the new
+  code is not called by any smoke). The host preflight correctly reports
+  the expected 404 while `payload.tar` is unpublished; the JSON scanner
+  was exercised in a temporary host harness
+  against a realistic release body plus malformed/truncated/trailing-
+  comma/nesting cases; the endpoint shape and certificate chains were
+  probed with host `curl`/`openssl`. **NOT verified:** no real-hardware
+  run and no kernel-side TLS fetch from the MacBook (sky2 + DHCP + DNS
+  on the real LAN) happened in this worktree — the end-to-end real
+  download remains for the hardware cycle after the URL is wired in and
+  the artifact published.
+
 ---
 
 ## 9. Open questions / risks

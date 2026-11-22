@@ -92,28 +92,62 @@
 //!   boot proofs stay automatic while a *manual* wipe always needs a
 //!   marked disk (AGENTS.md).
 //!
+//! ## I2b: the real HTTPS source (opt-in, docs/installer.md §8.8)
+//!
+//! [`netprove_https`] is a **separate, fallible** entry point for real
+//! hardware: same DNS → TCP → TLS 1.3 (pinned USERTrust ECC root) →
+//! HTTP → ustar → [`install_payload`] chain as the mock, but the
+//! payload comes from GitHub over our own stack. It is *not* called by
+//! the boot chain — `netprove` (the mock, `NETINST_OK`) stays the CI
+//! gate and every marker chain is untouched. Every network/JSON/tar
+//! check happens **before** the first disk write: a failed fetch
+//! returns an `Err` and the target is untouched.
+//!
+//! Two source shapes are accepted (both on `api.github.com`, with a
+//! `User-Agent` and no credentials):
+//!
+//! - `…/contents/payload.tar?ref=main` with
+//!   `Accept: application/vnd.github.raw` — the **primary** route: one
+//!   200 response with `Content-Length`, no redirect, chain ends at the
+//!   pinned root (verified live, §8.8);
+//! - `…/releases/latest` — the JSON route: a bounded, fail-closed
+//!   scan finds the `payload.tar` asset and its `browser_download_url`,
+//!   which is validated against a host allowlist before any request.
+//!   Release *assets* redirect to
+//!   `release-assets.githubusercontent.com` (Let's Encrypt → ISRG Root
+//!   X1), so the pinned-root verifier refuses them; the allowlist
+//!   rejects that host up front with a clear error instead of silently
+//!   connecting somewhere we cannot authenticate.
+//!
 //! ## What these milestones deliberately do *not* do (later work)
 //!
-//! - **No HTTPS payload fetch** (TLS against a local server is
-//!   impossible — §7.2; the real `api.github.com` fetch is a later
-//!   milestone), no AHCI *install* write path yet (the driver exists
-//!   and probes + reads; the smoke's install runs on the IDE disk —
-//!   `AHCI_OK` is the additive proof), no `/boot/grub/grub.cfg` on p2
-//!   (I1b embeds a tiny early config in `core.img` instead, §8.6), no
-//!   GRUB modules beyond the tested boot-critical set, and no
-//!   interactive menu (timeout 0 semantics: boot the only entry).
+//! - **No automatic real-HTTPS invocation** (the shell/hardware
+//!   integrator must opt in — §8.8 gives the exact line), no AHCI
+//!   *install* write path yet (the driver exists and probes + reads;
+//!   the smoke's install runs on the IDE disk — `AHCI_OK` is the
+//!   additive proof), no `/boot/grub/grub.cfg` on p2 (I1b embeds a tiny
+//!   early config in `core.img` instead, §8.6), no GRUB modules beyond
+//!   the tested boot-critical set, no interactive menu (timeout 0
+//!   semantics: boot the only entry), and no second TLS root (which is
+//!   what release-asset downloads would need).
 
 use crate::ata;
 use crate::clock;
 use crate::fs::{BlockDisk, stamp};
 use crate::netstack::{OP_DEADLINE_MS, Stack};
+use crate::tls::{self, Stream as TlsStream};
+use alloc::string::String;
 use core::ptr::{addr_of, addr_of_mut};
+use embedded_io::Write;
+use embedded_tls::TlsError;
+use embedded_tls::blocking::{Aes128GcmSha256, TlsConnection};
 use gptwire::{Guid, Partition, TYPE_BASIC_DATA, TYPE_BIOS_GRUB};
 use multiboot2::BootInformation;
 use net::http::{self, ResponseParser};
 use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp;
 use smoltcp::wire::Ipv4Address;
+use url::Url;
 
 /// p1 starts at 1 MiB and spans 1 MiB — docs/installer.md §3.2's
 /// `bios_grub` row (1 MiB holds `core.img` ≈172 KB with margin; the
@@ -388,6 +422,54 @@ static mut NET_PARSER: ResponseParser = ResponseParser::new();
 static mut NET_STAGING: [u8; NET_SCRATCH] = [0; NET_SCRATCH];
 /// Serialized GET request.
 static mut NET_REQ: [u8; 256] = [0; 256];
+
+// --- I2b: real HTTPS source (opt-in; docs/installer.md §8.8) --------------
+
+/// The real payload URL the hardware/shell integrator should pass to
+/// [`netprove_https`]: GitHub's *contents* API with the raw media type
+/// (§6.2 v1). Verified live 2026-11-22: `200`,
+/// `Content-Type: application/vnd.github.raw`, `Content-Length` set and
+/// **no redirect** — the only shape whose chain terminates at our
+/// single pinned USERTrust ECC root. `?ref=main` is required: without
+/// it the API answers 404 for this repository (verified live).
+///
+/// A `payload.tar` file must actually be published at that path before
+/// a real fetch can succeed; until then the function returns a clear
+/// `HTTP 404` error and touches no disk.
+// Opt-in path: the shell/hardware integrator passes this URL (docs §8.8).
+#[allow(dead_code)]
+pub const NETINSTALL_REAL_URL: &str =
+    "https://api.github.com/repos/LuisErnestoZamb/reemplazo/contents/payload.tar?ref=main";
+/// The only host allowed to *start* a real install (metadata or raw).
+const GITHUB_API_HOST: &str = "api.github.com";
+/// Asset name looked up in `releases/latest`.
+const RELEASE_ASSET_NAME: &str = "payload.tar";
+/// Fixed request headers: no credentials, ever (§8.8).
+const USER_AGENT: &str = "User-Agent: reemplazo-netinstall/0.1";
+const ACCEPT_JSON: &str = "Accept: application/vnd.github+json";
+const ACCEPT_RAW: &str = "Accept: application/vnd.github.raw";
+const API_VERSION: &str = "X-GitHub-Api-Version: 2022-11-28";
+/// Bound on the release-metadata JSON body. A bigger response is
+/// refused, never truncated (the asset list in this repo is tiny).
+const JSON_CAP: usize = 128 * 1024;
+/// Bounds for the bounded JSON scanner and the HTTPS exchange statics.
+const JSON_KEY_CAP: usize = 64;
+const JSON_NAME_CAP: usize = 128;
+const JSON_URL_CAP: usize = 512;
+const JSON_DEPTH_CAP: u8 = 32;
+const HTTPS_REQ_CAP: usize = 1024;
+const HTTPS_LOC_CAP: usize = 512;
+const MAX_HTTPS_HOPS: usize = 3; // first request + at most two redirects
+
+/// Single-use statics for the real-HTTPS path (the `tls.rs`/`ai.rs`
+/// `READ_STORAGE` idiom): written only by [`netprove_https`], on the
+/// single core, sequentially; the PIT handler never touches them.
+static mut JSON_BUF: [u8; JSON_CAP] = [0; JSON_CAP];
+static mut ASSET_URL: [u8; JSON_URL_CAP] = [0; JSON_URL_CAP];
+static mut HTTPS_PARSER: ResponseParser = ResponseParser::new();
+static mut HTTPS_STAGING: [u8; NET_SCRATCH] = [0; NET_SCRATCH];
+static mut HTTPS_REQ: [u8; HTTPS_REQ_CAP] = [0; HTTPS_REQ_CAP];
+static mut HTTPS_LOC: [u8; HTTPS_LOC_CAP] = [0; HTTPS_LOC_CAP];
 
 /// One payload file: `name` is the archive's bare file name (no
 /// leading `/` — [`qualify`] validates and prefixes it), `data` the
@@ -1487,4 +1569,719 @@ fn fatal(e: impl core::fmt::Debug) -> ! {
 fn fatal_msg(msg: &str) -> ! {
     serial_println!("FATAL: install: {}", msg);
     crate::halt()
+}
+
+// ---------------------------------------------------------------------------
+// I2b: the real HTTPS source (docs/installer.md §8.8)
+// ---------------------------------------------------------------------------
+
+/// Which GitHub endpoint the caller asked for: a raw payload download,
+/// or release metadata whose `payload.tar` asset URL must be resolved
+/// first. Both start on [`GITHUB_API_HOST`] (the only chain our single
+/// pinned root verifies), and both end in the same bounded tar path.
+#[derive(Debug, Clone, Copy)]
+// Opt-in path: the shell/hardware integrator wires this in (docs §8.8).
+#[allow(dead_code)]
+enum RealSource {
+    Raw,
+    ReleaseMetadata,
+}
+
+/// A validated, owned request target. Owned because a redirect chain
+/// produces new hosts/paths while the previous `Url` is being dropped.
+#[derive(Debug, Clone)]
+// Opt-in path: the shell/hardware integrator wires this in (docs §8.8).
+#[allow(dead_code)]
+struct Endpoint {
+    /// Allowlisted hostname, also used as SNI and `Host` header.
+    host: String,
+    /// Absolute path plus optional query (no fragment, no credentials).
+    target: String,
+}
+
+/// Hosts we may talk to on the real path. `api.github.com` terminates at
+/// the pinned USERTrust ECC root (verified live); `github.com` is needed
+/// only to *detect* the release-asset redirect and refuse it by name;
+/// `objects.githubusercontent.com` is allowed for a future host whose
+/// chain the pinned verifier accepts. Never an arbitrary `Location`.
+// Opt-in path: the shell/hardware integrator wires this in (docs §8.8).
+#[allow(dead_code)]
+fn host_allowed(host: &str) -> bool {
+    matches!(
+        host,
+        GITHUB_API_HOST | "github.com" | "objects.githubusercontent.com"
+    )
+}
+
+/// Host check with a dedicated, actionable message for the one host a
+/// GitHub release asset always redirects to. Its chain ends at ISRG Root
+/// X1, which our single-anchor verifier refuses (docs §1.3/§6.2) —
+/// a second root is a separate milestone, so we refuse *before* opening
+/// a connection we know cannot authenticate.
+// Opt-in path: the shell/hardware integrator wires this in (docs §8.8).
+#[allow(dead_code)]
+fn check_host(host: &str) -> Result<(), String> {
+    if host_allowed(host) {
+        return Ok(());
+    }
+    if host == "release-assets.githubusercontent.com" {
+        return Err(String::from(
+            "release assets redirect to release-assets.githubusercontent.com, \
+             whose ISRG Root X1 chain the pinned verifier rejects — publish \
+             payload.tar in the repo and use the contents endpoint",
+        ));
+    }
+    Err(String::from("host is not on the HTTPS allowlist"))
+}
+
+/// Validate a `Url` and turn it into a request target. Every check is
+/// fail-closed: https only, port 443 only, allowlisted host only, no
+/// userinfo, no fragment, printable ASCII target within the static
+/// request buffer.
+// Opt-in path: the shell/hardware integrator wires this in (docs §8.8).
+#[allow(dead_code)]
+fn endpoint_of(url: &Url) -> Result<Endpoint, String> {
+    if url.scheme() != "https" {
+        return Err(String::from("only https is allowed for the real source"));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(String::from("credentials in the payload URL are refused"));
+    }
+    if url.fragment().is_some() {
+        return Err(String::from("URL fragments are refused"));
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| String::from("URL has no host"))?;
+    check_host(host)?;
+    if url.port_or_known_default() != Some(443) {
+        return Err(String::from("only https port 443 is allowed"));
+    }
+    let mut target = String::from(url.path());
+    if let Some(query) = url.query() {
+        target.push('?');
+        target.push_str(query);
+    }
+    if target.is_empty()
+        || target.len() > 512
+        || !target.is_ascii()
+        || target.bytes().any(|b| !(0x21..=0x7E).contains(&b))
+    {
+        return Err(String::from("request target is malformed or too long"));
+    }
+    Ok(Endpoint {
+        host: String::from(host),
+        target,
+    })
+}
+
+/// Classify the caller's URL and reject anything outside the two
+/// documented GitHub shapes. The `?ref=` on the contents URL is left in
+/// the request target verbatim (validated by [`endpoint_of`]).
+// Opt-in path: the shell/hardware integrator wires this in (docs §8.8).
+#[allow(dead_code)]
+fn classify_source(url: &str) -> Result<(RealSource, Endpoint), String> {
+    let parsed = Url::parse(url).map_err(|_| String::from("invalid payload URL"))?;
+    if parsed.host_str() != Some(GITHUB_API_HOST) {
+        return Err(String::from(
+            "a real install must start on the GitHub API host",
+        ));
+    }
+    let endpoint = endpoint_of(&parsed)?;
+    let segments: alloc::vec::Vec<&str> = parsed
+        .path_segments()
+        .ok_or_else(|| String::from("payload URL has no path"))?
+        .collect();
+    if segments.len() != 5
+        || segments[0] != "repos"
+        || !valid_repo_part(segments[1])
+        || !valid_repo_part(segments[2])
+    {
+        return Err(String::from(
+            "expected /repos/<owner>/<repo>/contents/<file> or /releases/latest",
+        ));
+    }
+    let source = match (segments[3], segments[4]) {
+        ("contents", _) => RealSource::Raw,
+        ("releases", "latest") => RealSource::ReleaseMetadata,
+        _ => {
+            return Err(String::from(
+                "unsupported GitHub source path (contents or releases/latest only)",
+            ));
+        }
+    };
+    Ok((source, endpoint))
+}
+
+/// GitHub owner/repo path component: 1..=100 visible ASCII characters,
+/// at least one alphanumeric (so `..` can never be a component).
+// Opt-in path: the shell/hardware integrator wires this in (docs §8.8).
+#[allow(dead_code)]
+fn valid_repo_part(part: &str) -> bool {
+    !part.is_empty()
+        && part.len() <= 100
+        && part
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        && part.bytes().any(|b| b.is_ascii_alphanumeric())
+}
+
+/// Socket/local-port pairs for the initial request and up to two
+/// redirects. Each connection gets a fresh socket because smoltcp keeps
+/// a closed TCP tuple in TIME-WAIT for ten seconds (the same reason the
+/// boot chain owns one socket per exchange).
+// Opt-in path: the shell/hardware integrator wires this in (docs §8.8).
+#[allow(dead_code)]
+fn hop_for(stack: &Stack, hop: usize) -> Result<(SocketHandle, u16), String> {
+    match hop {
+        0 => Ok((stack.tcp7_handle, 49168)),
+        1 => Ok((stack.tcp8_handle, 49169)),
+        2 => Ok((stack.tcp9_handle, 49170)),
+        _ => Err(String::from("HTTPS redirect cap exceeded")),
+    }
+}
+
+/// One complete HTTPS exchange over an already-open `tls_open_soft`
+/// connection: send the serialized GET, frame the response, store a
+/// **200** body in `sink` (bounded by `cap`, never truncated), copy a
+/// `Location` value for the caller's allowlist check, and close
+/// best-effort. A non-200 body is counted but discarded — metadata
+/// errors and redirect pages must never become a payload.
+// Opt-in path: the shell/hardware integrator wires this in (docs §8.8).
+#[allow(dead_code)]
+fn tls_exchange(
+    tls: TlsConnection<'_, TlsStream<'_>, Aes128GcmSha256>,
+    request: &[u8],
+    sink: &mut [u8],
+    cap: usize,
+) -> Result<(u16, usize, usize), &'static str> {
+    let mut tls = tls;
+    if tls.write_all(request).is_err() {
+        return Err("TLS write failed");
+    }
+    if tls.flush().is_err() {
+        return Err("TLS flush failed");
+    }
+
+    // SAFETY: single-use statics (module note). Reset first — one
+    // parser serves every sequential exchange on this path.
+    let parser = unsafe { &mut *addr_of_mut!(HTTPS_PARSER) };
+    parser.reset();
+    let staging = unsafe { &mut *addr_of_mut!(HTTPS_STAGING) };
+    let loc = unsafe { &mut *addr_of_mut!(HTTPS_LOC) };
+    let mut scratch = [0u8; NET_SCRATCH];
+    let mut status = 0u16;
+    let mut head = false;
+    let mut stored = 0usize;
+    let mut loc_len = 0usize;
+    loop {
+        match tls.read(&mut scratch) {
+            Ok(0) => {
+                if parser.eof().is_err() {
+                    return Err("truncated HTTPS response");
+                }
+                break;
+            }
+            Ok(n) => {
+                let progress = parser
+                    .feed(&scratch[..n], staging)
+                    .map_err(|_| "HTTPS response refused")?;
+                if !head && let Some(s) = parser.status() {
+                    head = true;
+                    status = s; // parsed u16 — safe to log, never raw wire text
+                    if let Some(value) = http::header_value(parser.head(), b"location") {
+                        loc_len = loc.len().min(value.len());
+                        loc[..loc_len].copy_from_slice(&value[..loc_len]);
+                    }
+                }
+                if status == 200 && progress.body > 0 {
+                    let Some(next) = stored.checked_add(progress.body) else {
+                        return Err("response body exceeds the byte bound");
+                    };
+                    if next > cap || progress.body > sink.len().saturating_sub(stored) {
+                        return Err("response body exceeds the byte bound");
+                    }
+                    sink[stored..next].copy_from_slice(&staging[..progress.body]);
+                    stored = next;
+                }
+                if progress.complete {
+                    break;
+                }
+            }
+            Err(TlsError::ConnectionClosed) => {
+                // Authenticated shutdown doubles as EOF: a framed body
+                // ending here was truncated, never "close enough".
+                if parser.eof().is_err() {
+                    return Err("truncated HTTPS response");
+                }
+                break;
+            }
+            Err(_) => return Err("TLS read failed"),
+        }
+    }
+    if !head {
+        return Err("HTTPS response head never parsed");
+    }
+    // close_notify is best-effort; the next `tls_open_soft` aborts any
+    // socket still open on this handle (no TIME-WAIT reuse hazard).
+    let _ = tls.close();
+    Ok((status, stored, loc_len))
+}
+
+/// GET `endpoint` over DNS → TLS 1.3 (pinned root) → HTTP, with at most
+/// two redirects. Every hop is re-validated against the host allowlist
+/// before DNS, and an https→http downgrade is refused. Returns the
+/// final status and the number of body bytes stored in `sink`.
+// Opt-in path: the shell/hardware integrator wires this in (docs §8.8).
+#[allow(dead_code)]
+fn https_get(
+    stack: &mut Stack,
+    start: Endpoint,
+    headers: &[&str],
+    sink: &mut [u8],
+    cap: usize,
+) -> Result<(u16, usize), String> {
+    let mut endpoint = start;
+    for hop in 0..MAX_HTTPS_HOPS {
+        let ip = match stack.resolve(&endpoint.host) {
+            Some(ip) => ip,
+            None => return Err(String::from("DNS failed for the payload host")),
+        };
+        let (handle, port) = hop_for(stack, hop)?;
+        // SAFETY: single-use static; the request is consumed before the
+        // next hop rebuilds it.
+        let req = unsafe { &mut *addr_of_mut!(HTTPS_REQ) };
+        let req_len = http::build_request(req, &endpoint.host, &endpoint.target, headers)
+            .ok_or_else(|| String::from("HTTPS request does not fit the buffer"))?;
+        let (status, total, loc_len) = {
+            let tls = tls::tls_open_soft(stack, handle, ip, &endpoint.host, port)?;
+            // SAFETY: the mutable borrow above ended; immutable read of
+            // the serialized request while the TLS exchange runs.
+            let req = unsafe { &*addr_of!(HTTPS_REQ) };
+            tls_exchange(tls, &req[..req_len], sink, cap).map_err(String::from)?
+        };
+        if status == 200 {
+            return Ok((status, total));
+        }
+        if !(300..400).contains(&status) {
+            return Err(String::from(
+                "payload source returned an unexpected HTTP status",
+            ));
+        }
+        if hop + 1 == MAX_HTTPS_HOPS {
+            return Err(String::from("HTTPS redirect cap exceeded"));
+        }
+        if loc_len == 0 {
+            return Err(String::from("redirect without a Location header"));
+        }
+        // SAFETY: single-use static, written by this exchange only.
+        let raw = unsafe { &HTTPS_LOC[..loc_len] };
+        // The release-asset host is rejected by name *before* URL
+        // joining, even when its signed Location is longer than our
+        // 512-byte cap (and would otherwise look merely malformed).
+        if raw.starts_with(b"https://release-assets.githubusercontent.com/") {
+            return Err(String::from(
+                "release assets redirect to release-assets.githubusercontent.com, \
+                 whose ISRG Root X1 chain the pinned verifier rejects — publish \
+                 payload.tar in the repo and use the contents endpoint",
+            ));
+        }
+        let reference = core::str::from_utf8(raw)
+            .map_err(|_| String::from("redirect Location is not valid UTF-8"))?;
+        let parsed = match Url::parse(reference) {
+            Ok(url) => url,
+            Err(_) => {
+                // A relative Location needs an absolute base; build it
+                // from the already-validated endpoint (no wire text).
+                let base = alloc::format!("https://{}{}", endpoint.host, endpoint.target);
+                let base =
+                    Url::parse(&base).map_err(|_| String::from("malformed redirect base"))?;
+                base.join(reference)
+                    .map_err(|_| String::from("malformed redirect Location"))?
+            }
+        };
+        endpoint = endpoint_of(&parsed)?;
+    }
+    Err(String::from("HTTPS redirect cap exceeded"))
+}
+
+/// Minimal, bounded JSON scanner for the one field we need from
+/// `/releases/latest`: the `browser_download_url` of the asset named
+/// `payload.tar`. Input is already capped by [`JSON_CAP`]; every string,
+/// nesting level and number is checked, unknown fields are skipped
+/// structurally (never with a substring search), and malformed/truncated
+/// input is an `Err`. Unlike `aiwire`'s typed `serde_json` responses this
+/// is a three-field reader, kept here because adding dependencies or
+/// editing that crate is outside this milestone's surface.
+// Opt-in path: the shell/hardware integrator wires this in (docs §8.8).
+#[allow(dead_code)]
+struct Json<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+// Opt-in path: the shell/hardware integrator wires this in (docs §8.8).
+#[allow(dead_code)]
+impl<'a> Json<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Json { bytes, pos: 0 }
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.pos).copied()
+    }
+
+    fn take(&mut self) -> Option<u8> {
+        let byte = self.peek()?;
+        self.pos += 1;
+        Some(byte)
+    }
+
+    fn ws(&mut self) {
+        while matches!(self.peek(), Some(b' ' | b'\n' | b'\r' | b'\t')) {
+            self.pos += 1;
+        }
+    }
+
+    fn expect(&mut self, want: u8) -> Result<(), &'static str> {
+        self.ws();
+        if self.take() == Some(want) {
+            Ok(())
+        } else {
+            Err("json: unexpected byte")
+        }
+    }
+
+    /// Parse a JSON string into `out`, refusing any escape we would have
+    /// to materialize as a non-ASCII code point (URLs and asset names on
+    /// this API are plain ASCII). The returned `&str` borrows `out`.
+    fn string_into<'b>(&mut self, out: &'b mut [u8]) -> Result<&'b str, &'static str> {
+        self.ws();
+        if self.take() != Some(b'"') {
+            return Err("json: expected a string");
+        }
+        let mut n = 0usize;
+        loop {
+            let byte = self.take().ok_or("json: unterminated string")?;
+            let decoded = match byte {
+                b'"' => break,
+                b'\\' => match self.take().ok_or("json: unterminated escape")? {
+                    b'"' => b'"',
+                    b'\\' => b'\\',
+                    b'/' => b'/',
+                    b'u' => {
+                        for _ in 0..4 {
+                            let hex = self.take().ok_or("json: short unicode escape")?;
+                            if !hex.is_ascii_hexdigit() {
+                                return Err("json: bad unicode escape");
+                            }
+                        }
+                        return Err("json: unicode escapes are not accepted in read fields");
+                    }
+                    _ => return Err("json: unsupported escape"),
+                },
+                0..=0x1F => return Err("json: control byte in string"),
+                other => other,
+            };
+            if n == out.len() {
+                return Err("json: string too long");
+            }
+            out[n] = decoded;
+            n += 1;
+        }
+        core::str::from_utf8(&out[..n]).map_err(|_| "json: string is not UTF-8")
+    }
+
+    /// Validate and step over a string whose value we do not need.
+    fn skip_string(&mut self) -> Result<(), &'static str> {
+        self.ws();
+        if self.take() != Some(b'"') {
+            return Err("json: expected a string");
+        }
+        loop {
+            match self.take().ok_or("json: unterminated string")? {
+                b'"' => return Ok(()),
+                b'\\' => match self.take().ok_or("json: unterminated escape")? {
+                    b'u' => {
+                        for _ in 0..4 {
+                            let hex = self.take().ok_or("json: short unicode escape")?;
+                            if !hex.is_ascii_hexdigit() {
+                                return Err("json: bad unicode escape");
+                            }
+                        }
+                    }
+                    b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => {}
+                    _ => return Err("json: unsupported escape"),
+                },
+                0..=0x1F => return Err("json: control byte in string"),
+                _ => {}
+            }
+        }
+    }
+
+    fn keyword(&mut self, word: &[u8]) -> Result<(), &'static str> {
+        for &want in word {
+            if self.take() != Some(want) {
+                return Err("json: bad literal");
+            }
+        }
+        Ok(())
+    }
+
+    fn number(&mut self) -> Result<(), &'static str> {
+        if self.peek() == Some(b'-') {
+            self.pos += 1;
+        }
+        let first = self.take().ok_or("json: bad number")?;
+        if !first.is_ascii_digit() {
+            return Err("json: bad number");
+        }
+        while self.peek().is_some_and(|b| b.is_ascii_digit()) {
+            self.pos += 1;
+        }
+        if self.peek() == Some(b'.') {
+            self.pos += 1;
+            if !self.take().is_some_and(|b| b.is_ascii_digit()) {
+                return Err("json: bad fraction");
+            }
+            while self.peek().is_some_and(|b| b.is_ascii_digit()) {
+                self.pos += 1;
+            }
+        }
+        if matches!(self.peek(), Some(b'e' | b'E')) {
+            self.pos += 1;
+            if matches!(self.peek(), Some(b'+' | b'-')) {
+                self.pos += 1;
+            }
+            if !self.take().is_some_and(|b| b.is_ascii_digit()) {
+                return Err("json: bad exponent");
+            }
+            while self.peek().is_some_and(|b| b.is_ascii_digit()) {
+                self.pos += 1;
+            }
+        }
+        if !matches!(
+            self.peek(),
+            None | Some(b' ' | b'\n' | b'\r' | b'\t' | b',' | b']' | b'}')
+        ) {
+            return Err("json: trailing number garbage");
+        }
+        Ok(())
+    }
+
+    /// Skip one arbitrary JSON value with a nesting cap — a hostile
+    /// metadata body cannot grow the kernel stack or hide a second
+    /// `assets` key behind an unparsed value.
+    fn skip_value(&mut self, depth: u8) -> Result<(), &'static str> {
+        if depth > JSON_DEPTH_CAP {
+            return Err("json: nesting too deep");
+        }
+        self.ws();
+        match self.peek().ok_or("json: truncated value")? {
+            b'"' => self.skip_string(),
+            b'{' => {
+                self.pos += 1;
+                loop {
+                    self.ws();
+                    if self.peek() == Some(b'}') {
+                        let _ = self.take();
+                        return Ok(());
+                    }
+                    self.skip_string()?;
+                    self.expect(b':')?;
+                    self.skip_value(depth + 1)?;
+                    self.separator()?;
+                }
+            }
+            b'[' => {
+                self.pos += 1;
+                loop {
+                    self.ws();
+                    if self.peek() == Some(b']') {
+                        let _ = self.take();
+                        return Ok(());
+                    }
+                    self.skip_value(depth + 1)?;
+                    self.separator()?;
+                }
+            }
+            b't' => self.keyword(b"true"),
+            b'f' => self.keyword(b"false"),
+            b'n' => self.keyword(b"null"),
+            b'-' | b'0'..=b'9' => self.number(),
+            _ => Err("json: unexpected value"),
+        }
+    }
+
+    /// Consume the `,` or closing bracket/brace after a member/element.
+    /// A comma immediately followed by a closing delimiter is a trailing
+    /// comma (invalid JSON) and is refused rather than skipped over.
+    fn separator(&mut self) -> Result<(), &'static str> {
+        self.ws();
+        match self.take() {
+            Some(b',') => {
+                self.ws();
+                if matches!(self.peek(), Some(b'}' | b']')) {
+                    return Err("json: trailing comma");
+                }
+                Ok(())
+            }
+            Some(b'}') | Some(b']') => {
+                self.pos -= 1; // let the enclosing loop consume it
+                Ok(())
+            }
+            _ => Err("json: missing separator"),
+        }
+    }
+}
+
+/// Find the `browser_download_url` of the asset named
+/// [`RELEASE_ASSET_NAME`] in a releases/latest JSON body. Only those two
+/// string fields are materialized; everything else is skipped
+/// structurally. The URL comes back as a bounded slice of the
+/// single-use [`ASSET_URL`] static.
+// Opt-in path: the shell/hardware integrator wires this in (docs §8.8).
+#[allow(dead_code)]
+fn release_asset_url(json: &'static [u8]) -> Result<&'static str, &'static str> {
+    let mut j = Json::new(json);
+    let mut key = [0u8; JSON_KEY_CAP];
+    // Parse the *whole* document before handing back a URL: a malformed
+    // tail must not be accepted just because the asset was earlier.
+    let mut result: Option<&'static str> = None;
+    j.expect(b'{')?;
+    loop {
+        j.ws();
+        if j.peek() == Some(b'}') {
+            let _ = j.take();
+            break;
+        }
+        let field = j.string_into(&mut key)?;
+        let is_assets = field == "assets";
+        j.expect(b':')?;
+        if is_assets {
+            j.expect(b'[')?;
+            loop {
+                j.ws();
+                if j.peek() == Some(b']') {
+                    let _ = j.take();
+                    break;
+                }
+                j.expect(b'{')?;
+                let mut named = false;
+                let mut url: Option<&'static str> = None;
+                loop {
+                    j.ws();
+                    if j.peek() == Some(b'}') {
+                        let _ = j.take();
+                        break;
+                    }
+                    let asset_field = j.string_into(&mut key)?;
+                    j.expect(b':')?;
+                    match asset_field {
+                        "name" => {
+                            let mut name = [0u8; JSON_NAME_CAP];
+                            named = j.string_into(&mut name)? == RELEASE_ASSET_NAME;
+                        }
+                        "browser_download_url" if url.is_none() && result.is_none() => {
+                            // SAFETY: single-use static; one `&'static
+                            // mut` per field, and a duplicate field is
+                            // skipped instead of borrowing it twice.
+                            let out: &'static mut [u8] = unsafe {
+                                core::slice::from_raw_parts_mut(
+                                    addr_of_mut!(ASSET_URL) as *mut u8,
+                                    JSON_URL_CAP,
+                                )
+                            };
+                            url = Some(j.string_into(out)?);
+                        }
+                        _ => j.skip_value(0)?,
+                    }
+                    j.separator()?;
+                }
+                if named && result.is_none() {
+                    result = url;
+                }
+                // Next array element (or the closing `]`): never leave
+                // the separating comma for `expect(b'{')` to trip on.
+                j.separator()?;
+            }
+        } else {
+            j.skip_value(0)?;
+        }
+        j.separator()?;
+    }
+    result.ok_or("no payload.tar asset in the release metadata")
+}
+
+/// Real-source network install (`docs/installer.md` §8.8). **Not** part
+/// of any boot chain or smoke marker: the shell/hardware integrator
+/// calls it explicitly with [`NETINSTALL_REAL_URL`] (or a
+/// `releases/latest` URL). With no target it is silent; with a target it
+/// pre-flights capacity + GRUB modules, then does *all* network, JSON
+/// and tar validation **before** [`install_payload`] writes a single
+/// sector. A failed/rate-limited/404 fetch therefore returns an `Err`
+/// and the disk is untouched — the mock `netprove` remains the CI gate.
+// Opt-in path: the shell/hardware integrator wires this in (docs §8.8).
+#[allow(dead_code)]
+pub(crate) fn netprove_https(
+    stack: &mut Stack,
+    target: Option<&ata::Disk>,
+    payloads: &Payloads,
+    url: &str,
+) -> Result<(), String> {
+    let Some(target) = target else {
+        return Ok(());
+    };
+    check_size(target)?;
+    if payloads.grub().is_none() {
+        return Err(String::from(
+            "no GRUB artifacts captured (boot the installer ISO, not the installed system)",
+        ));
+    }
+
+    let (source, endpoint) = classify_source(url)?;
+    let headers_json = [USER_AGENT, ACCEPT_JSON, API_VERSION];
+    let headers_raw = [USER_AGENT, ACCEPT_RAW, API_VERSION];
+    let mut endpoint = endpoint;
+
+    if matches!(source, RealSource::ReleaseMetadata) {
+        // SAFETY: single-use static, one exchange at a time.
+        let json = unsafe { &mut *addr_of_mut!(JSON_BUF) };
+        let (status, n) = https_get(stack, endpoint, &headers_json, json, JSON_CAP)?;
+        if status != 200 {
+            return Err(String::from("release metadata was not HTTP 200"));
+        }
+        if n == 0 {
+            return Err(String::from("release metadata is empty"));
+        }
+        // SAFETY: `https_get` wrote exactly `n` bytes into this static.
+        let body: &'static [u8] =
+            unsafe { core::slice::from_raw_parts(addr_of!(JSON_BUF) as *const u8, n) };
+        let asset_url = release_asset_url(body)?;
+        let parsed = Url::parse(asset_url)
+            .map_err(|_| String::from("browser_download_url is not a valid URL"))?;
+        endpoint = endpoint_of(&parsed)?;
+        serial_println!("netinstall: release asset URL passed the host allowlist");
+    }
+
+    // SAFETY: single-use static; reused from the mock path, which is
+    // never active at the same time as this opt-in path.
+    let download = unsafe { &mut *addr_of_mut!(DOWNLOAD) };
+    let (status, n) = https_get(stack, endpoint, &headers_raw, download, DOWNLOAD_CAP)?;
+    if status != 200 {
+        return Err(String::from("payload download was not HTTP 200"));
+    }
+    serial_println!("netinstall: {n} bytes received over HTTPS");
+    // SAFETY: `https_get` wrote exactly `n` bytes, `n <= DOWNLOAD_CAP`.
+    let archive: &'static [u8] =
+        unsafe { core::slice::from_raw_parts(addr_of!(DOWNLOAD) as *const u8, n) };
+    let mut files = [PayloadFile {
+        name: "",
+        data: &[],
+    }; MAX_PAYLOAD_FILES];
+    let count = parse_tar(archive, &mut files)?;
+    serial_println!("netinstall: payload carries {count} files");
+
+    install_payload(target, &files[..count], payloads);
+    Ok(())
 }
