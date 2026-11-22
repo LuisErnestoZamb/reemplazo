@@ -165,6 +165,17 @@ fn overrun_line(out: &mut [u8], lost: u64) -> usize {
     len
 }
 
+/// Recoveries performed by [`pump`] (a client that left the socket
+/// in a terminal state): printed to serial so the *next* netlog
+/// session's history shows exactly when and from which state the
+/// listener re-armed — the diagnosis channel for the live hardware.
+///
+/// SAFETY: written only from `pump`, which runs only from
+/// [`Stack::poll`] on the mainline (never from an interrupt
+/// handler — those only `push` into the ring), single core, never
+/// re-entered. Plain `u32` increment, no aliasing.
+static mut RE_LISTENS: u32 = 0;
+
 /// Stream the ring to the netlog client — called from
 /// [`Stack::poll`] on every stack iteration.
 ///
@@ -173,30 +184,61 @@ fn overrun_line(out: &mut [u8], lost: u64) -> usize {
 /// ~0 for this. One client at a time: history first (the cursor
 /// starts at 0 per session), then the live tail; when the client
 /// leaves, the session resets and the socket listens again.
+///
+/// Recovery is **unconditional** from every non-`Listen`,
+/// non-`SynReceived`, non-`Established` state — with or without a
+/// streamed session. A fast client (`nc -z`: connect, then FIN
+/// immediately) can have its final ACK and its FIN processed inside
+/// *one* `iface.poll()` (both sit in the NIC ring while the accept
+/// loop naps between IRQ0 ticks), so the socket goes
+/// `SynReceived → Established → CloseWait` between two `pump` calls
+/// and `netlog_streaming` is still `false` when `CloseWait` is
+/// first seen. Gating the re-listen on `streaming` (the old code)
+/// left the socket in `CloseWait` with the dead client's tuple
+/// forever: every later SYN was answered with RST and the service
+/// read as "0 bytes" — the 2026-11-22 live-hardware failure. The
+/// harness repro (`xtask hwtest`: two fast connect-and-hang-ups
+/// before the reading sessions) failed exactly there.
+///
+/// `SynReceived` is *not* recovered: a handshake is in flight and
+/// aborting it would kill every legitimate connect. `Listen` is the
+/// steady state. Everything else (CloseWait, Closed, TimeWait,
+/// FinWait*, LastAck, Closing — an RST, a FIN with or without a
+/// session) re-arms the listener, the `listen_ssh` pattern: abort
+/// whatever is open first (`listen` refuses an open socket),
+/// TimeWait and Closed listen directly.
 pub fn pump(stack: &mut Stack) {
     if !stack.netlog_enabled {
         return; // normal boots: no listener, no work (neutrality)
     }
     let handle = stack.netlog_handle;
     let state = stack.sockets.get::<tcp::Socket>(handle).state();
-    if state == tcp::State::Listen {
-        return; // no client yet
+    if state == tcp::State::Listen || state == tcp::State::SynReceived {
+        return; // no client yet / handshake in flight
     }
     if state != tcp::State::Established {
-        // The client is gone (FIN/RST), or a handshake died. Reset
-        // the session — the next client replays the history — and
-        // listen again, the `listen_ssh` pattern: abort whatever is
-        // open first (`listen` refuses an open socket), TimeWait and
-        // Closed listen directly.
-        if stack.netlog_streaming {
-            stack.netlog_streaming = false;
-            stack.netlog_cursor = 0;
-            stack.netlog_report = 0;
-            let sock = stack.sockets.get_mut::<tcp::Socket>(handle);
-            if sock.is_open() {
-                sock.abort();
-            }
-            let _ = sock.listen(PORT);
+        // Terminal or half-closed: the client is gone (FIN/RST) or
+        // was never observed connected (the fast-client race
+        // above). Reset the session — the next client replays the
+        // history — and listen again.
+        stack.netlog_streaming = false;
+        stack.netlog_cursor = 0;
+        stack.netlog_report = 0;
+        let sock = stack.sockets.get_mut::<tcp::Socket>(handle);
+        if sock.is_open() {
+            sock.abort();
+        }
+        if sock.listen(PORT).is_ok() {
+            // One line per recovery into the ring (never recurses:
+            // `push` does not print): the next session's history
+            // carries it — `netlog: re-listen after CLOSE-WAIT (#n)`.
+            // SAFETY: see RE_LISTENS — pump-only writer.
+            let n = unsafe {
+                let c = &mut *addr_of_mut!(RE_LISTENS);
+                *c = c.wrapping_add(1);
+                *c
+            };
+            serial_println!("netlog: re-listen after {state} (#{n})");
         }
         return;
     }

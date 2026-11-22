@@ -1553,7 +1553,7 @@ fn hwtest(root: &Path) -> bool {
         match netlog_probe(&container) {
             Ok(bytes) => {
                 netlog_ok = true;
-                println!("hwtest: netlog PASS — {bytes} bytes");
+                println!("hwtest: netlog PASS — {bytes} bytes over 2 sessions");
             }
             Err(e) => eprintln!("hwtest: netlog FAIL — {e}"),
         }
@@ -1637,33 +1637,36 @@ fn hwtest(root: &Path) -> bool {
     ok && netlog_ok
 }
 
-/// The netlog phase: connect to the guest's serial-over-TCP port from
-/// **inside** the container (`hostfwd=tcp:0.0.0.0:2224-:2224` binds
-/// the container's own interfaces, so `/dev/tcp/127.0.0.1/2224`
-/// reaches it) and read for a bounded few seconds — the stream never
+/// One netlog session: connect to the guest's serial-over-TCP port
+/// from **inside** the container (`hostfwd=tcp:0.0.0.0:2224-:2224`
+/// binds the container's own interfaces, so `/dev/tcp/127.0.0.1:2224`
+/// reaches it) and read for `secs` bounded seconds — the stream never
 /// ends on its own (the server keeps streaming the live tail until
-/// the client hangs up, which is what `timeout … cat` does).
+/// the client hangs up, which is what `timeout … cat` does), so the
+/// timeout kill is the *expected* end of an open-ended stream and the
+/// verdict is the content, not the exit status.
 ///
 /// Returns the byte count when the stream carries a known boot line
 /// (`hw: bring-up mode` or `BOOT_OK`); a detailed error — bytes
-/// received plus the first lines — otherwise.
-fn netlog_probe(container: &str) -> Result<usize, String> {
+/// received plus the first lines — otherwise. `session` names the
+/// attempt in the error (the second connection is the regression the
+/// live hardware hit: after one client comes and goes the service
+/// must still deliver bytes to the next one).
+fn netlog_session(container: &str, session: &str, secs: u32) -> Result<usize, String> {
     // bash provides /dev/tcp (the same idiom the sshd phases use),
-    // coreutils provides `timeout`. Exit 11 = connect refused; the
-    // `timeout` kill (124) is the *expected* end of an open-ended
-    // stream, so the verdict is the content, not the exit status.
-    let script = "exec 3<>/dev/tcp/127.0.0.1/2224 || exit 11; timeout 8 cat <&3";
+    // coreutils provides `timeout`. Exit 11 = connect refused.
+    let script = format!("exec 3<>/dev/tcp/127.0.0.1/2224 || exit 11; timeout {secs} cat <&3");
     let out = match Command::new("docker")
-        .args(["exec", container, "bash", "-c", script])
+        .args(["exec", container, "bash", "-c", &script])
         .output()
     {
         Ok(out) => out,
-        Err(e) => return Err(format!("cannot run docker exec: {e}")),
+        Err(e) => return Err(format!("{session}: cannot run docker exec: {e}")),
     };
     let stderr = String::from_utf8_lossy(&out.stderr);
     if out.stdout.is_empty() {
         return Err(format!(
-            "0 bytes received (status: {}; stderr: {})",
+            "{session}: 0 bytes received (status: {}; stderr: {})",
             out.status,
             stderr.trim()
         ));
@@ -1672,11 +1675,61 @@ fn netlog_probe(container: &str) -> Result<usize, String> {
     if !text.contains("hw: bring-up mode") && !text.contains("BOOT_OK") {
         let head: String = text.lines().take(8).map(|l| format!("  {l}\n")).collect();
         return Err(format!(
-            "{} bytes received but no known boot line; first lines:\n{head}",
+            "{session}: {} bytes received but no known boot line; first lines:\n{head}",
             out.stdout.len()
         ));
     }
     Ok(out.stdout.len())
+}
+
+/// The netlog phase: **two fast connect-and-hang-up rounds** followed
+/// by **two reading sessions** against the guest's serial-over-TCP
+/// port.
+///
+/// The fast rounds are what `nc -z` does on the live MacBook: the
+/// handshake's final ACK and the FIN arrive back-to-back, and with
+/// the accept loop napping between IRQ0 ticks the server can process
+/// both in a *single* stack poll — it then never observes
+/// `Established` and, with the old `pump`, never re-listens (the
+/// session-reset was gated on `netlog_streaming`). Every later
+/// connection was refused → "0 bytes". The reading sessions prove the
+/// normal history-then-tail stream works *after* those fast clients
+/// came and went (session 2 is the reconnect the single-session
+/// harness never covered).
+///
+/// Returns the total byte count across both reading sessions; a
+/// detailed error naming the failing phase otherwise.
+fn netlog_probe(container: &str) -> Result<usize, String> {
+    // Fast connect + immediate close, no read: two rounds (if the
+    // first wedges the listener, the second round's refused connect
+    // is the error that reports it). Exit 11 = connect refused.
+    for round in 1..=2 {
+        let script = "exec 3<>/dev/tcp/127.0.0.1/2224 || exit 11; exec 3>&-";
+        let out = Command::new("docker")
+            .args(["exec", container, "bash", "-c", script])
+            .output()
+            .map_err(|e| format!("fast close {round}: cannot run docker exec: {e}"))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(format!(
+                "fast close {round}: connect failed (status: {}; stderr: {}) — the listener died after a previous client came and went",
+                out.status,
+                stderr.trim()
+            ));
+        }
+        // Let the server's next poll (≤ one IRQ0 tick away) process
+        // our FIN and re-listen before dialing again: without the
+        // fix this sleep cannot help (nothing ever re-listens), with
+        // it 500 ms is a 50× margin over the ~10 ms poll cadence.
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let first = netlog_session(container, "session 1", 4)?;
+    // Give the server one poll round to process our FIN and re-listen
+    // before dialing again (a same-instant reconnect would race the
+    // state machine rather than test it).
+    std::thread::sleep(Duration::from_secs(1));
+    let second = netlog_session(container, "session 2", 8)?;
+    Ok(first + second)
 }
 
 fn smoke(root: &Path) -> bool {
