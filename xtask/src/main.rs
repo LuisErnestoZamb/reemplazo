@@ -1512,18 +1512,62 @@ fn hwtest(root: &Path) -> bool {
     }
     let mut ok = false;
     if listening {
-        // The real OpenSSH client, inside the container, through hostfwd.
+        // 1. An abrupt mid-KEX connection (open the TCP stream, say
+        //    nothing, hang up): the server's step deadline fires and
+        //    stores the failure reason — the input the banner replay
+        //    below must surface. Keeps the failure path exercised on
+        //    every run.
+        let _ = Command::new("docker")
+            .args([
+                "exec",
+                &container,
+                "bash",
+                "-c",
+                "exec 3<>/dev/tcp/127.0.0.1/2223 && sleep 0.3 && exec 3>&-",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        // 2. Let the server's step deadline (OP_DEADLINE_MS = 10 s)
+        //    fire and `remember_fail` before the replay connection.
+        std::thread::sleep(Duration::from_secs(12));
+        // 3. Drain the server's serial CONTINUOUSLY while the interop
+        //    runs: each failed attempt's reason (step deadline = 10 s)
+        //    must land in this log even when it fires seconds later.
+        eprintln!("hwtest-diag: collector starting");
+        let collector = std::thread::spawn(move || {
+            let mut during = Vec::new();
+            let mut quiet = 0u32;
+            loop {
+                match rx.recv_timeout(Duration::from_secs(2)) {
+                    Ok(line) => {
+                        quiet = 0;
+                        println!("hwtest| {line}");
+                        during.push(line);
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        quiet += 1;
+                        // The interop's last phase can be quiet; stop
+                        // only after 30 s of silence (well past it).
+                        if quiet >= 15 {
+                            eprintln!("hwtest-diag: collector quiet-exit");
+                            break;
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        eprintln!("hwtest-diag: collector DISCONNECTED (all senders gone)");
+                        break;
+                    }
+                }
+            }
+            during
+        });
         ok = run_openssh_interop(&container, "2223");
-        // Drain a couple more seconds: the server's drop/auth reason
-        // for the attempt is printed after the client returns.
-        let tail_deadline = Instant::now() + Duration::from_secs(3);
-        while let Ok(line) = rx.recv_timeout(
-            tail_deadline
-                .saturating_duration_since(Instant::now())
-                .max(Duration::from_millis(1)),
-        ) {
-            println!("hwtest| {line}");
-            collected.push(line);
+        if let Ok(extra) = collector.join() {
+            eprintln!("hwtest-diag: collector delivered {} lines", extra.len());
+            collected.extend(extra);
+        } else {
+            eprintln!("hwtest-diag: collector panicked");
         }
     } else {
         eprintln!("hwtest: the kernel never printed SSHD_LISTEN_OK");
