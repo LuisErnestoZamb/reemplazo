@@ -149,6 +149,8 @@ fn check(root: &Path) -> bool {
                 "rtc",
                 "-p",
                 "fat",
+                "-p",
+                "git-pack",
                 "--all-targets",
                 "--",
                 "-D",
@@ -201,6 +203,8 @@ fn check(root: &Path) -> bool {
                 "rtc",
                 "-p",
                 "fat",
+                "-p",
+                "git-pack",
             ],
         )
         && build_kernel(root)
