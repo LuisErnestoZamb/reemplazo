@@ -44,3 +44,14 @@ Estado: **hito 1 completado** (`e53295e`).kernel+apps separados por una frontera
 - **Qué se queda en ring 0 al final**: ATA/AHCI/e1000/sky2, PCI/PIC/PIT/IDT, memory/heap, `netstack` (smoltcp), `tls` + raíces, `fs/` + `install.rs`, VGA/serial, y el propio loader/scheduler/dispatch. Razones: sin IOMMU el DMA de usuario es inseguro; el NIC es polled y el stack necesita el PIT en ring 0; FAT16 `write` ya es no-atómico; el installer debe poder formatear antes de que exista un proceso.
 - **Latencia**: sky2 y AHCI sin IRQ (INTx/NCQ pendiente) → I/O se sondea en el tick a 100 Hz (≤10 ms añadidos). No bloquea los markers (deadlines ≥1 s).
 - **Seguridad**: Merom no tiene SMAP/SMEP/NX; la única barrera al dereferenciar punteros de usuario es `userptr::validated_slice` + los bits U/S. Todo `unsafe` nuevo lleva `// SAFETY:`.
+
+## Superficie de red del kernel (netlog)
+
+`netlog` (:2224 en modo bring-up) transmite el **ring del serial completo** —
+incluye líneas del kernel y de los procesos de usuario — a **cualquier
+cliente de la LAN**, sin autenticación. Es una decisión deliberada: en la
+MacBook no hay puerto serial y este es el único canal de diagnóstico
+remoto (junto con sshd en :2222). No debe exponerse a una red no confiable.
+El shield de red es la propia red local del banco; si se necesitara
+autenticación, el camino es pasar el streaming por una syscall de usuario
+con token, no añadir contraseñas al kernel.
