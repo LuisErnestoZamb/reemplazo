@@ -1,0 +1,9 @@
+[package]
+name = "user-hello"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+# Zero dependencies. `src/sys.rs` owns the four syscall numbers until the
+# `userlib` crate (m-syscalls) lands; the migration is then a one-line swap
+# of the constants in that file — see user/README.md.
