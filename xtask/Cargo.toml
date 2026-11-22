@@ -5,6 +5,16 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+# Review (S5, docs/git-ssh-deps.md §B.4 row S5): the two-VM `smoke-ssh`
+# harness must generate ONE ed25519 keypair per run (client seed into
+# one disk image, its public blob into the other VM's authorized_keys)
+# and encode the RFC4251 key blob / base64 line. `ed25519-dalek` is the
+# same audited, RustSec-clean, no_std crate the kernel already ships
+# (§B.1, S2 review) — host tooling only, never in the OS image; xtask
+# never prints the seed. `ssh-wire` (zero-dependency, in-tree) supplies
+# the blob/base64 codecs so harness and kernel cannot drift.
+ssh-wire = { path = "../ssh-wire" }
+ed25519-dalek = { version = "3.0", default-features = false }
 
 [dev-dependencies]
 # Host round-trip test only: `write_disk_image` must emit a volume the

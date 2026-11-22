@@ -40,6 +40,7 @@ mod rtc;
 mod shell;
 mod sky2;
 mod ssh;
+mod sshd;
 mod tls;
 mod usb;
 mod vga;
@@ -121,6 +122,21 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
         detected_drive = Some(drive);
     }
 
+    // S5 (docs/git-ssh-deps.md §B.4 row S5): a disk carrying a host key
+    // seed + authorized_keys turns this boot into an sshd; a disk
+    // carrying only a client seed makes it run the two-VM probe client.
+    // Both reads are silent when the files are absent — the installer
+    // smoke's disk (README only) and the diskless `smoke` are
+    // completely neutral (no listener, no probe, no line).
+    let mut sshd_config = None;
+    let mut probe_seed = None;
+    if let Some(drive) = detected_drive.as_ref() {
+        sshd_config = crate::keyfile::server_config(drive);
+        if sshd_config.is_none() {
+            probe_seed = crate::keyfile::client_seed(drive);
+        }
+    }
+
     // QEMU's e1000 first (byte-identical history: on a machine with
     // an e1000 the sky2 probe never even runs), then the MacBook's
     // sky2 — `sky2::init` prints nothing when the device is absent.
@@ -140,6 +156,12 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
         stack.set_static_ipv4();
         stack.prove_ping(); // NET_OK (ARP sniff) + PING_OK
         stack.wait_lease(); // DHCP_OK — slirp values asserted
+        // S5: the server VM serves one client before its own network
+        // chain continues (the client VM boots in parallel and dials
+        // in). No config → no listener, no line.
+        if let Some(cfg) = sshd_config.as_ref() {
+            crate::sshd::serve_once(stack, cfg); // SSHD_LISTEN_OK … SSHD_SESSION_OK
+        }
         // git's host, per AGENTS.md.
         let Some(github_ip) = stack.resolve("github.com") else {
             serial_println!(
@@ -157,6 +179,11 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
         // FAT16 checkout + re-mount read-back (GIT_CHECKOUT_OK).
         git_fetch::fetch(stack, github_ip, head, detected_drive.as_ref());
         ssh::kex_smoke(stack, github_ip); // SSH_KEXINIT_OK + SSH_KEX_OK
+        // S5: the client VM's half of the two-VM proof — connect to the
+        // peer sshd through slirp → hostfwd, authenticate, exec.
+        if let Some(seed) = probe_seed {
+            ssh::probe_server(stack, seed); // SSHD_OK + SSHD_EXEC_OK
+        }
     }
 
     test_interrupts();
