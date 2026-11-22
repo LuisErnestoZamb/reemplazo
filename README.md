@@ -158,4 +158,11 @@ Milestones landed so far (see `git log` for details):
 
 ## License
 
-Licensed under the [MIT License](LICENSE).
+Copyright © 2026 **Arepitas Technologies Inc**
+
+Licensed under the [GNU Affero General Public License v3.0](LICENSE)
+(AGPL-3.0). Versions committed up to `580f394` were released under the
+MIT license (still visible in the git history); from this commit the
+project is AGPL-3.0 — free to use, modify and serve, provided you
+publish your modifications. **Commercial licensing (perpetual, for
+closed-source use) from Arepitas Technologies Inc.**

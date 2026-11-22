@@ -195,7 +195,7 @@ Order rationale: S1–S2 are heap-free (fixed-size KEX state) and give the first
 1. **Heap milestone comes before**: full clone/checkout (G3–G4), `ssh-key` parsing (S3), `miniz_oxide` vec APIs, RSA. Per skill rule: *if the best crate needs `alloc`, plan the heap milestone before rewriting it by hand* — none of the §A/§B from-scratch items is a workaround for an alloc-bound crate.
 2. **Design every from-scratch parser streaming with caller-provided buffers** (pkt-line, HTTP headers, pack index, SSH frames) so S1–S2 and G1–G2 land pre-heap and double as adversarial-parser test surfaces (skill: every external datum is hostile; length/offset arithmetic `checked_*`).
 3. **No new crypto code**: SSH transport and git protocol state machines are protocol glue only; every primitive is an audited crate from §B.1/§A.1, versions pinned in `Cargo.lock`, `cargo audit` gate before each commit (skill dependency rule).
-4. **License check:** all recommended crates are MIT/Apache-2.0/BSD-3/Zlib → compatible with this repo's MIT license. Avoid `gunnar` (AGPL-3.0) and `cgap-git` (license unknown).
+4. **License check:** all recommended crates are MIT/Apache-2.0/BSD-3/Zlib → compatible with this repo's license (relicensed MIT → **AGPL-3.0** on 2026-11-21, Arepitas Technologies Inc; permissive and AGPL deps are both fine now). Avoid `gunnar` (first release 2026-08, fails the battle-tested bar) and `cgap-git` (license unknown).
 5. **Host-side note:** `gix`/gitoxide (std, MIT/Apache, very active) remains the right choice for xtask/CI tooling on the dev Mac — it is not a substitute for the in-OS deliverable, and none of it is no_std.
 
 ---
