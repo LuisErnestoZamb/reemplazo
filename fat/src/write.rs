@@ -73,8 +73,11 @@
 //!   to clobber via `create_file`) and [`Error::NotAFile`].
 //! - **Creation works in the root and in existing subdirectories**;
 //!   directories are created with [`crate::tree`]'s `create_dir`/
-//!   `create_dir_all` (FS3) — existing directories are never grown past
-//!   their extent (`NoSpace` when full).
+//!   `create_dir_all` (FS3) and a full subdirectory grows by one
+//!   zeroed cluster on demand (the FS4 extension
+//!   [`crate::tree`]'s `alloc_run_or_grow` provides — git's
+//!   `.git/objects` fan-out needs it). The fixed root directory cannot
+//!   grow (`NoSpace` when full, per the FAT specification).
 //! - **No delete/unlink** — freeing happens only inside truncate of the
 //!   file being written (tail or whole chain), never on another file's
 //!   chain, so no double-free is reachable through this API.
@@ -311,10 +314,7 @@ impl<'a, D: BlockDevice + ?Sized> Fat16<'a, D> {
         let create_slot = match &create {
             Some((parent, plan)) => {
                 let slots = plan.lfn_entries() + 1;
-                Some((
-                    *parent,
-                    self.alloc_run(*parent, slots)?.ok_or(Error::NoSpace)?,
-                ))
+                Some((*parent, self.alloc_run_or_grow(*parent, slots)?))
             }
             None => None,
         };

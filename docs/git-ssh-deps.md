@@ -111,7 +111,7 @@ Honest sizing for a full clone (numbers derived from [pack-format](https://git-s
 | G2 | smart-HTTP GET `info/refs?service=git-upload-pack` + advertisement parse → **`git ls-remote`** | serial marker **`GIT_LSREMOTE_OK`** in QEMU against `github.com` | `HTTP_OK` (already in smoke chain), `httparse` |
 | G3 | fetch (v0 `want`/`deepen=1`) → pack stream → **index-pack** (offset table + delta resolution + `.idx` write) | **`GIT_FETCH_OK`** (verify pack+idx against a real `git` on the host) | G1, G2, heap (tables) |
 | G4 | checkout of depth-1 tree (tree/blob parse, paths, file write) | **`GIT_CHECKOUT_OK`** | G3, heap, VFS/FS writes |
-| G5 | local object store: loose object write (sha1 + miniz_oxide), refs, commit creation → `git commit` equivalent | **`GIT_COMMIT_OK`** | G4 |
+| G5 | local object store: loose object write (sha1 + miniz_oxide), refs, commit creation → `git commit` equivalent | **`GIT_STORE_OK`** (smoke-install; the plan's `GIT_COMMIT_OK` name was folded into the store proof) | G4 |
 | G6 | push: serialize full-object pack + idx, `receive-pack` state machine | **`GIT_PUSH_OK`** against a test repo | G5, G1 |
 | G7 | git over ssh (`git-upload-pack` exec channel) | **`GIT_SSH_OK`** | G2 + S4 (§B.4) |
 
@@ -127,18 +127,61 @@ verifies the trailer SHA-1 and returns the objects plus the sha1 →
 offset `PackIndex` (the in-memory `.idx` main table). An iterative
 commit → tree → blob walk then enforces depth/entry/path/bounds caps.
 **Deferred:** the **`.idx` file write** (the index exists in memory and
-is exercised, but no `.idx` bytes are written to disk yet) and the
-loose-object store — both belong to G5's `clone` layout. **G4 checkout
+is exercised, but no `.idx` bytes are written to disk yet) — it belongs
+to the pack-layout/push work. **G4 checkout
 (full, FS3):** `smoke-install`'s `GIT_CHECKOUT_OK` writes the fetched
 repo's **whole** depth-1 tree into the FAT16 volume — every regular
 blob, directories created as needed through `fat::create_dir_all`, long
 names behind LFN chains through the FS3 writer — asserts the written
-count equals the fetched blob count (112 files in 53 dirs at the time
+count equals the fetched blob count (123 files in 56 dirs at the time
 of writing; symlinks/gitlinks are counted as skipped), then re-mounts
 from scratch and reads `/README.md` and the nested `docs/hardware.md`
 back byte-exactly with a content fragment each. The old `mkdir`/LFN
 limitation is resolved: the G3 proof's root-only, 8.3-only checkout no
 longer exists.
+
+**G5 local object store (landed 2026-11-22, `GIT_STORE_OK`):** the
+`git-store` crate owns the writing half of git's formats — loose
+objects (`<type> <size>\0<content>` → SHA-1 → zlib, written at
+`objects/xx/y…`), tree serialization with git's `base_name_compare`
+ordering, commit objects (byte-exact to `git commit-tree`), the binary
+v2 index (62-byte fixed part, `(62 + name + 8) & ~7` entry padding,
+trailing SHA-1) and refs/HEAD — `no_std`, `forbid(unsafe_code)`, only
+the two G3a-reviewed crates (`sha1`, `miniz_oxide`), with 44
+adversarial host tests (canonical empty-object ids, tree ordering
+traps, deflate truncation at every byte, oversize caps, index padding
+1..20 and checksum/version refusals, ref grammar). In `smoke-install`,
+after the checkout, the kernel writes `.git/HEAD` +
+`refs/heads/main` + `.git/shallow` (the depth-1 boundary — without it
+the new commit's parent would read as a missing object), one loose
+object per decoded commit/tree/blob
+(encoded and written **one at a time**; 181 objects / ~1.0 MB on this
+repo), the v2 index for every checked-out path, and rebuilds every tree
+from those paths — the rebuilt root must equal the fetched commit's
+tree id and every rebuilt tree must be byte-identical to the fetched
+tree object. It then creates one local commit (`tree` = rebuilt root,
+`parent` = fetched head, author/committer `reemplazo
+<reemplazo@localhost>` at the RTC epoch, message `reemplazo: local
+commit`) and moves the ref to it. A **fresh mount** re-reads HEAD, the
+ref and the shallow boundary, parses the index
+(signature/version/checksum/entry set), inflates the new commit and
+checks its `tree` line, and inflates + re-hashes every loose object to
+the id its path encodes. An independent host check (throwaway: the
+`fat` fixture image mounted through the host crate, `.git` extracted,
+then `git fsck --strict`, `git log`, `git status --porcelain`) passes
+with an empty `status`, so the store is a real git repository.
+**Remaining for a full `git`:** the `.idx` file write, pack-objects +
+`push` (G6, `GIT_PUSH_OK`), git over ssh (G7, reusing S4's channel),
+and a user-facing `log`/`status` on top of this store (the read side is
+the crate's `decode_loose`/`parse_index`, wired to the shell).
+
+**Filesystem extension it needed:** the `fat` crate's directories were
+capped at their first cluster (FS3's documented limit); git's
+`.git/objects` fan-out holds up to 256 two-hex subdirectories, which
+does not fit a 4 KiB cluster's 128 slots. `fat::tree` now grows a
+**subdirectory** by one zeroed, end-of-chain cluster on demand
+(`alloc_run_or_grow`, exercised by a 200-entry host test); the fixed
+root still refuses with `NoSpace`.
 
 ---
 

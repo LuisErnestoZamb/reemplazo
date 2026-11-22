@@ -66,6 +66,8 @@ All in Rust, all in this workspace:
 | `kernel/` | The OS kernel — `no_std`, built only for `x86_64-unknown-none` |
 | `mbi/` | Multiboot2 handoff range contract + hostile-input host tests |
 | `net/` | HTTP/1.1 responses (`httparse` + RFC 9112 framing), SLIRP smoke constants, `parse_ipv4` — host-tested (the TCP/IP stack itself is smoltcp, see `docs/smoltcp-eval.md`) |
+| `git-pack/` | Packfile v2 reader: header, zlib streams, OFS/REF deltas, trailer + in-memory index, tree/commit parsing — host-tested |
+| `git-store/` | Local git object store formats: loose objects (SHA-1 + zlib), tree/commit writers, the v2 index and refs/HEAD — `no_std`, `forbid(unsafe_code)`, 44 adversarial host tests |
 | `rtc/` | CMOS clock decoding (BCD, 12/24 h, leap years, century plausibility) — host-tested |
 | `pci/` | PCI enumeration and device IDs (e1000, sky2, …) |
 | `xtask/` | Build/test orchestration (`cargo xtask …`) |
@@ -78,7 +80,7 @@ All in Rust, all in this workspace:
 ```sh
 cargo xtask check   # fmt + clippy (host and kernel target) + tests + cross-build
 cargo xtask smoke   # build ISO, boot headless, assert serial markers in order
-cargo xtask smoke-install  # same + FAT16 IDE disk; assert BLK_OK + FAT_OK + FS_WRITE_OK + FS_TREE_OK + GIT_CHECKOUT_OK
+cargo xtask smoke-install  # same + FAT16 IDE disk; assert BLK_OK + FAT_OK + FS_WRITE_OK + FS_TREE_OK + GIT_CHECKOUT_OK + GIT_STORE_OK
 cargo xtask run     # interactive boot in QEMU (Ctrl-C quits)
 cargo test -p mbi <name>   # single test
 ```
@@ -110,7 +112,18 @@ needed, long names through LFN writes, symlinks/submodules counted as
 skipped), the written count is asserted against the fetched blob count
 (112 files in 53 dirs at the time of writing), and after a fresh
 re-mount `/README.md` and the nested `docs/hardware.md` are read back
-byte-exact with a content fragment each.
+byte-exact with a content fragment each — and `GIT_STORE_OK`: the
+fetched repo's **local object store** is written — `.git/HEAD` +
+`refs/heads/main` + `.git/shallow` (the depth-1 boundary), one loose zlib object per decoded commit/tree/blob
+(181 objects at the time of writing, encoded and written one at a
+time), the v2 index for every checked-out path, the tree objects
+rebuilt from those paths and asserted byte-identical to the fetched
+ones, and one local commit on top of the fetched head (`parent` =
+fetched head, author/committer from the RTC epoch, message
+`reemplazo: local commit`) — then a fresh re-mount re-reads HEAD, the
+ref and the shallow boundary, parses the index, inflates the new commit (its `tree` line
+must equal the rebuilt root) and inflates + re-hashes every loose
+object to the id its path encodes.
 
 **Notes:**
 
@@ -158,7 +171,7 @@ Milestones landed so far (see `git log` for details):
 - [x] TCP/IP stack migrated to **smoltcp** — hand-rolled frame/DHCP/DNS/TCP code replaced, ~2300 lines removed (docs/smoltcp-eval.md)
 - [x] TLS 1.3 client — HTTPS against github.com:443, pinned root certificate
 - [x] HTTP/1.1 client — `httparse` head + RFC 9112 body framing (HTTP_OK)
-- [x] git over HTTPS — smart-HTTP `ls-remote` advertisement (GIT_LSREMOTE_OK), depth-1 `fetch` via v0 `want`/`deepen 1`/`done` → `git-pack` decode → iterative tree walk (GIT_FETCH_OK), and a **full-tree** checkout into FAT16 — directories, long names, every blob — with a re-mount read-back (GIT_CHECKOUT_OK, `smoke-install`)
+- [x] git over HTTPS — smart-HTTP `ls-remote` advertisement (GIT_LSREMOTE_OK), depth-1 `fetch` via v0 `want`/`deepen 1`/`done` → `git-pack` decode → iterative tree walk (GIT_FETCH_OK), a **full-tree** checkout into FAT16 — directories, long names, every blob — with a re-mount read-back (GIT_CHECKOUT_OK, `smoke-install`), and the **local object store**: loose objects for every fetched commit/tree/blob, refs/HEAD, the v2 index, rebuilt trees checked byte-exact, and one local commit on top of the fetched head, all proved from a fresh mount (GIT_STORE_OK, `smoke-install`)
 - [x] Shell — serial-console REPL with minimal builtins (ping, resolve, netinfo, …)
 - [x] Keyboard — polled i8042 + set-1 decode feeding the shell's line discipline (QEMU `sendkey` → `KEYBOARD_OK`; MacBook needs UHCI/HID)
 - [ ] sky2 driver (real hardware only)

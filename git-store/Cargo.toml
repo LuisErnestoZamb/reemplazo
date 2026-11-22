@@ -1,0 +1,24 @@
+[package]
+name = "git-store"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+# SHA-1 object ids (git's hash). Reviewed in G3a (docs/git-ssh-deps.md
+# §A.1.1): `default-features = false` is no_std, no allocator inside the
+# crate, RustCrypto/hashes, RustSec-clean.
+sha1 = { version = "0.11", default-features = false }
+# zlib for loose objects (git's object framing). Reviewed in G3a
+# (docs/git-ssh-deps.md §A.1.2): default features are no_std + alloc,
+# RustSec-clean, flate2's `rust_backend`.
+miniz_oxide = { version = "0.9", default-features = false, features = ["with-alloc"] }
+
+[dev-dependencies]
+# The hostile index tests rebuild a checksum after tampering with a byte;
+# same crate/version as the runtime dependency (no new crate enters the
+# tree).
+sha1 = { version = "0.11", default-features = false }
+# Tests construct malformed zlib streams (bad headers, oversize output)
+# with the same reviewed codec the crate uses at runtime.
+miniz_oxide = { version = "0.9", default-features = false, features = ["with-alloc"] }

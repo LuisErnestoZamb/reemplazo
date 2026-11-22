@@ -27,6 +27,7 @@ mod entropy;
 mod fs;
 mod git;
 mod git_fetch;
+mod git_store;
 mod heap;
 mod idt;
 mod keyboard;

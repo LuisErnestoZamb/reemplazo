@@ -461,8 +461,9 @@ impl<'a, D: BlockDevice + ?Sized> Fat16<'a, D> {
     /// Number of directory slots in `dir`'s existing extent: the fixed
     /// root's entry count, or every slot of every cluster in a
     /// subdirectory's chain (cycle-checked by [`Fat16::walk_chain`]).
-    /// Directories are never grown — a full directory is
-    /// [`Error::NoSpace`] (documented FS3 limit).
+    /// A subdirectory grows through
+    /// [`alloc_run_or_grow`](Self::alloc_run_or_grow) when its extent
+    /// has no free run; the fixed root cannot grow (FAT specification).
     pub(crate) fn dir_slots(&self, dir: DirLoc) -> Result<u32, Error> {
         match dir {
             DirLoc::Root => Ok(self.root_entries),
@@ -544,6 +545,57 @@ impl<'a, D: BlockDevice + ?Sized> Fat16<'a, D> {
         Ok(None)
     }
 
+    /// [`alloc_run`](Self::alloc_run), growing a **subdirectory** by one
+    /// cluster when its current extent has no run long enough. The root
+    /// directory is fixed by the FAT specification and cannot grow
+    /// ([`Error::NoSpace`]).
+    ///
+    /// This lifts FS3's documented "directories are never grown" limit,
+    /// which a real workload needs: git's `.git/objects` fan-out creates
+    /// up to 256 two-hex subdirectories, and a 4 KiB cluster holds only
+    /// 128 slots. Growth zeroes the new cluster (every slot reads as the
+    /// `0x00` end marker), marks it end-of-chain, and only then links it
+    /// from the old tail — an interrupted growth leaks one free cluster
+    /// instead of corrupting a chain (FAT-first discipline, same as the
+    /// writer's other ordering decisions).
+    pub(crate) fn alloc_run_or_grow(&self, dir: DirLoc, count: u32) -> Result<u32, Error> {
+        if let Some(run) = self.alloc_run(dir, count)? {
+            return Ok(run);
+        }
+        self.grow_dir(dir)?;
+        self.alloc_run(dir, count)?.ok_or(Error::NoSpace)
+    }
+
+    /// Append one zeroed cluster to the directory `dir`'s chain.
+    fn grow_dir(&self, dir: DirLoc) -> Result<(), Error> {
+        let DirLoc::Cluster(head) = dir else {
+            return Err(Error::NoSpace); // the fixed root cannot grow
+        };
+        let (count, tail) = self.walk_chain(head)?;
+        if count == 0 {
+            return Err(Error::BadDirectory);
+        }
+        if count >= self.clusters {
+            return Err(Error::NoSpace);
+        }
+        let fresh = self.alloc_free()?;
+        let fresh_entry = u16::try_from(fresh).map_err(|_| Error::NoSpace)?;
+        if !self.cluster_bytes.is_multiple_of(512) {
+            return Err(Error::BadDirectory); // mount invariant
+        }
+        let base = self.cluster_byte(fresh)?;
+        let zeros = [0u8; 512];
+        for chunk in 0..self.cluster_bytes / 512 {
+            let offset = base
+                .checked_add(u64::from(chunk) * 512)
+                .ok_or(Error::OutOfRange)?;
+            write_bytes(self.dev, offset, &zeros)?;
+        }
+        self.fat_set(fresh, EOC)?;
+        self.fat_set(tail, fresh_entry)?;
+        Ok(())
+    }
+
     /// Write the name (LFN chain when needed, then the 8.3 entry that
     /// seals it) into the slot run at `run`. The 8.3 entry is written
     /// last: it is the commit point readers consult. Stale LFN parts in
@@ -586,7 +638,7 @@ impl<'a, D: BlockDevice + ?Sized> Fat16<'a, D> {
         let plan = self.plan_name(parent, name)?;
         let (date, time) = stamp.encode()?;
         let entries = plan.lfn_entries();
-        let run = self.alloc_run(parent, entries + 1)?.ok_or(Error::NoSpace)?;
+        let run = self.alloc_run_or_grow(parent, entries + 1)?;
         // The directory's own cluster, linked end-of-chain (FAT first).
         let cluster = self.alloc_free()?;
         self.fat_set(cluster, EOC)?;

@@ -446,6 +446,52 @@ fn create_dir_all_builds_missing_parents_and_is_idempotent() {
 }
 
 #[test]
+fn a_full_subdirectory_grows_by_a_cluster() {
+    let mem = Mem::new(image());
+    {
+        let fs = mount(&mem);
+        fs.create_dir_all("/MANY", STAMP).expect("mkdir");
+        // 200 entries exceed one 4 KiB cluster's 128 slots, so the
+        // directory must grow (FS4 extension): git's object fan-out
+        // needs the same.
+        for i in 0..200u32 {
+            let name = format!("/MANY/F{i:03}.BIN");
+            fs.write_file_all(&name, b"x", STAMP)
+                .unwrap_or_else(|e| panic!("write {name}: {e:?}"));
+        }
+        assert_eq!(fs.kind("/MANY"), Ok(Kind::Dir));
+    }
+
+    // The directory chain is now longer than one cluster...
+    let mut dir_cluster = 0u32;
+    for slot in 0..ROOT_ENTRIES {
+        let raw = root_raw(&mem, slot);
+        if raw[0] == 0x00 {
+            break;
+        }
+        if raw[0] == 0xE5 || raw[11] == 0x0F {
+            continue;
+        }
+        if &name_of(&raw)[..4] == b"MANY" {
+            dir_cluster = cluster_of(&raw);
+        }
+    }
+    assert!(dir_cluster >= 2, "found /MANY in the root");
+    assert_ne!(
+        fat_of(&mem, dir_cluster),
+        0xFFFF,
+        "the directory's first cluster links to a second one"
+    );
+
+    // ...and every entry reads back from a fresh mount.
+    let fs = mount(&mem);
+    for i in 0..200u32 {
+        let name = format!("/MANY/F{i:03}.BIN");
+        assert_eq!(read_exact(&fs, &name, 1), b"x", "{name}");
+    }
+}
+
+#[test]
 fn create_dir_all_refuses_a_file_in_the_middle() {
     let mem = Mem::new(image());
     let fs = mount(&mem);

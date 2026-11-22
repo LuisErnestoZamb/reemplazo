@@ -7,8 +7,9 @@
 //!   smoke   boot the ISO headless; assert serial markers in order,
 //!           then type a command through QEMU's monitor (KEYBOARD_OK)
 //!   smoke-install  boot with a FAT16 IDE disk; assert BLK_OK + FAT_OK
-//!           + FS_WRITE_OK (write + re-mount read-back) + GIT_CHECKOUT_OK
-//!           (fetched root blobs written to FAT16, README.md read back)
+//!           + FS_WRITE_OK + GIT_CHECKOUT_OK + GIT_STORE_OK
+//!           (fetched tree checked out, then `.git` objects/refs/index
+//!           written and one local commit proved from a fresh mount)
 //!   run     build + iso + boot interactively (serial on stdio; keys
 //!           can also be injected via the printed monitor address)
 //!
@@ -156,6 +157,8 @@ fn check(root: &Path) -> bool {
                 "fat",
                 "-p",
                 "git-pack",
+                "-p",
+                "git-store",
                 "--all-targets",
                 "--",
                 "-D",
@@ -214,6 +217,8 @@ fn check(root: &Path) -> bool {
                 "fat",
                 "-p",
                 "git-pack",
+                "-p",
+                "git-store",
             ],
         )
         && build_kernel(root)
@@ -758,9 +763,9 @@ fn smoke(root: &Path) -> bool {
     boot_assert(root, "smoke", &MARKERS, None, true)
 }
 
-/// Installer milestones 1 + FS1 + FS2 + FS3 + G3/G4's checkout
-/// (`BLK_OK`, `FAT_OK`, `FS_WRITE_OK`, `FS_TREE_OK`, `GIT_CHECKOUT_OK`):
-/// build the ISO, write a 64 MiB
+/// Installer milestones 1 + FS1 + FS2 + FS3 + G3/G4's checkout and
+/// local object store (`BLK_OK`, `FAT_OK`, `FS_WRITE_OK`, `FS_TREE_OK`,
+/// `GIT_CHECKOUT_OK`, `GIT_STORE_OK`): build the ISO, write a 64 MiB
 /// `target/iso-root/disk.img` that is a **valid FAT16 volume** carrying
 /// the `ata` magic in its boot sector's bootstrap area (see
 /// [`write_disk_image`]), boot with the image attached as an IDE drive,
@@ -771,11 +776,15 @@ fn smoke(root: &Path) -> bool {
 /// with `/README.TXT` re-checked for clobbering), `FS_TREE_OK` (the
 /// kernel created `/sub/dir/deep/nested-long-name-file.txt` and a plain
 /// 8.3 nested file through `fat::write_file_all`, re-mounted and read
-/// both back byte-exact) and `GIT_CHECKOUT_OK` (the depth-1 fetch
+/// both back byte-exact), `GIT_CHECKOUT_OK` (the depth-1 fetch
 /// checked the **whole** tree out — directories created, long names
 /// through LFN chains — then re-read `/README.md` and the nested
-/// `docs/hardware.md` byte-exact, with the file count asserted) in that
-/// order.
+/// `docs/hardware.md` byte-exact, with the file count asserted) and
+/// `GIT_STORE_OK` (the fetched `.git` written: refs/HEAD, every decoded
+/// object as a loose zlib object, the v2 index, the tree objects
+/// rebuilt and compared byte-exact, one local commit created on top of
+/// the fetched head, everything re-read from a fresh mount and
+/// re-hashed) in that order.
 ///
 /// Note the image is created **after** `iso()` (which wipes
 /// `target/iso-root`) and lives inside it, so the container's `/iso`
@@ -798,6 +807,7 @@ fn smoke_install(root: &Path) -> bool {
             "FS_WRITE_OK",
             "FS_TREE_OK",
             "GIT_CHECKOUT_OK",
+            "GIT_STORE_OK",
         ],
         Some(&disk),
         false,
