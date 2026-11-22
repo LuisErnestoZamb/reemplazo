@@ -35,7 +35,9 @@
 #![allow(dead_code)]
 
 use crate::idt::Frame as InterruptFrame;
+use crate::memory::{USER_BASE, USER_STACK_SIZE};
 use crate::userland::process::{KERNEL_STACK_SIZE, MAX_FREE_FRAMES, MAX_PROCS, Process, State};
+use crate::userland::userptr::{Vm, set_vm};
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -249,6 +251,20 @@ fn install_context(s: &Scheduler, pid: u32) {
     // SAFETY: loading CR3 in ring 0 is always legal. The value comes from
     // a PCB captured from our own page table (or the ELF loader).
     unsafe { core::arch::asm!("mov cr3, {}", in(reg) p.cr3_phys, options(nostack)) };
+    // Publish the incoming process's VMAs before any of its syscalls can
+    // touch a user pointer (hito 2 debt): with Vm::NONE every Write is
+    // EFAULT. The ELF's PT_LOAD occupies the low user region, the stack
+    // the top of USER_END (both bounded by userptr's own caps).
+    if pid == 0 {
+        set_vm(Vm::NONE);
+    } else if let Some(stack_lo) = p.user_stack_top.checked_sub(USER_STACK_SIZE) {
+        set_vm(Vm {
+            brk_base: USER_BASE,
+            brk_end: p.brk_end,
+            stack_base: stack_lo,
+            stack_end: p.user_stack_top,
+        });
+    }
 }
 
 /// Build the first CPL3 interrupt frame at the top of a fresh process's
