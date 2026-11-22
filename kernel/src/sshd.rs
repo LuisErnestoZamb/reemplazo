@@ -176,6 +176,26 @@ fn remember_fail(reason: &str) {
     }
 }
 
+/// Coarsen an internal failure reason for the pre-auth banner (audit F8).
+///
+/// The banner is the only remote diagnostic channel on the MacBook (no
+/// serial port), so it must stay *before* auth — but leaking the exact
+/// parser check that fired lets an unauthenticated peer fingerprint
+/// our implementation and consume the one-shot reason meant for the
+/// operator. Map to a fixed, small vocabulary; the full reason still
+/// goes to the serial/VGA log via `remember_fail`'s caller.
+fn banner_reason(reason: &[u8]) -> &'static [u8] {
+    let text = core::str::from_utf8(reason).unwrap_or("");
+    if text.contains("timeout") || text.contains("deadline") {
+        b"previous session: timeout\n"
+    } else if text.contains("auth") || text.contains("key") || text.contains("signature") {
+        b"previous session: authentication failed\n"
+    } else {
+        // Covers malformed KEX/banner/packets/channels: no parser detail.
+        b"previous session: protocol error\n"
+    }
+}
+
 /// Take the stored reason (one-shot: the banner is sent once).
 fn take_fail() -> Option<&'static [u8]> {
     // SAFETY: as `remember_fail`; cleared immediately after the read,
@@ -619,6 +639,9 @@ fn session(
                 // OpenSSH prints it on stderr, so a remote operator
                 // sees *why* the last attempt died without a screen.
                 if let Some(msg) = take_fail() {
+                    // F8: send only a coarse category, never the exact
+                    // internal parser reason, to an unauthenticated peer.
+                    let msg = banner_reason(msg);
                     let mut bbuf = [0u8; 192];
                     match ssh_wire::userauth_banner_payload(msg, &mut bbuf) {
                         Some(n) => {
