@@ -129,8 +129,10 @@ impl Drop for IrqGuard<'_> {
 /// Snapshot RFLAGS and mask interrupts (`CLI`).
 ///
 /// Must be balanced by a [`restore`] with the returned value, on the
-/// same CPU (see the `IrqCell::lock` docs).
-fn save_and_disable() -> u64 {
+/// same CPU (see the `IrqCell::lock` docs). Shared with `netlog` —
+/// the serial ring mutates shared state from the print path, which
+/// must be masked exactly like the allocator's cell.
+pub(crate) fn save_and_disable() -> u64 {
     let flags: u64;
     // SAFETY: `pushfq; pop` snapshots RFLAGS and `cli` clears IF. No
     // `nostack`: the push/pop deliberately use the stack below RSP, so the
@@ -152,8 +154,9 @@ fn save_and_disable() -> u64 {
 ///
 /// Contract: `flags` must come from `save_and_disable` on this CPU, and
 /// every `save_and_disable` since then must have been balanced by a
-/// restore (the lock's RAII guard upholds this).
-fn restore(flags: u64) {
+/// restore (the lock's RAII guard upholds this). `netlog` pairs its
+/// own calls the same way (see `crate::netlog::push`).
+pub(crate) fn restore(flags: u64) {
     // SAFETY: caller contract above; `push`/`popfq` pair atomically
     // restore the full register with no interrupt window in between.
     unsafe {

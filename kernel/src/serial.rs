@@ -91,6 +91,14 @@ impl fmt::Write for SerialPort {
     /// `Uart16550Tty` wrapper: its `write_str` also echoes backspace,
     /// which must not appear in the log stream.
     fn write_str(&mut self, s: &str) -> fmt::Result {
+        // netlog (milestone): copy the line into the serial ring so
+        // the bring-up mode can serve it over TCP — hooked here, not
+        // in the macros, so the panic path is captured too. A bounded
+        // copy into a static buffer: no allocation, and `push` never
+        // prints, so this cannot recurse into `serial_print!`. Raw
+        // `s` (LF only): the CRLF mapping below is a wire detail of
+        // the UART, not part of the log text.
+        crate::netlog::push(s.as_bytes());
         for byte in s.bytes() {
             if byte == b'\n' {
                 self.write_byte(b'\r');
