@@ -683,7 +683,11 @@ fn run(root: &Path) -> bool {
 /// `background-color` and `font-weight`, the margin/padding cell shift,
 /// `display:none` absence — then the same body without its sheet,
 /// proving the defaults return; the real page's own sheet is applied
-/// as a robustness pass) — within
+/// as a robustness pass), `BROWSER_NAV_OK` (B4 navigation: the
+/// interactive browser's own state driven through the keyboard path —
+/// two kernel-owned fixture pages followed/back/forward with history
+/// depths asserted, and an unreachable endpoint rendering the error
+/// page instead of halting; offline, no internet needed) — within
 /// [`SMOKE_TIMEOUT`]. Then the keyboard milestone:
 /// once `SHELL_OK` matches, connect to QEMU's HMP monitor
 /// ([`monitor_port`]) and type `echo KEYBOARD_OK` key by key with
@@ -713,7 +717,10 @@ fn run(root: &Path) -> bool {
 /// viewport frame read back from `0xb8000`), the B3 CSS subset (sheet
 /// parsing, specificity/source-order/inline cascade, VGA attribute
 /// mapping and the styled-vs-unstyled fixture pair read back from
-/// `0xb8000`), the serial
+/// `0xb8000`), the B4 navigation state (fixture link follow through
+/// `Url::join`, the bounded history's back/forward depths and the
+/// forward-tail rule, the error page rendered for an unreachable
+/// endpoint — all read back from `0xb8000`; offline), the serial
 /// shell coming up, or the keyboard path (i8042 bring-up, scancode
 /// decode, input multiplexing) — so it gates every milestone in the
 /// chain.
@@ -721,7 +728,7 @@ fn run(root: &Path) -> bool {
 /// It runs **without a disk**, so the `ata::probe` that sits between
 /// `PCI_OK` and `E1000_OK` stays silent here.
 fn smoke(root: &Path) -> bool {
-    const MARKERS: [&str; 29] = [
+    const MARKERS: [&str; 30] = [
         "BOOT_OK",
         "VGA_OK",
         "MEM_OK",
@@ -749,6 +756,7 @@ fn smoke(root: &Path) -> bool {
         "AI_EDIT_OK",
         "BROWSER_RENDER_OK",
         "BROWSER_CSS_OK",
+        "BROWSER_NAV_OK",
         "SHELL_OK",
         "KEYBOARD_OK",
     ];

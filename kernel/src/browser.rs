@@ -30,13 +30,41 @@
 //! reaches the serial log and the VGA mirror only through
 //! [`sanitize`], and `serial_println!` evaluates its arguments twice,
 //! so every logged expression stays side-effect free.
+//!
+//! # B4: one pipeline, two front-ends
+//!
+//! The hop loop is **fallible** ([`NavError`]) and has two callers: the
+//! boot proofs ([`fetch`], [`FetchPolicy::BOOT`] — TLS allowed, a 10 s
+//! connect bound, any error `FATAL: browser:` + [`crate::halt`], the
+//! semantics the B1/B2 markers were proven with), and the interactive
+//! browser app ([`navigate`], [`FetchPolicy::NAV`] — the error goes back
+//! to the caller, which renders it as a page; a 3 s connect bound so a
+//! dead endpoint cannot stall the UI; **no TLS hop**: `tls::tls_open`
+//! is fail-closed by design and `tls.rs` is outside B4's change set, so
+//! the app refuses `https` with a page instead of risking a halt — see
+//! `docs/browser.md` §8 row B4).
+//!
+//! The app also resets a stale socket before connecting: a hop that hit
+//! its deadline can leave the socket open, and navigation must never
+//! inherit that state. Wire detail (`{:?}` of a parser error, the port
+//! that refused) goes to its own `browser:` serial line; the page text
+//! and the `FATAL:` line carry only the fixed [`NavError`] wording.
+//!
+//! A browser navigates the same page many times, so the app's policy
+//! also differs at the socket: it **resets** after every hop (RST — the
+//! body is already framed) instead of proving the graceful close, and it
+//! rotates through 64 local ports, so neither our TIME-WAIT nor the
+//! peer's can swallow the next SYN to the same host:port. Both are
+//! [`FetchPolicy`] fields; [`FetchPolicy::BOOT`] keeps B1/B2 exactly as
+//! they were.
 
 use crate::clock;
 use crate::netstack::{OP_DEADLINE_MS, Stack};
 use crate::tls::{self, FetchCfg};
 use core::cmp::min;
+use core::fmt;
 use core::ptr::addr_of_mut;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 use net::http::{self, ResponseParser};
 use smoltcp::socket::tcp;
 use smoltcp::wire::Ipv4Address;
@@ -95,6 +123,122 @@ const HEADERS: [&str; 2] = [
 /// `Location` values are display-only: longer ones are truncated with
 /// `?`-fill, never wrapped or rejected because of the log).
 const SANITIZE_CAP: usize = 240;
+/// Connect bound of the **navigation app** (B4): the boot proofs keep
+/// [`OP_DEADLINE_MS`] (10 s — a slow real network is fine at boot), but
+/// an interactive navigation must turn a dead endpoint into a page
+/// quickly. Every loop that uses it is deadline-bounded, so this is an
+/// upper bound on the app's stall, never a hang.
+const NAV_CONNECT_MS: u64 = 3_000;
+
+/// Why one navigation attempt failed. The **app** renders [`Display`]
+/// (`fmt::Display`) as the error page's cause line; the boot proofs
+/// print the same text as `FATAL: browser: {e}`. Every variant carries
+/// fixed, printable-ASCII wording (or a parsed status number) — never
+/// wire bytes, so the page and the log are injection-free by
+/// construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NavError {
+    /// URL-level refusal: parse, scheme, host, port, request target.
+    Url(&'static str),
+    /// The resolver produced no answer for the host.
+    Dns,
+    /// The connection never came up (refused, reset, timeout) or died
+    /// while the request was being sent.
+    Connect,
+    /// The HTTP response could not be framed/read to completion.
+    Http(&'static str),
+    /// The redirect chain was refused (cap, missing/malformed Location,
+    /// protocol downgrade).
+    Redirect(&'static str),
+    /// A final status outside `200`/`3xx`.
+    Status(u16),
+    /// The body exceeded [`BODY_CAP`].
+    TooLarge,
+    /// `200` with a zero-length body.
+    Empty,
+    /// `https` cannot be navigated from the app in this build — see the
+    /// module docs and `docs/browser.md` §8 row B4.
+    TlsUnavailable,
+}
+
+impl fmt::Display for NavError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Url(why) | Self::Http(why) | Self::Redirect(why) => f.write_str(why),
+            Self::Dns => f.write_str("dns: no answer for the host"),
+            Self::Connect => f.write_str("connection failed or timed out"),
+            Self::Status(status) => write!(f, "unexpected HTTP status {status}"),
+            Self::TooLarge => f.write_str("response body exceeds the byte bound"),
+            Self::Empty => f.write_str("empty response body"),
+            Self::TlsUnavailable => f.write_str(
+                "https is not navigable in this session (single pinned trust anchor; \
+                 see docs/browser.md)",
+            ),
+        }
+    }
+}
+
+/// How one fetch behaves — the only difference between the boot proofs
+/// and the navigation app.
+#[derive(Clone, Copy)]
+struct FetchPolicy {
+    /// May the loop enter the fail-closed TLS hop? (`tls.rs` is outside
+    /// B4's change set; the app says no and renders a page instead.)
+    tls: bool,
+    /// Connect-phase bound in milliseconds.
+    connect_ms: u64,
+    /// Close the final hop gracefully (FIN + wait for TimeWait/Closed)?
+    /// The boot proofs do — that close is one of their proofs. The app
+    /// **resets** instead (after the body is fully framed): a browser
+    /// navigates repeatedly, a graceful close leaves this 4-tuple in
+    /// TIME-WAIT on both sides, and the next SYN to the same host:port
+    /// is then answered from the server's TIME-WAIT entry (observed: a
+    /// connect timeout on a second visit to the same page). RST tears
+    /// the peer's TCB down immediately.
+    graceful_close: bool,
+    /// Pick a fresh local port for every hop instead of the fixed boot
+    /// port: the app must never collide with a 4-tuple the boot chain
+    /// (or a previous session) left in the peer's TIME-WAIT — e.g.
+    /// `browse http://example.com` right after the B2 proof, which used
+    /// the same source port. Cheap (64 ports, round-robin) and it makes
+    /// the first navigation deterministic.
+    rotate_port: bool,
+}
+
+impl FetchPolicy {
+    /// The boot proofs: the exact pre-B4 semantics.
+    const BOOT: Self = Self {
+        tls: true,
+        connect_ms: OP_DEADLINE_MS,
+        graceful_close: true,
+        rotate_port: false,
+    };
+    /// The navigation app: errors become pages, no TLS hop, short
+    /// connect bound, RST close and a rotating source port (repeat
+    /// navigation).
+    const NAV: Self = Self {
+        tls: false,
+        connect_ms: NAV_CONNECT_MS,
+        graceful_close: false,
+        rotate_port: true,
+    };
+}
+
+/// The app's rotating local-port range: 64 ports, away from the
+/// documented fixed ports (49152 plain smoke, 49160–49166 TLS/git/ssh/
+/// AI/browser/fetch).
+const NAV_PORT_BASE: u16 = 49300;
+const NAV_PORT_COUNT: u16 = 64;
+/// Round-robin counter behind [`next_nav_port`] (single core, no IRQ
+/// touches it; only the app fetches use it).
+static NAV_SEQ: AtomicU16 = AtomicU16::new(0);
+
+/// The next local port for an app hop (see
+/// [`FetchPolicy::rotate_port`]).
+fn next_nav_port() -> u16 {
+    let step = NAV_SEQ.fetch_add(1, Ordering::Relaxed) % NAV_PORT_COUNT;
+    NAV_PORT_BASE.wrapping_add(step)
+}
 
 /// Single-use statics — the `READ_STORAGE` idiom of `tls.rs`: written
 /// once from `fetch_smoke` on a single core; the only handler in play
@@ -193,49 +337,99 @@ fn host_header<'a>(
     core::str::from_utf8(out).ok()
 }
 
-/// One plain-HTTP hop on the browser's `tcp6` socket (local port
-/// [`PLAIN_PORT`]): connect, GET with [`HEADERS`], frame the response
-/// through this module's `PARSER` static, then close per the hop's
-/// role — a 3xx `abort()`s (RST, no TIME-WAIT → the socket recycles),
-/// anything else closes gracefully and must reach TimeWait/Closed.
-/// Returns `(status, total_body_bytes, location_len)`; every failure
-/// is `FATAL: browser:` + halt, never a partial result.
+/// One plain hop's request parameters (a struct instead of eight
+/// positional arguments): where to connect, what to ask for, and the
+/// caller-owned body/`Location` buffers.
+struct Hop<'a> {
+    /// Resolved endpoint.
+    ip: Ipv4Address,
+    /// `Host` header value source (already validated as ASCII by `url`).
+    host: &'a str,
+    /// Destination port (the `Host` header drops the scheme default).
+    port: u16,
+    /// `path ["?" query]` for the request line.
+    target: &'a str,
+    /// Head sample of the body (`BODY`).
+    body: &'a mut [u8],
+    /// `Location` value storage.
+    loc: &'a mut [u8],
+}
+
+/// One plain-HTTP hop on the browser's `tcp6` socket: reset a stale
+/// socket, connect, GET with [`HEADERS`], frame the response through
+/// this module's `PARSER` static, then close per the hop's role — a 3xx
+/// (or any hop under [`FetchPolicy::NAV`]) `abort()`s (RST, no
+/// TIME-WAIT → the socket recycles), a boot proof's final hop closes
+/// gracefully and must reach TimeWait/Closed. Returns
+/// `(status, total_body_bytes, location_len)` or the [`NavError`] the
+/// caller turns into a `FATAL:` line (boot) or a page (app). Every loop
+/// is deadline-bounded; no path can hang.
 fn plain_fetch(
     stack: &mut Stack,
-    ip: Ipv4Address,
-    host: &str,
-    port: u16,
-    target: &str,
-    body: &mut [u8],
-    loc: &mut [u8],
-) -> (u16, usize, usize) {
+    hop: Hop<'_>,
+    policy: FetchPolicy,
+) -> Result<(u16, usize, usize), NavError> {
+    let Hop {
+        ip,
+        host,
+        port,
+        target,
+        body,
+        loc,
+    } = hop;
+
     let handle = stack.tcp6_handle;
+    // Navigation may run after a hop that hit its deadline mid-flight
+    // (socket still SynSent/Established). `is_open` is false only for
+    // Closed/TimeWait, so this resets exactly the states `connect`
+    // would reject; the poll flushes the pending RST and forgets the
+    // tuple. At boot the socket is Closed and this is a no-op.
+    if stack.sockets.get::<tcp::Socket>(handle).is_open() {
+        stack.sockets.get_mut::<tcp::Socket>(handle).abort();
+        stack.poll();
+    }
+    let local_port = if policy.rotate_port {
+        next_nav_port()
+    } else {
+        PLAIN_PORT
+    };
     {
         let sock = stack.sockets.get_mut::<tcp::Socket>(handle);
-        if let Err(e) = sock.connect(stack.iface.context(), (ip, port), PLAIN_PORT) {
-            serial_println!("FATAL: browser: connect rejected: {e:?}");
-            crate::halt();
+        if let Err(e) = sock.connect(stack.iface.context(), (ip, port), local_port) {
+            serial_println!("browser: connect rejected: {e:?}");
+            return Err(NavError::Connect);
         }
     }
-    let deadline = clock::now_ms() + OP_DEADLINE_MS;
+    let deadline = clock::now_ms() + policy.connect_ms;
     loop {
         stack.poll();
-        if stack.sockets.get::<tcp::Socket>(handle).state() == tcp::State::Established {
+        let state = stack.sockets.get::<tcp::Socket>(handle).state();
+        if state == tcp::State::Established {
             break;
         }
+        // A refused endpoint answers with RST: `SynSent` → `Closed`
+        // immediately, which is an error *now*, not after the deadline.
+        if state == tcp::State::Closed {
+            serial_println!("browser: connection refused or reset by {ip}:{port}");
+            return Err(NavError::Connect);
+        }
         if clock::now_ms() > deadline {
-            fatal("tcp connect timeout");
+            serial_println!("browser: connect timeout to {ip}:{port}");
+            abandon(stack);
+            return Err(NavError::Connect);
         }
     }
     serial_println!("browser: connected to {ip}:{port}");
 
     let mut hbuf = [0u8; 600];
     let Some(host_hdr) = host_header(host, port, HTTP_PORT, &mut hbuf) else {
-        fatal("Host header does not fit the buffer");
+        abandon(stack);
+        return Err(NavError::Http("Host header does not fit the buffer"));
     };
     let mut req = [0u8; 512];
     let Some(req_len) = http::build_request(&mut req, host_hdr, target, &HEADERS) else {
-        fatal("GET request does not fit the buffer");
+        abandon(stack);
+        return Err(NavError::Http("GET request does not fit the buffer"));
     };
     let mut sent = 0usize;
     let deadline = clock::now_ms() + OP_DEADLINE_MS;
@@ -247,10 +441,16 @@ fn plain_fetch(
             .send_slice(&req[sent..])
         {
             Ok(n) => sent += n,
-            Err(_) => fatal("tcp send rejected (connection lost)"),
+            Err(_) => {
+                serial_println!("browser: tcp send rejected (connection lost)");
+                abandon(stack);
+                return Err(NavError::Connect);
+            }
         }
         if clock::now_ms() > deadline {
-            fatal("tcp send timeout");
+            serial_println!("browser: tcp send timeout");
+            abandon(stack);
+            return Err(NavError::Connect);
         }
     }
 
@@ -291,8 +491,9 @@ fn plain_fetch(
             let progress = match parser.feed(&scratch[..n], staging) {
                 Ok(progress) => progress,
                 Err(e) => {
-                    serial_println!("FATAL: browser: HTTP response refused: {e:?}");
-                    crate::halt();
+                    serial_println!("browser: HTTP response refused: {e:?}");
+                    abandon(stack);
+                    return Err(NavError::Http("HTTP response refused"));
                 }
             };
             deadline = clock::now_ms() + OP_DEADLINE_MS;
@@ -314,7 +515,8 @@ fn plain_fetch(
                 body_stored += take;
                 body_total = body_total.saturating_add(progress.body);
                 if body_total > BODY_CAP {
-                    fatal("response body exceeds the byte bound");
+                    abandon(stack);
+                    return Err(NavError::TooLarge);
                 }
             }
             if progress.complete {
@@ -326,24 +528,31 @@ fn plain_fetch(
             // Server FIN (or reset): close-delimited bodies finish
             // here; a framed body still short is refused as truncated.
             if let Err(e) = parser.eof() {
-                serial_println!("FATAL: browser: response truncated: {e:?}");
-                crate::halt();
+                serial_println!("browser: response truncated: {e:?}");
+                abandon(stack);
+                return Err(NavError::Http("response truncated"));
             }
             break;
         }
         if clock::now_ms() > deadline {
-            fatal("timeout waiting for the HTTP response");
+            serial_println!("browser: timeout waiting for the HTTP response");
+            abandon(stack);
+            return Err(NavError::Http("timeout waiting for the HTTP response"));
         }
     }
     if !status_checked {
-        fatal("response head never parsed");
+        abandon(stack);
+        return Err(NavError::Http("response head never parsed"));
     }
 
     // Close per the hop's role (the TLS path applies the same rule in
     // `tls_fetch_any`): a 3xx is intermediate → abort with RST, no
     // TIME-WAIT, reusable immediately; anything else is final →
-    // graceful FIN close, proven to settle below.
-    if (300..400).contains(&status) {
+    // graceful FIN close, proven to settle below — unless the policy
+    // asks for the app's RST close (repeat navigation, see
+    // [`FetchPolicy::graceful_close`]); the response is fully framed
+    // either way.
+    if (300..400).contains(&status) || !policy.graceful_close {
         stack.sockets.get_mut::<tcp::Socket>(handle).abort();
         // Dispatch the RST now: an aborted socket with a tuple
         // reports `PollAt::Now`, so this poll puts it on the wire and
@@ -362,11 +571,22 @@ fn plain_fetch(
                 break;
             }
             if clock::now_ms() > deadline {
-                fatal("timeout closing connection (never reached TimeWait/Closed)");
+                serial_println!("browser: timeout closing connection");
+                abandon(stack);
+                return Err(NavError::Connect);
             }
         }
     }
-    (status, body_total, loc_len)
+    Ok((status, body_total, loc_len))
+}
+
+/// Reset the browser's plain socket to `Closed` (an aborted socket with
+/// a tuple reports `PollAt::Now`, so the poll puts the RST on the wire
+/// and forgets the tuple — the same dance the 3xx close uses).
+fn abandon(stack: &mut Stack) {
+    let handle = stack.tcp6_handle;
+    stack.sockets.get_mut::<tcp::Socket>(handle).abort();
+    stack.poll();
 }
 
 /// One TLS hop on the browser's `tcp7` socket (local port
@@ -402,28 +622,32 @@ fn tls_hop(
 /// What one [`fetch`] handed back: the final URL, how many head bytes
 /// of the body are stored in [`BODY`] (`min(total, BODY_SAMPLE)`), and
 /// the total body size on the wire.
-struct Fetched {
-    url: Url,
-    stored: usize,
-    total: usize,
+pub(crate) struct Fetched {
+    /// Final URL after the redirect chain (absolute, parsed).
+    pub url: Url,
+    /// Stored head-sample length (`min(total, BODY_SAMPLE)`).
+    pub stored: usize,
+    /// Total body bytes on the wire (counted, not necessarily stored).
+    pub total: usize,
 }
 
 /// Fetch `start`, following up to [`MAX_REDIRECTS`] redirects — the
-/// B1 proof loop, parameterized so B2's render proof can point it at
-/// [`RENDER_URL`] (additive: `fetch_smoke` below still runs it with
-/// [`START_URL`], prints and all). Every failure is a fail-closed
-/// `FATAL: browser:` + [`crate::halt`], never a partial result;
-/// success returns the final URL plus the bounded body sample's
-/// stored length.
+/// shared hop loop behind the B1 proof ([`FetchPolicy::BOOT`], via
+/// [`fetch`]) and the B4 navigation app ([`FetchPolicy::NAV`], via
+/// [`navigate`]). Every failure is a [`NavError`]; only [`fetch`] turns
+/// one into a fatal line, so the app can render a page instead.
 ///
 /// Its serial lines mirror to the VGA text buffer — callers hand the
 /// shell a clean screen afterwards (see [`fetch_smoke`]).
-fn fetch(stack: &mut Stack, start: &str) -> Fetched {
+fn hop_loop(stack: &mut Stack, start: &str, policy: FetchPolicy) -> Result<Fetched, NavError> {
+    // A failed fetch must not leave the previous page's sample looking
+    // current (`sample` reads `STORED`).
+    STORED.store(0, Ordering::Relaxed);
     let mut url = match Url::parse(start) {
         Ok(url) => url,
         Err(e) => {
-            serial_println!("FATAL: browser: cannot parse the start URL: {e:?}");
-            crate::halt();
+            serial_println!("browser: cannot parse the URL: {e:?}");
+            return Err(NavError::Url("cannot parse the URL"));
         }
     };
     // SAFETY: single-use statics (see `BODY`/`LOC`); one fetch at a
@@ -442,59 +666,83 @@ fn fetch(stack: &mut Stack, start: &str) -> Fetched {
         // pointing at `ftp:`, `data:`, … is refused before any I/O.
         let scheme = url.scheme();
         if scheme != "http" && scheme != "https" {
-            fatal("unsupported URL scheme (only http/https)");
+            return Err(NavError::Url("unsupported URL scheme (only http/https)"));
+        }
+        // The app's policy: no TLS hop at all (module docs). The check
+        // sits before any socket work, so the page is instant.
+        if scheme == "https" && !policy.tls {
+            return Err(NavError::TlsUnavailable);
         }
         let Some(host) = url.host_str() else {
-            fatal("URL has no host");
+            return Err(NavError::Url("URL has no host"));
         };
         let Some(port) = url.port_or_known_default() else {
-            fatal("URL has no usable port");
+            return Err(NavError::Url("URL has no usable port"));
         };
         // `tls_open` connects to :443 (the pinned-HTTPS port), so a
         // https URL anywhere else is refused rather than silently
         // misconnected — and the `Host` header then matches SNI.
         if scheme == "https" && port != 443 {
-            fatal("unsupported https port (only 443)");
+            return Err(NavError::Url("unsupported https port (only 443)"));
         }
         let mut tbuf = [0u8; 512];
         let Some(target) = request_target(&url, &mut tbuf) else {
-            fatal("request target too long or not ASCII");
+            return Err(NavError::Url("request target too long or not ASCII"));
         };
         let mut gbuf = [0u8; SANITIZE_CAP];
         let shown = sanitize(url.as_str().as_bytes(), &mut gbuf);
         serial_println!("browser: hop {hops} GET {shown}");
 
-        let ip = match stack.resolve(host) {
-            Some(ip) => ip,
-            None => {
-                let mut hbuf = [0u8; SANITIZE_CAP];
-                let hshown = sanitize(host.as_bytes(), &mut hbuf);
-                serial_println!("FATAL: browser: dns: no answer for {hshown}");
-                crate::halt();
-            }
+        // An IPv4 literal needs no DNS query (`browse http://10.0.2.2:…`).
+        let ip = match net::parse_ipv4(host) {
+            Some([a, b, c, d]) => Ipv4Address::new(a, b, c, d),
+            None => match stack.resolve(host) {
+                Some(ip) => ip,
+                None => {
+                    let mut hbuf = [0u8; SANITIZE_CAP];
+                    let hshown = sanitize(host.as_bytes(), &mut hbuf);
+                    serial_println!("browser: dns: no answer for {hshown}");
+                    return Err(NavError::Dns);
+                }
+            },
         };
         let (status, got, loc_full) = if scheme == "https" {
             tls_hop(stack, ip, host, target, body, loc)
         } else {
-            plain_fetch(stack, ip, host, port, target, body, loc)
+            plain_fetch(
+                stack,
+                Hop {
+                    ip,
+                    host,
+                    port,
+                    target,
+                    body,
+                    loc,
+                },
+                policy,
+            )?
         };
 
         match status {
             200 => break (url, got),
             300..=399 => {
                 if redirects == MAX_REDIRECTS {
-                    fatal("redirect cap exceeded (max 5)");
+                    return Err(NavError::Redirect("redirect cap exceeded (max 5)"));
                 }
                 if loc_full == 0 {
-                    fatal("redirect without a Location header");
+                    return Err(NavError::Redirect("redirect without a Location header"));
                 }
                 if loc_full > loc.len() {
-                    fatal("redirect Location longer than the buffer");
+                    return Err(NavError::Redirect(
+                        "redirect Location longer than the buffer",
+                    ));
                 }
                 let raw = &loc[..loc_full];
                 let reference = match core::str::from_utf8(raw) {
                     Ok(reference) => reference,
-                    Err(_) => fatal("redirect Location is not valid UTF-8"),
+                    Err(_) => {
+                        return Err(NavError::Redirect("redirect Location is not valid UTF-8"));
+                    }
                 };
                 let mut lbuf = [0u8; SANITIZE_CAP];
                 let lshown = sanitize(raw, &mut lbuf);
@@ -503,28 +751,30 @@ fn fetch(stack: &mut Stack, start: &str) -> Fetched {
                 let next = match url.join(reference) {
                     Ok(next) => next,
                     Err(e) => {
-                        serial_println!("FATAL: browser: malformed redirect Location: {e:?}");
-                        crate::halt();
+                        serial_println!("browser: malformed redirect Location: {e:?}");
+                        return Err(NavError::Redirect("malformed redirect Location"));
                     }
                 };
                 if next.scheme() != "http" && next.scheme() != "https" {
-                    fatal("redirect to an unsupported scheme (only http/https)");
+                    return Err(NavError::Redirect(
+                        "redirect to an unsupported scheme (only http/https)",
+                    ));
                 }
                 if url.scheme() == "https" && next.scheme() == "http" {
-                    fatal("refusing https -> http downgrade");
+                    return Err(NavError::Redirect("refusing https -> http downgrade"));
                 }
                 redirects += 1;
                 url = next;
             }
             _ => {
-                serial_println!("FATAL: browser: unexpected HTTP status {status}");
-                crate::halt();
+                serial_println!("browser: unexpected HTTP status {status}");
+                return Err(NavError::Status(status));
             }
         }
     };
 
     if body_total == 0 {
-        fatal("empty response body");
+        return Err(NavError::Empty);
     }
     let stored = min(body_total, BODY_SAMPLE);
     STORED.store(stored, Ordering::Relaxed);
@@ -533,13 +783,51 @@ fn fetch(stack: &mut Stack, start: &str) -> Fetched {
     serial_println!(
         "browser: fetched {final_shown} — {body_total} bytes after {redirects} redirect(s)"
     );
-    Fetched {
+    Ok(Fetched {
         url: final_url,
         // The sample is filled head-first by both hop classes, so the
         // stored prefix is exactly `min(total, BODY_SAMPLE)`.
         stored,
         total: body_total,
+    })
+}
+
+/// The boot proofs' front-end: [`hop_loop`] under
+/// [`FetchPolicy::BOOT`], any error `FATAL: browser:` + halt (never a
+/// partial result). Its serial lines mirror to the VGA text buffer, so
+/// callers hand the shell a clean screen afterwards.
+fn fetch(stack: &mut Stack, start: &str) -> Fetched {
+    match hop_loop(stack, start, FetchPolicy::BOOT) {
+        Ok(fetched) => fetched,
+        Err(e) => {
+            serial_println!("FATAL: browser: {e}");
+            crate::halt();
+        }
     }
+}
+
+/// B4: one navigation fetch for the interactive browser — the same hop
+/// loop as the boot proofs, but the error comes back as a [`NavError`]
+/// for the app to render and the policy refuses TLS (module docs).
+/// Success stores the bounded body sample exactly like [`fetch`], so
+/// [`sample`] is the caller's next read.
+pub(crate) fn navigate(stack: &mut Stack, start: &str) -> Result<Fetched, NavError> {
+    hop_loop(stack, start, FetchPolicy::NAV)
+}
+
+/// The head of the last successful fetch's body (`min(total,
+/// BODY_SAMPLE)` bytes) — the render input for the proofs and the app.
+///
+/// The reference is valid until the next fetch starts; callers build
+/// their owned tree before fetching again (one navigation at a time).
+pub(crate) fn sample() -> &'static [u8] {
+    let stored = STORED.load(Ordering::Relaxed);
+    // SAFETY: single-use static — the `READ_STORAGE` contract of
+    // `render_smoke`: fetches are sequential on one core, IRQ0 never
+    // touches `BODY`, and every `&mut` taken by a fetch is gone by the
+    // time this shared reference is created.
+    let body = unsafe { &*core::ptr::addr_of!(BODY) };
+    body.get(..stored.min(body.len())).unwrap_or(&[])
 }
 
 /// The B1 proof: fetch [`START_URL`] following up to
