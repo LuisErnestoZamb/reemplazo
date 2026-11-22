@@ -1,0 +1,11 @@
+[package]
+name = "csscore"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+# None by design: the B3 subset (docs/browser.md §5) is a from-scratch,
+# `no_std` + `alloc`, `forbid(unsafe_code)` dependency-policy exception
+# (a) — the standalone servo pieces (`cssparser`, `selectors`) are
+# std-leaning and do not carry the cascade this milestone needs.

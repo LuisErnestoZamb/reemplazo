@@ -215,6 +215,15 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
         // the missing marker). Its proofs clear the screen at the
         // end, so the shell still starts clean.
         browser::render_smoke(stack); // BROWSER_RENDER_OK
+        // B3 CSS subset (docs/browser.md §5): the kernel-owned styled
+        // fixture rendered with and without its sheet, VGA attribute
+        // bytes read back from 0xb8000, plus the real page's own sheet
+        // applied as a robustness pass — BROWSER_CSS_OK lands between
+        // BROWSER_RENDER_OK and SHELL_OK (the smoke asserts markers in
+        // order). It reuses the body sample render_smoke retained, so
+        // it costs no network and can sit inside the same `Some(stack)`
+        // branch; the screen is cleared after the proof.
+        browser::css_smoke(); // BROWSER_CSS_OK
     }
 
     // The shell is the kernel's idle state until a scheduler exists;

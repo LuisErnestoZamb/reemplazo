@@ -78,6 +78,12 @@ fat = { path = "../fat" }
 # `no_std` + `forbid(unsafe_code)`, zero deps beyond `html`;
 # adversarially host-tested in `dom/tests/`.
 dom = { path = "../dom" }
+# CSS subset (B3 of docs/browser.md §5): from-scratch under
+# dependency-policy exception (a) — the standalone servo pieces are
+# std-leaning and carry no cascade; selector matching, specificity and
+# computed values are ours. `no_std` + `forbid(unsafe_code)`, zero deps,
+# adversarially host-tested in `csscore/tests/`.
+csscore = { path = "../csscore" }
 net = { path = "../net" }
 pci = { path = "../pci" }
 rtc = { path = "../rtc" }

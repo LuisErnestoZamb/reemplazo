@@ -90,6 +90,9 @@ commit either way). Property subset v1: `display` (none/block/inline),
 `font-style`, `text-decoration`, list properties, `width`/`height` (cell
 units), margins/padding (cell units). Specificity + source order implemented
 properly (it is ~30 lines and prevents a class of wrong renders).
+B3 landed this as the **`csscore`** crate — §8 row B3 and the appendix
+record the exact supported/ignored set, the units and the VGA color
+mapping.
 
 ## 6. Layout + rendering
 
@@ -124,7 +127,7 @@ problem:
 | B0 | *(shared prerequisite)* TUI screen layer — docs/ai-client.md milestone **A1** (`TUI_OK`) | — | — |
 | B1 | URL parse/resolve + fetch with redirect loop against real hosts (GET only) | **`BROWSER_FETCH_OK`** (resolve+fetch github.com through ≥1 redirect, print status/final URL) | `url` probe, TLS |
 | B2 | HTML tree builder crate (host tests) + text layout + render in the TUI viewport | **`BROWSER_RENDER_OK`** (landed: `dom` arena tree over the tokenizer, word-wrapped layout rendered in the viewport and read back from `0xb8000` — real page *and* a feature fixture, since today's example.com carries no `<h1>`/`<a>`) | B0, B1 |
-| B3 | CSS subset: parser + cascade + attribute mapping | **`BROWSER_CSS_OK`** (styled page differs from unstyled, asserted on screen) | B2 |
+| B3 | CSS subset: parser + cascade + attribute mapping | **`BROWSER_CSS_OK`** (landed: `csscore` parses/selects/cascades — type/class/id/`*`/compound/descendant/comma, specificity + source order + inline + `!important`; `display`, `color`, `background-color`→VGA attribute, `font-weight`→bright bit, `font-style`→dim, `text-decoration` parsed/no-op, `list-style-type`, `width`/`height`, `margin`/`padding` in cells; styled fixture vs unstyled twin asserted on exact attribute bytes/positions from `0xb8000`; real-page sheet applied as an unchecked robustness pass) | B2 |
 | B4 | Navigation polish: history, link jump, status bar, error pages (DNS/refused/timeout → friendly page, never a hang) | **`BROWSER_NAV_OK`** (scripted key sequence follows a link and goes back) | B2 |
 | later | GUI (A6), images, cookies, HTTP cache, keep-alive, JS stance revisit | separate research | — |
 
@@ -151,6 +154,43 @@ so the AI-client track (A1→A2→A3) and the browser track interleave cleanly:
 
 ## Appendix: verification log
 
+- 2026-11-22 — **B3 landed** (`BROWSER_CSS_OK`, 27-marker chain):
+  `csscore` (new workspace crate, exception (a) of §5) — `no_std` +
+  `alloc`, zero deps, `forbid(unsafe_code)`, bounded input/rules/
+  selectors/declarations, adversarial host tests (`cargo test -p
+  csscore`: 66). Supported: type/`.class`/`#id`/`*`/compound/descendant
+  selectors and comma lists; `display` (none/block/inline,
+  `inline-block`→inline), `color`, `background-color`, `font-weight`
+  (normal/bold/100–900), `font-style` (italic→dim), `text-decoration`
+  (parsed; VGA has no underline), `list-style-type`
+  (disc/circle/square, dash, none), `width`/`height` and
+  `margin`/`padding` (1–4 value shorthand, cells; `px` = 8 px/cell
+  rounded up, `%` for width only). Cascade: id > class > type summed
+  over compounds, source order, inline `style=""`, `!important`
+  implemented (`(important, inline, id, class, type, order,
+  declaration)` — sheet-important beats inline-normal). Ignored
+  (fail-soft per declaration, rule survives): child/sibling/attribute/
+  pseudo selectors (selector dropped, comma list survives), `@media`/
+  `@import`/`@font-face` (skipped whole), units other than
+  `px`/bare/`%`-width, floats, `background`/`font` shorthands, external
+  stylesheets (`<link rel=stylesheet>` fetching is out). Render:
+  `display:none` skips the subtree, `color`/`background-color` become
+  the cell's VGA attribute indices (nearest RGB over the 16-color table
+  the tree already uses; ties → brighter; `yellow` → 11 because slot 3
+  is olive), `font-weight` the bright bit, `font-style` the dark half,
+  left margin/padding the block indent, top the blank-line count
+  (capped), `width` the block's wrap width, `list-style-type` the
+  marker; `background-color` inherits down the subtree (documented
+  divergence — no block boxes are painted), `height` right/bottom
+  margins are parsed but not applied by the flow. Proof: the fixture
+  frame is asserted cell-by-cell (heading 0x09, `.box` background
+  0xB7, `color:red` 0x01, bold 0x0F, `#id` 0x0E, inline 0x0B,
+  margin+padding shift x=4, `display:none` absent) and the **same body
+  without its sheet** re-asserts the plain heading attribute 0x0F,
+  default 0x07 on a plain div, the previously hidden paragraph visible
+  and x=0; the real example.com sheet parses (2 rules, all properties
+  outside the subset) and is applied without assertions, so B2's
+  example.com frame stays the unstyled regression net.
 - 2026-11-22 — **B2 landed** (`BROWSER_RENDER_OK`, 25-marker chain):
   `dom` (new workspace crate, exception (a) of §4) builds an iterative
   arena tree with `DEPTH_CAP` 64 / `NODE_CAP` 4096 refused fail-closed
