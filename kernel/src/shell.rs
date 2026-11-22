@@ -175,6 +175,7 @@ fn execute(stack: &mut Stack, line: &str) {
              \x20 ping <a.b.c.d>    ICMP echo roundtrip\n\
              \x20 resolve <host>    DNS A lookup\n\
              \x20 tui               full-screen TUI demo (Esc quits)\n\
+             \x20 edit              in-memory text editor (Esc quits)\n\
              \x20 halt              park the CPU"
         ),
         "echo" => serial_println!("{rest}"),
@@ -241,6 +242,7 @@ fn execute(stack: &mut Stack, line: &str) {
             }
         }
         "tui" => crate::apps::tui::run(),
+        "edit" => crate::apps::editor::run(),
         "halt" => {
             serial_println!("halting.");
             crate::halt();

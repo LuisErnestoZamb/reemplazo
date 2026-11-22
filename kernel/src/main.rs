@@ -131,6 +131,11 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
     // screen to the shell. Serial output is untouched.
     apps::tui::boot_proof();
 
+    // A2 editor: scripted insert/newline/delete/undo/redo proof, frame
+    // read back from 0xb8000 (EDITOR_OK — between TUI_OK and SHELL_OK),
+    // then another clean text screen for the shell.
+    apps::editor::boot_proof();
+
     // The shell is the kernel's idle state until a scheduler exists;
     // without a NIC there is nothing to drive, so just park.
     match stack.as_mut() {

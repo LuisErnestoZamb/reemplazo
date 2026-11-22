@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["git-pktline", "html", "kernel", "mbi", "net", "pci", "rtc", "ssh-wire", "xtask"]
+members = ["editorbuf", "git-pktline", "html", "kernel", "mbi", "net", "pci", "rtc", "ssh-wire", "xtask"]
 # Bare `cargo build` at the repo root must not try to build `kernel` for the
 # host: it is no_std and only valid for x86_64-unknown-none (built via xtask).
-default-members = ["git-pktline", "html", "mbi", "net", "pci", "rtc", "ssh-wire", "xtask"]
+default-members = ["editorbuf", "git-pktline", "html", "mbi", "net", "pci", "rtc", "ssh-wire", "xtask"]
 
 [workspace.package]
 edition = "2024"

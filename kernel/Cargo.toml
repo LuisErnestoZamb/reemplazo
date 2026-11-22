@@ -16,6 +16,13 @@ git-pktline = { path = "../git-pktline" }
 # advisory history, `ssh-protocol` is a WIP facade; rationale and the
 # adversarial test suite live in the crate's docs.
 ssh-wire = { path = "../ssh-wire" }
+# Editor gap buffer (A2 of docs/ai-client.md §5): from-scratch under
+# dependency-policy exceptions (a)+(b) — no maintained no_std rope exists
+# (ropey is std-only, verified in source) and a flat buffer is less
+# memory + trivially forbid(unsafe_code) at our bounds; rationale and the
+# adversarial suite (UTF-8 boundary refusals, gap compaction, line-index
+# oracle, undo/redo) live in the crate's docs.
+editorbuf = { path = "../editorbuf" }
 multiboot2 = { version = "0.28", default-features = false }
 net = { path = "../net" }
 pci = { path = "../pci" }

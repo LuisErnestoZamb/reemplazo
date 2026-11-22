@@ -277,6 +277,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "editorbuf"
+version = "0.1.0"
+
+[[package]]
 name = "either"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -559,6 +563,7 @@ dependencies = [
 name = "kernel"
 version = "0.1.0"
 dependencies = [
+ "editorbuf",
  "embassy-crypto",
  "embassy-crypto-rustcrypto",
  "embedded-io",
