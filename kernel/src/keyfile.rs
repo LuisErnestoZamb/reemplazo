@@ -190,6 +190,27 @@ pub(crate) struct ServerConfig {
 /// the volume does not carry one. A file that is present but malformed
 /// prints one explanatory line and yields `None`: a typo must not look
 /// like "not configured", and it must not stop the boot either.
+/// Hardware bring-up module layout: exactly this many bytes.
+pub(crate) const MODULE_CONFIG_LEN: usize = 64;
+
+/// The `sshd` multiboot2 module (hw bring-up): host seed ‖ the
+/// authorized key's raw 32 bytes. No parsing beyond a length check —
+/// the operator-side generator (kept out of this repo) writes exactly
+/// this layout; a malformed module is refused, never guessed at.
+pub(crate) fn module_config(raw: &[u8]) -> Option<ServerConfig> {
+    if raw.len() != MODULE_CONFIG_LEN {
+        return None;
+    }
+    let mut host_seed = [0u8; 32];
+    host_seed.copy_from_slice(&raw[..32]);
+    let mut client_key = [0u8; 32];
+    client_key.copy_from_slice(&raw[32..]);
+    Some(ServerConfig {
+        host_seed,
+        client_key,
+    })
+}
+
 pub(crate) fn server_config(dev: &ata::Drive) -> Option<ServerConfig> {
     let disk = KeyDisk(dev);
     let fs = fat::Fat16::mount(&disk).ok()?; // not FAT16 → not ours

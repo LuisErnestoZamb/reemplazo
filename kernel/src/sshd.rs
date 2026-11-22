@@ -89,7 +89,7 @@ static mut RX: [u8; RX_CAP] = [0; RX_CAP];
 
 /// Serve exactly one client, or give up after [`ACCEPT_DEADLINE_MS`].
 /// Called from the boot chain only when a disk carried a server key.
-pub(crate) fn serve_once(stack: &mut Stack, cfg: &ServerConfig) {
+pub(crate) fn serve_once(stack: &mut Stack, cfg: &ServerConfig) -> bool {
     // The fingerprint is public material: it is what an operator
     // compares out of band. The seed behind it is never printed.
     let mut host_seed = cfg.host_seed;
@@ -101,14 +101,14 @@ pub(crate) fn serve_once(stack: &mut Stack, cfg: &ServerConfig) {
         Some(n) => n,
         None => {
             serial_println!("sshd: host key blob does not fit");
-            return;
+            return false;
         }
     };
     ssh::print_public_key("sshd: host key (ssh-ed25519)", &blob[..blob_len]);
 
     if !stack.listen_ssh(LISTEN_PORT) {
         serial_println!("sshd: cannot listen on :{LISTEN_PORT}; not serving");
-        return;
+        return false;
     }
     serial_println!(
         "sshd: listening on :{LISTEN_PORT} (one connection, {} s budget)",
@@ -131,14 +131,14 @@ pub(crate) fn serve_once(stack: &mut Stack, cfg: &ServerConfig) {
             && !stack.listen_ssh(LISTEN_PORT)
         {
             serial_println!("sshd: cannot re-listen on :{LISTEN_PORT}");
-            return;
+            return false;
         }
         if clock::now_ms() > deadline {
             serial_println!(
                 "sshd: no client within {} s; not serving",
                 ACCEPT_DEADLINE_MS / 1000
             );
-            return;
+            return false;
         }
     }
 
@@ -154,7 +154,10 @@ pub(crate) fn serve_once(stack: &mut Stack, cfg: &ServerConfig) {
             // machine-checked by `cargo xtask smoke-ssh` (server VM)
             serial_println!("SSHD_SESSION_OK");
         }
-        Err(reason) => serial_println!("sshd: connection dropped: {reason}"),
+        Err(reason) => {
+            serial_println!("sshd: connection dropped: {reason}");
+            return false;
+        }
     }
 
     // Orderly close: FIN if the peer is still there; a dead connection
@@ -176,6 +179,7 @@ pub(crate) fn serve_once(stack: &mut Stack, cfg: &ServerConfig) {
             break; // release anyway: one session, then back to boot
         }
     }
+    true
 }
 
 /// One wire failure reason — ours, static, safe to log.
@@ -714,7 +718,7 @@ fn channel_phase(stack: &mut Stack, wire: &mut Conn<'_, '_>) -> Wire {
 /// (pipes, builtins, git-upload-pack) is the later shell/session
 /// milestone; this exists so bytes demonstrably cross the channel.
 fn run_command(command: &[u8]) -> ([u8; ssh_wire::EXEC_COMMAND_MAX], usize, u32) {
-    const UNKNOWN: &[u8] = b"sshd: unknown command (only echo)\n";
+    const UNKNOWN: &[u8] = b"sshd: unknown command (echo|reboot)\n";
     let mut out = [0u8; ssh_wire::EXEC_COMMAND_MAX];
     let rest = command.trim_ascii();
     if let Some(args) = rest.strip_prefix(b"echo")
@@ -725,6 +729,12 @@ fn run_command(command: &[u8]) -> ([u8; ssh_wire::EXEC_COMMAND_MAX], usize, u32)
         out[..len].copy_from_slice(&msg[..len]);
         out[len] = b'\n';
         return (out, len + 1, 0);
+    }
+    if rest == b"reboot" {
+        // Remote recovery: the operator can always return the machine
+        // to the loader's next entry (the one-shot GRUB cycle).
+        serial_println!("sshd: reboot requested over ssh");
+        crate::power::reboot();
     }
     let n = UNKNOWN.len().min(out.len());
     out[..n].copy_from_slice(&UNKNOWN[..n]);

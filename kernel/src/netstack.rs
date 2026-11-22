@@ -573,21 +573,18 @@ impl Stack {
     /// sources 0.0.0.0 regardless, so the DISCOVER is unaffected
     /// (docs/smoltcp-eval.md §7).
     pub fn set_static_ipv4(&mut self) {
-        let guest = Ipv4Address::new(
-            SLIRP_GUEST_IP[0],
-            SLIRP_GUEST_IP[1],
-            SLIRP_GUEST_IP[2],
-            SLIRP_GUEST_IP[3],
-        );
-        let gateway = Ipv4Address::new(
-            SLIRP_GATEWAY[0],
-            SLIRP_GATEWAY[1],
-            SLIRP_GATEWAY[2],
-            SLIRP_GATEWAY[3],
-        );
+        self.set_static_ipv4_at(SLIRP_GUEST_IP, 24, SLIRP_GATEWAY);
+    }
+
+    /// The same assignment for a caller-chosen address — the hardware
+    /// bring-up mode (`kernel/src/hwtest.rs`) uses the real LAN's
+    /// numbers, where the slirp constants do not apply.
+    pub fn set_static_ipv4_at(&mut self, addr: [u8; 4], prefix: u8, gateway: [u8; 4]) {
+        let guest = Ipv4Address::new(addr[0], addr[1], addr[2], addr[3]);
+        let gateway = Ipv4Address::new(gateway[0], gateway[1], gateway[2], gateway[3]);
         self.iface.update_ip_addrs(|addrs| {
             addrs.clear();
-            let _ = addrs.push(IpCidr::Ipv4(Ipv4Cidr::new(guest, 24)));
+            let _ = addrs.push(IpCidr::Ipv4(Ipv4Cidr::new(guest, prefix)));
         });
         let _ = self.iface.routes_mut().add_default_ipv4_route(gateway);
     }

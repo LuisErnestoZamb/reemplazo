@@ -29,6 +29,7 @@ mod git;
 mod git_fetch;
 mod git_store;
 mod heap;
+mod hwtest;
 mod idt;
 mod install;
 mod keyboard;
@@ -38,6 +39,7 @@ mod pci;
 mod pic;
 mod pit;
 mod port;
+mod power;
 mod rtc;
 mod shell;
 mod sky2;
@@ -58,6 +60,42 @@ use multiboot2::{
 };
 
 core::arch::global_asm!(include_str!("entry.S"), options(att_syntax));
+
+/// Multiboot2 module with the command line `sshd`: the hardware
+/// bring-up configuration (64 bytes: host seed ‖ authorized key).
+/// Copied out of GRUB's memory before the frame allocator exists —
+/// module frames are not reserved in the multiboot2 memory map.
+const SSHD_MODULE_CAP: usize = 128;
+static mut SSHD_MODULE: [u8; SSHD_MODULE_CAP] = [0; SSHD_MODULE_CAP];
+
+fn capture_sshd_module(info: &BootInformation) -> Option<usize> {
+    for tag in info.module_tags() {
+        let Ok(name) = tag.cmdline() else {
+            continue;
+        };
+        if name != "sshd" {
+            continue;
+        }
+        let Ok(len) = mbi::check_module(tag.start_address(), tag.end_address(), SSHD_MODULE_CAP)
+        else {
+            serial_println!("FATAL: mbi: sshd module range refused");
+            halt();
+        };
+        // SAFETY: `check_module` proved start != 0, end > start and
+        // len <= the destination's length; both addresses are inside
+        // the identity map; the destination is this module's
+        // single-use static and interrupts are off here.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                tag.start_address() as *const u8,
+                core::ptr::addr_of_mut!(SSHD_MODULE) as *mut u8,
+                len,
+            )
+        };
+        return Some(len);
+    }
+    None
+}
 
 /// Called from `entry.S` with System V AMD64 args.
 ///
@@ -82,7 +120,7 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
         halt();
     }
 
-    let payloads = match read_mbi(mbi_addr) {
+    let (payloads, sshd_len) = match read_mbi(mbi_addr) {
         Ok(info) => {
             report_boot_info(&info);
             sync_vga(&info);
@@ -94,11 +132,16 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
             // `install::capture_modules`). Silent when a boot carries no
             // modules (the installed system's own boot).
             let payloads = crate::install::capture_modules(&info);
+            // Hardware bring-up: an `sshd` module turns this boot into
+            // the network-only service mode (see `crate::hwtest`).
+            // Copied before the frame allocator for the same reason as
+            // the installer payloads.
+            let sshd_len = capture_sshd_module(&info);
             memory::init(&info, mbi_addr);
             memory::selftest(&info, mbi_addr); // MEM_OK
             heap::init(); // carve a contiguous run, init the global heap
             heap::prove_alloc(); // ALLOC_OK — before the network chain
-            payloads
+            (payloads, sshd_len)
         }
         Err(e) => {
             serial_println!("FATAL: bad multiboot2 info: {:?}", e);
@@ -177,6 +220,28 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
             | u64::from(crate::entropy::boot_entropy());
         netstack::Stack::new(dev, seed)
     });
+
+    // Hardware bring-up mode: an `sshd` module means "serve sshd on
+    // the real LAN instead of running the smoke chain" — the only
+    // observability channel this machine has (no serial port).
+    if let Some(len) = sshd_len {
+        // SAFETY: `SSHD_MODULE` is written once by
+        // `capture_sshd_module` before the allocator exists; single
+        // core, interrupts still off during capture, read-only here.
+        let raw = unsafe {
+            core::slice::from_raw_parts(core::ptr::addr_of!(SSHD_MODULE) as *const u8, len)
+        };
+        match crate::keyfile::module_config(raw) {
+            Some(cfg) => match stack.as_mut() {
+                Some(stack) => crate::hwtest::run(stack, &cfg), // never returns
+                None => crate::hwtest::no_nic(),                // never returns
+            },
+            None => {
+                serial_println!("FATAL: hw: sshd module is malformed (want 64 bytes)");
+                halt();
+            }
+        }
+    }
 
     if let Some(stack) = stack.as_mut() {
         stack.set_static_ipv4();
