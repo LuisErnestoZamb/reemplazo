@@ -34,7 +34,7 @@ Estado: **hito 1 completado** (`e53295e`).kernel+apps separados por una frontera
 | 4 · FS | ✅ (mergeado) | syscalls 10–15, fds opacos por PID, volumen RAM acotado, `user/edit` con readback byte-exacto; deuda: volumen FAT-backed real, `Seek`, persistencia |
 | 5 · red/TLS | 📋 | handles opacos para `netstack`/`tls`, estados `Blocked`, migrar AI y browser |
 | 6 · git/ssh/instalador | 📋 | `Spawn/Waitpid`, IPC acotado, ELFs de usuario en p2 y `GRUB_EARLY_CFG` |
-| 7 · corte total | 📋 | borrar `kernel/src/apps/`, `shell::run` solo fallback, `USER_ONLY_OK` |
+| 7 · corte total | 📋 | migrar apps interactivas a userland; **conservar los boot proofs** (`apps::{tui,editor,ai,browse}::boot_proof` en `main.rs`, productores de la cadena de 30) o convertirlos en módulos `#[cfg]`; `shell::run` solo fallback; `USER_ONLY_OK` |
 
 ## Deuda y decisiones
 
