@@ -11,11 +11,30 @@ mbi = { path = "../mbi" }
 # exception (a) — `gix-packetline` is std-only; rationale and the
 # adversarial test suite live in the crate's docs.
 git-pktline = { path = "../git-pktline" }
-# SSH wire codec (S1 of docs/git-ssh-deps.md §B): from-scratch under
-# dependency-policy exception (a) — `russh` is std-only with an
+# SSH wire codec (S1/S2 of docs/git-ssh-deps.md §B): from-scratch
+# under dependency-policy exception (a) — `russh` is std-only with an
 # advisory history, `ssh-protocol` is a WIP facade; rationale and the
 # adversarial test suite live in the crate's docs.
 ssh-wire = { path = "../ssh-wire" }
+# SSH key exchange (S2, docs/git-ssh-deps.md §B.1): audited dalek
+# crates for X25519/Ed25519, `default-features = false` (no getrandom,
+# no serde, no alloc — `static_secrets` only). Review recorded in the
+# S2 commit: x25519-dalek 3.0.0 + ed25519-dalek 3.0.0 are RustSec-clean
+# at these versions (RUSTSEC-2024-0344/2022-0093 patched long before),
+# `#![no_std]` by construction, and both cross-check clean for
+# `x86_64-unknown-none`.
+x25519-dalek = { version = "3.0", default-features = false, features = ["static_secrets"] }
+ed25519-dalek = { version = "3.0", default-features = false }
+# SSH transport crypto glue (S2): SHA-256 (exchange hash + RFC4253 §7.2
+# KDF), HMAC-SHA256 (packet MACs), AES-CTR (aes128/256-ctr). All four
+# already in Cargo.lock via embassy-crypto-rustcrypto / aes-gcm, audited
+# (RustSec-clean at these versions), no_std with `default-features =
+# false` (no alloc). The protocol glue lives in `ssh-wire`, tested on
+# the host against these same crates.
+sha2 = { version = "0.11", default-features = false }
+hmac = { version = "0.13", default-features = false }
+aes = { version = "0.9", default-features = false }
+ctr = { version = "0.10", default-features = false }
 multiboot2 = { version = "0.28", default-features = false }
 net = { path = "../net" }
 pci = { path = "../pci" }

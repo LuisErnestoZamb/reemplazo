@@ -1,9 +1,14 @@
-//! SSH wire codec — milestone S1 of docs/git-ssh-deps.md §B.4: the
-//! RFC4253 identification banner (§4.2), the unencrypted binary
-//! packet framing (§6), `SSH_MSG_KEXINIT` parse/encode (§7.1) and the
-//! algorithm intersection. **Plaintext only** — key exchange and
-//! crypto arrive with S2; nothing in this crate implements (or may
-//! ever implement) a cryptographic primitive.
+//! SSH wire codec — milestones S1+S2 of docs/git-ssh-deps.md §B.4: the
+//! RFC4253 identification banner (§4.2), the binary packet framing
+//! (§6, plaintext and encrypted), `SSH_MSG_KEXINIT` parse/encode
+//! (§7.1) and algorithm intersection, the `curve25519-sha256` KEXDH
+//! message pair (RFC4253 §8 / RFC8731 §3), the RFC4253 §7.2 key
+//! derivation, `NEWKEYS`, `SSH_MSG_EXT_INFO` (RFC8308) and the
+//! service/`none`-auth probe messages. **No primitive lives here** —
+//! SHA-256, HMAC, AES-CTR, X25519 and Ed25519 all come from the
+//! audited crates the kernel (and, for tests only, this crate's
+//! dev-dependencies) already use; everything in this file is protocol
+//! glue over a wire format the RFCs specify byte for byte.
 //!
 //! From-scratch under the skill's dependency-policy exception (a),
 //! justified in docs/git-ssh-deps.md §B.2: `russh` is std-only
@@ -199,6 +204,18 @@ pub enum PacketStep<'a> {
 /// validated the moment it is complete, so a bad declared structure
 /// fails before its (attacker-chosen) length is ever waited on.
 pub fn decode_packet(buf: &[u8]) -> PacketStep<'_> {
+    decode_packet_block(buf, BLOCK_SIZE)
+}
+
+/// [`decode_packet`] with an explicit alignment block: `8` before the
+/// keys exist, `max(cipher block, 8)` once `aes*-ctr` is up (16 for
+/// every cipher we negotiate — RFC4253 §6). A `block_size` of 0 is
+/// refused as [`PacketError::Misaligned`] (defensive; the encoders
+/// refuse blocks below [`MIN_PADDING`]'s alignment base too).
+pub fn decode_packet_block(buf: &[u8], block_size: usize) -> PacketStep<'_> {
+    if block_size == 0 {
+        return PacketStep::Failed(PacketError::Misaligned);
+    }
     if buf.len() < 4 {
         return PacketStep::Incomplete;
     }
@@ -215,7 +232,7 @@ pub fn decode_packet(buf: &[u8]) -> PacketStep<'_> {
     // u32 → usize after the cap check: lossless on every target we
     // build for (x86-64 hosts and `x86_64-unknown-none`).
     let packet_length = declared as usize;
-    if !(packet_length + 4).is_multiple_of(BLOCK_SIZE) {
+    if !(packet_length + 4).is_multiple_of(block_size) {
         return PacketStep::Failed(PacketError::Misaligned);
     }
     if buf.len() < 5 {
@@ -286,6 +303,7 @@ pub struct KexInit<'a> {
 /// Bounds-checked cursor over the payload — every read is checked
 /// against the remaining slice; wire data never reaches an unguarded
 /// index.
+#[derive(Debug, Clone, Copy)]
 struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,
@@ -396,8 +414,16 @@ pub fn parse_kexinit(payload: &[u8]) -> Result<KexInit<'_>, KexError> {
 
 /// Our kex name-list (docs/git-ssh-deps.md §B.3: the minimal
 /// GitHub-compatible set — every algorithm here must be understood by
-/// `github.com:22` today).
-pub const KEX_ALGORITHMS: &str = "curve25519-sha256";
+/// `github.com:22` today). `ext-info-c` is not a key-exchange method:
+/// it is the RFC8308 signal that makes the server send
+/// `SSH_MSG_EXT_INFO` after its `NEWKEYS` (the first encrypted packet
+/// we may receive — the S2 driver parses it).
+pub const KEX_ALGORITHMS: &str = "curve25519-sha256,ext-info-c";
+/// The one key-exchange method we actually implement: what
+/// [`intersect`] must select from [`KEX_ALGORITHMS`] (the trailing
+/// `ext-info-c` signal may never be negotiated *as* the kex —
+/// [`check_must_have`] refuses that).
+pub const KEX_CHOSEN: &str = "curve25519-sha256";
 /// Our server-host-key acceptance list.
 pub const HOST_KEY_ALGORITHMS: &str = "ssh-ed25519";
 /// Our cipher list, both directions (AES-CTR is a stream cipher — no
@@ -579,7 +605,7 @@ impl Missing {
 /// actually implement (§B.1 primitives + `none`). Anything else —
 /// including missing overlap — is a hard failure.
 pub fn check_must_have(n: &Negotiated) -> Result<(), Missing> {
-    if n.kex != Some(KEX_ALGORITHMS) {
+    if n.kex != Some(KEX_CHOSEN) {
         return Err(Missing::Kex);
     }
     if n.host_key != Some(HOST_KEY_ALGORITHMS) {
@@ -608,9 +634,834 @@ pub fn check_must_have(n: &Negotiated) -> Result<(), Missing> {
     Ok(())
 }
 
+// ---- S2: key exchange, key derivation, encrypted packets ----------
+
+/// `SSH_MSG_EXT_INFO` (RFC8308 §2.1) — may arrive as the first
+/// encrypted packet after the server's `NEWKEYS`.
+pub const SSH_MSG_EXT_INFO: u8 = 7;
+/// `SSH_MSG_SERVICE_REQUEST` (RFC4253 §10).
+pub const SSH_MSG_SERVICE_REQUEST: u8 = 5;
+/// `SSH_MSG_SERVICE_ACCEPT` (RFC4253 §10).
+pub const SSH_MSG_SERVICE_ACCEPT: u8 = 6;
+/// `SSH_MSG_NEWKEYS` (RFC4253 §7.3).
+pub const SSH_MSG_NEWKEYS: u8 = 21;
+/// `SSH_MSG_KEXDH_INIT` — RFC8731 §3 registers the curve25519 method
+/// under the ECDH message numbers, identical to RFC4253 §8's.
+pub const SSH_MSG_KEXDH_INIT: u8 = 30;
+/// `SSH_MSG_KEXDH_REPLY` (RFC8731 §3 / RFC4253 §8).
+pub const SSH_MSG_KEXDH_REPLY: u8 = 31;
+/// `SSH_MSG_USERAUTH_REQUEST` (RFC4254 §5).
+pub const SSH_MSG_USERAUTH_REQUEST: u8 = 50;
+/// `SSH_MSG_USERAUTH_FAILURE` (RFC4254 §5).
+pub const SSH_MSG_USERAUTH_FAILURE: u8 = 51;
+
+/// `hmac-sha2-256` tag length (RFC4253 §6.4 over SHA-256): every MAC
+/// on the wire is exactly this many bytes, in the clear after the
+/// ciphertext.
+pub const TAG_LEN: usize = 32;
+/// Encrypted-phase alignment block: `max(cipher block, 8)` for the
+/// `aes*-ctr` family is 16 (RFC4253 §6 — the constraint holds even
+/// for stream ciphers).
+pub const ENC_BLOCK: usize = 16;
+
+/// RFC4251 `string`: `uint32` big-endian length + bytes. `None` when
+/// it does not fit `out` (or the length exceeds `u32::MAX`).
+pub fn encode_string(bytes: &[u8], out: &mut [u8]) -> Option<usize> {
+    let n = u32::try_from(bytes.len()).ok()?;
+    let total = 4usize.checked_add(bytes.len())?;
+    let dst = out.get_mut(..total)?;
+    dst[..4].copy_from_slice(&n.to_be_bytes());
+    dst[4..].copy_from_slice(bytes);
+    Some(total)
+}
+
+/// RFC4251 `mpint` of a non-negative integer: leading zero bytes are
+/// stripped, `0x00` is prepended when the leading bit would make the
+/// value negative, and the `uint32` length counts that prepended byte.
+/// Byte-for-byte identical to OpenSSH's `sshbuf_put_bignum2_bytes` —
+/// the exchange hash and the RFC4253 §7.2 KDF both feed this encoding
+/// of the shared secret `K`, so a single divergent byte breaks every
+/// signature and key. `None` when it does not fit `out`.
+pub fn encode_mpint(bytes: &[u8], out: &mut [u8]) -> Option<usize> {
+    let start = bytes.iter().take_while(|&&b| b == 0).count();
+    let body = &bytes[start..];
+    let prepend = matches!(body.first(), Some(&b) if b & 0x80 != 0);
+    let n = body.len() + usize::from(prepend);
+    let n32 = u32::try_from(n).ok()?;
+    let total = 4usize.checked_add(n)?;
+    let dst = out.get_mut(..total)?;
+    dst[..4].copy_from_slice(&n32.to_be_bytes());
+    let mut w = 4;
+    if prepend {
+        dst[w] = 0;
+        w += 1;
+    }
+    dst[w..].copy_from_slice(body);
+    Some(total)
+}
+
+/// Frame `payload` as one binary packet (RFC4253 §6): `uint32
+/// packet_length`, `byte padding_length`, `payload`, padding — with
+/// `4 + packet_length` a multiple of `block_size` (≥ 8, per
+/// `max(cipher block, 8)`) and at least [`MIN_PADDING`] padding bytes.
+/// The padding is whatever `fill_pad` writes — S2 draws random bytes
+/// from the kernel CSPRNG (the RFC's "SHOULD be random" is a hard
+/// requirement once padding rides inside ciphertext); S1's KEXINIT
+/// encoder still zero-fills deliberately, because it carries no
+/// secrets. `None` when the packet does not fit `out`, `payload` is
+/// empty (no message-type byte), or `block_size` is unusable. MAC and
+/// encryption are [`seal_packet`]'s job.
+pub fn encode_packet(
+    payload: &[u8],
+    block_size: usize,
+    mut fill_pad: impl FnMut(&mut [u8]),
+    out: &mut [u8],
+) -> Option<usize> {
+    if payload.is_empty() || block_size < 8 {
+        return None;
+    }
+    let unpadded = 5usize.checked_add(payload.len())?;
+    let mut pad = (block_size - unpadded % block_size) % block_size;
+    if pad < MIN_PADDING {
+        pad += block_size;
+    }
+    // `padding_length` is a single byte (RFC4253 §6).
+    if pad > u8::MAX as usize {
+        return None;
+    }
+    let packet_length = 1usize.checked_add(payload.len())?.checked_add(pad)?;
+    let packet_length32 = u32::try_from(packet_length).ok()?;
+    let total = 4usize.checked_add(packet_length)?;
+    let dst = out.get_mut(..total)?;
+    dst[..4].copy_from_slice(&packet_length32.to_be_bytes());
+    dst[4] = u8::try_from(pad).ok()?;
+    dst[5..5 + payload.len()].copy_from_slice(payload);
+    fill_pad(&mut dst[5 + payload.len()..total]);
+    Some(total)
+}
+
+/// The wire length (`4 + packet_length`) declared by a packet header,
+/// validated against `block_size`, from just the first four bytes.
+/// The encrypted phase needs this after decrypting only the first
+/// block-aligned chunk: the length itself is ciphertext, and it says
+/// where the ciphertext ends and the in-the-clear MAC tag begins
+/// (RFC4253 §6.3). `Ok(None)` while fewer than four bytes exist;
+/// `Err` the moment the header alone is illegal — bounds are checked
+/// before a single further byte is ever waited on.
+pub fn packet_total(head: &[u8], block_size: usize) -> Result<Option<usize>, PacketError> {
+    if block_size == 0 {
+        return Err(PacketError::Misaligned);
+    }
+    let Some(first) = head.get(..4) else {
+        return Ok(None);
+    };
+    let arr: [u8; 4] = first.try_into().map_err(|_| PacketError::TooSmall)?;
+    let declared = u32::from_be_bytes(arr);
+    if declared < 5 {
+        return Err(PacketError::TooSmall);
+    }
+    if declared > MAX_PACKET_LENGTH {
+        return Err(PacketError::TooLarge);
+    }
+    // u32 → usize after the cap check (lossless on our targets).
+    let total = 4usize
+        .checked_add(declared as usize)
+        .ok_or(PacketError::TooLarge)?;
+    if !total.is_multiple_of(block_size) {
+        return Err(PacketError::Misaligned);
+    }
+    Ok(Some(total))
+}
+
+/// A parsed `SSH_MSG_KEXDH_REPLY` (RFC4253 §8 / RFC8731 §3). Every
+/// length has been validated: `K_S` is exactly `string "ssh-ed25519"`
+/// followed by `string` of 32 key bytes, `f` exactly 32 bytes and not
+/// the all-zero (small-order) point, `signature` exactly
+/// `string "ssh-ed25519"` followed by `string` of 64 bytes. Slices
+/// point into the caller's payload buffer — nothing is copied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KexDhReply<'a> {
+    /// The host-key blob `K_S` as it will be hashed (the whole blob,
+    /// `string`-encoded into the exchange hash).
+    pub host_key: &'a [u8],
+    /// The raw 32-byte ed25519 public key inside `K_S` — verify the
+    /// signature with it, then pin it.
+    pub host_key_bytes: &'a [u8],
+    /// The server's 32-byte ephemeral public value `f`.
+    pub f: &'a [u8],
+    /// The signature blob as it appears on the wire (`string
+    /// "ssh-ed25519" || string` of 64 bytes).
+    pub signature: &'a [u8],
+    /// The raw 64-byte ed25519 signature inside `signature` — this is
+    /// what verifies the exchange hash.
+    pub signature_bytes: &'a [u8],
+}
+
+/// Why a `SSH_MSG_KEXDH_REPLY` payload was refused. Fail-closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KexDhError {
+    /// Not [`SSH_MSG_KEXDH_REPLY`].
+    WrongMessage,
+    /// A field runs past the payload (or it is empty).
+    Truncated,
+    /// `K_S` is not `string "ssh-ed25519" || string` of exactly 32
+    /// key bytes (we negotiate only `ssh-ed25519`, docs §B.3).
+    BadHostKey,
+    /// `f` is not exactly 32 bytes (RFC8731 §3: abort on any other
+    /// length).
+    BadPublicKey,
+    /// `f` is the all-zero point — small-order, the shared secret
+    /// would be all zero (RFC8731 §3 / RFC7748 §6).
+    ZeroPublicKey,
+    /// The signature blob is not `string "ssh-ed25519" || string` of
+    /// exactly 64 bytes.
+    BadSignature,
+    /// Bytes after the signature — nothing legal follows it.
+    TrailingGarbage,
+}
+
+/// Parse a complete `SSH_MSG_KEXDH_REPLY` **payload** (message byte
+/// included — hand it the `payload` a `PacketStep` produced).
+pub fn parse_kexdh_reply(payload: &[u8]) -> Result<KexDhReply<'_>, KexDhError> {
+    let read = |e: KexError| match e {
+        KexError::Truncated => KexDhError::Truncated,
+        // `Reader::take/u8/u32` only ever fail with Truncated.
+        _ => KexDhError::Truncated,
+    };
+    let mut r = Reader {
+        buf: payload,
+        pos: 0,
+    };
+    if r.u8().map_err(read)? != SSH_MSG_KEXDH_REPLY {
+        return Err(KexDhError::WrongMessage);
+    }
+    // K_S: outer string, then string "ssh-ed25519" + string 32.
+    let ks_len = r.u32().map_err(read)?;
+    let ks_len = usize::try_from(ks_len).map_err(|_| KexDhError::Truncated)?;
+    let host_key = r.take(ks_len).map_err(read)?;
+    let mut inner = Reader {
+        buf: host_key,
+        pos: 0,
+    };
+    let ks_alg_len = inner.u32().map_err(read)?;
+    if ks_alg_len != 11 || inner.take(11).map_err(read)? != b"ssh-ed25519" {
+        return Err(KexDhError::BadHostKey);
+    }
+    let key_len = inner.u32().map_err(read)?;
+    if key_len != 32 {
+        return Err(KexDhError::BadHostKey);
+    }
+    let host_key_bytes = inner.take(32).map_err(read)?;
+    if inner.pos != host_key.len() {
+        return Err(KexDhError::BadHostKey);
+    }
+    // f: string of exactly 32 bytes, not all-zero.
+    let f_len = r.u32().map_err(read)?;
+    if f_len != 32 {
+        return Err(KexDhError::BadPublicKey);
+    }
+    let f = r.take(32).map_err(read)?;
+    if f.iter().all(|&b| b == 0) {
+        return Err(KexDhError::ZeroPublicKey);
+    }
+    // signature: outer string, then string "ssh-ed25519" + string 64.
+    let sig_len = r.u32().map_err(read)?;
+    let sig_len = usize::try_from(sig_len).map_err(|_| KexDhError::Truncated)?;
+    let signature = r.take(sig_len).map_err(read)?;
+    let mut inner = Reader {
+        buf: signature,
+        pos: 0,
+    };
+    let sig_alg_len = inner.u32().map_err(read)?;
+    if sig_alg_len != 11 || inner.take(11).map_err(read)? != b"ssh-ed25519" {
+        return Err(KexDhError::BadSignature);
+    }
+    let sig_inner_len = inner.u32().map_err(read)?;
+    if sig_inner_len != 64 {
+        return Err(KexDhError::BadSignature);
+    }
+    let signature_bytes = inner.take(64).map_err(read)?;
+    if inner.pos != signature.len() {
+        return Err(KexDhError::BadSignature);
+    }
+    if r.pos != payload.len() {
+        return Err(KexDhError::TrailingGarbage);
+    }
+    Ok(KexDhReply {
+        host_key,
+        host_key_bytes,
+        f,
+        signature,
+        signature_bytes,
+    })
+}
+
+/// Bound on one `SSH_MSG_EXT_INFO`: OpenSSH allows 1024 entries; a
+/// client that never rekeys needs a handful (GitHub sends four). The
+/// count is refused the moment it exceeds this — before any entry is
+/// parsed, so a hostile `uint32` never becomes work.
+pub const EXT_INFO_MAX: usize = 64;
+
+/// Why an `SSH_MSG_EXT_INFO` payload was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtInfoError {
+    /// Not [`SSH_MSG_EXT_INFO`].
+    WrongMessage,
+    /// A field runs past the payload.
+    Truncated,
+    /// Declared entry count above [`EXT_INFO_MAX`].
+    TooMany,
+    /// An extension name is empty or contains non-graphic bytes
+    /// (values are opaque; the kernel sanitizes before logging).
+    BadName,
+    /// Bytes after the declared entries.
+    TrailingGarbage,
+}
+
+/// One `(name, value)` extension pair from an [`ExtInfo`] cursor.
+pub type ExtEntry<'a> = (&'a [u8], &'a [u8]);
+
+/// A bounded cursor over the entries of a parsed `SSH_MSG_EXT_INFO`
+/// (RFC8308 §2.1): `uint32 nr-extension` followed by `nr` × (`string
+/// name`, `string value`). Drive it with [`ExtInfo::next_entry`]
+/// until `Ok(None)`, then [`ExtInfo::finish`] proves nothing follows.
+#[derive(Debug, Clone, Copy)]
+pub struct ExtInfo<'a> {
+    r: Reader<'a>,
+    left: usize,
+}
+
+/// Parse the header of a complete `SSH_MSG_EXT_INFO` **payload**
+/// (message byte included).
+pub fn parse_ext_info(payload: &[u8]) -> Result<ExtInfo<'_>, ExtInfoError> {
+    let read = |e: KexError| match e {
+        KexError::Truncated => ExtInfoError::Truncated,
+        _ => ExtInfoError::Truncated,
+    };
+    let mut r = Reader {
+        buf: payload,
+        pos: 0,
+    };
+    if r.u8().map_err(read)? != SSH_MSG_EXT_INFO {
+        return Err(ExtInfoError::WrongMessage);
+    }
+    let count = r.u32().map_err(read)?;
+    if count > EXT_INFO_MAX as u32 {
+        return Err(ExtInfoError::TooMany);
+    }
+    Ok(ExtInfo {
+        r,
+        left: count as usize,
+    })
+}
+
+impl<'a> ExtInfo<'a> {
+    /// The next `(name, value)`; `Ok(None)` once the declared count
+    /// is exhausted.
+    pub fn next_entry(&mut self) -> Result<Option<ExtEntry<'a>>, ExtInfoError> {
+        if self.left == 0 {
+            return Ok(None);
+        }
+        let read = |e: KexError| match e {
+            KexError::Truncated => ExtInfoError::Truncated,
+            _ => ExtInfoError::Truncated,
+        };
+        let nlen = self.r.u32().map_err(read)?;
+        let nlen = usize::try_from(nlen).map_err(|_| ExtInfoError::Truncated)?;
+        let name = self.r.take(nlen).map_err(read)?;
+        // RFC8308 extension names are short printable tokens; an
+        // empty or control-byte name is refused, a value is opaque.
+        if name.is_empty() || !name.iter().all(|&b| (0x21..=0x7E).contains(&b)) {
+            return Err(ExtInfoError::BadName);
+        }
+        let vlen = self.r.u32().map_err(read)?;
+        let vlen = usize::try_from(vlen).map_err(|_| ExtInfoError::Truncated)?;
+        let value = self.r.take(vlen).map_err(read)?;
+        self.left -= 1;
+        Ok(Some((name, value)))
+    }
+    /// Nothing may follow the declared entries.
+    pub fn finish(self) -> Result<(), ExtInfoError> {
+        if self.r.pos != self.r.buf.len() {
+            return Err(ExtInfoError::TrailingGarbage);
+        }
+        Ok(())
+    }
+}
+
+/// A parsed `SSH_MSG_USERAUTH_FAILURE` (RFC4254 §5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UserAuthFailure<'a> {
+    /// `partial_success` — the `none` probe must come back `false`
+    /// (GitHub never accepts `none`; `true` would mean something is
+    /// very wrong).
+    pub partial_success: bool,
+    /// The offered-methods name-list (comma-separated, sanitized by
+    /// the kernel before any log line).
+    pub methods: &'a [u8],
+}
+
+/// Why a `SSH_MSG_USERAUTH_FAILURE` payload was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserAuthError {
+    /// Not [`SSH_MSG_USERAUTH_FAILURE`].
+    WrongMessage,
+    /// A field runs past the payload.
+    Truncated,
+    /// `partial_success` is not 0 or 1 (RFC4251 boolean).
+    BadBoolean,
+    /// Illegal byte in the methods name-list (same rules as the
+    /// KEXINIT lists).
+    BadNameList,
+    /// Bytes after the boolean.
+    TrailingGarbage,
+}
+
+/// Parse a complete `SSH_MSG_USERAUTH_FAILURE` **payload** (message
+/// byte included). Field order is **RFC4252 §5.1**: the name-list
+/// comes FIRST, then the boolean — the opposite of what many readers
+/// assume from RFC4254 (which does not define this message); GitHub's
+/// server and OpenSSH's client both use this order.
+pub fn parse_userauth_failure(payload: &[u8]) -> Result<UserAuthFailure<'_>, UserAuthError> {
+    let read = |e: KexError| match e {
+        KexError::Truncated => UserAuthError::Truncated,
+        KexError::BadNameList => UserAuthError::BadNameList,
+        // `namelist(false)` never reports EmptyList.
+        _ => UserAuthError::Truncated,
+    };
+    let mut r = Reader {
+        buf: payload,
+        pos: 0,
+    };
+    if r.u8().map_err(read)? != SSH_MSG_USERAUTH_FAILURE {
+        return Err(UserAuthError::WrongMessage);
+    }
+    // RFC4252 §5.1: name-list, THEN boolean.
+    let methods = r.namelist(false).map_err(read)?;
+    let partial_success = match r.u8().map_err(read)? {
+        0 => false,
+        1 => true,
+        _ => return Err(UserAuthError::BadBoolean),
+    };
+    if r.pos != payload.len() {
+        return Err(UserAuthError::TrailingGarbage);
+    }
+    Ok(UserAuthFailure {
+        partial_success,
+        methods,
+    })
+}
+
+/// Why a `SSH_MSG_SERVICE_ACCEPT` payload was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceError {
+    /// Not [`SSH_MSG_SERVICE_ACCEPT`].
+    WrongMessage,
+    /// The service-name string runs past the payload.
+    Truncated,
+    /// Bytes after the service-name string.
+    TrailingGarbage,
+}
+
+/// Parse a complete `SSH_MSG_SERVICE_ACCEPT` **payload**, returning
+/// the accepted service name (`string`). The caller checks it is
+/// `"ssh-userauth"`.
+pub fn parse_service_accept(payload: &[u8]) -> Result<&[u8], ServiceError> {
+    let read = |e: KexError| match e {
+        KexError::Truncated => ServiceError::Truncated,
+        _ => ServiceError::Truncated,
+    };
+    let mut r = Reader {
+        buf: payload,
+        pos: 0,
+    };
+    if r.u8().map_err(read)? != SSH_MSG_SERVICE_ACCEPT {
+        return Err(ServiceError::WrongMessage);
+    }
+    let nlen = r.u32().map_err(read)?;
+    let nlen = usize::try_from(nlen).map_err(|_| ServiceError::Truncated)?;
+    let name = r.take(nlen).map_err(read)?;
+    if r.pos != payload.len() {
+        return Err(ServiceError::TrailingGarbage);
+    }
+    Ok(name)
+}
+
+/// The `SSH_MSG_KEXDH_INIT` payload (RFC8731 §3): message byte +
+/// `string` of the client's 32-byte ephemeral public value.
+pub fn kexdh_init_payload(e: &[u8; 32], out: &mut [u8]) -> Option<usize> {
+    let dst = out.get_mut(..1 + 4 + 32)?;
+    dst[0] = SSH_MSG_KEXDH_INIT;
+    let n = encode_string(e, &mut dst[1..])?;
+    Some(1 + n)
+}
+
+/// The `SSH_MSG_SERVICE_REQUEST` payload for `"ssh-userauth"`
+/// (RFC4253 §10).
+pub fn service_request_payload(out: &mut [u8]) -> Option<usize> {
+    const SERVICE: &[u8] = b"ssh-userauth";
+    let dst = out.get_mut(..1 + 4 + SERVICE.len())?;
+    dst[0] = SSH_MSG_SERVICE_REQUEST;
+    let n = encode_string(SERVICE, &mut dst[1..])?;
+    Some(1 + n)
+}
+
+/// The `SSH_MSG_USERAUTH_REQUEST` payload with method `"none"` for
+/// user `git` on service `ssh-connection` (RFC4254 §5) — the pre-auth
+/// probe whose `SSH_MSG_USERAUTH_FAILURE` proves the whole encrypted
+/// path. The user name is irrelevant to GitHub for a `none` probe; it
+/// is fixed (and byte-tested) rather than configurable.
+pub fn userauth_none_payload(out: &mut [u8]) -> Option<usize> {
+    // 1 + (4+3) + (4+14) + (4+4) = 34 bytes exactly.
+    let dst = out.get_mut(..34)?;
+    let mut w = 0usize;
+    dst[w] = SSH_MSG_USERAUTH_REQUEST;
+    w += 1;
+    w += encode_string(b"git", &mut dst[w..])?;
+    w += encode_string(b"ssh-connection", &mut dst[w..])?;
+    w += encode_string(b"none", &mut dst[w..])?;
+    Some(w)
+}
+
+/// Why key derivation refused its inputs (RFC4253 §7.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KdfError {
+    /// The letter is not `'A'..='F'`.
+    BadLetter,
+    /// `out` is empty or longer than [`KDF_MAX_OUTPUT`].
+    BadLength,
+    /// An input (`k`, `h`, `session_id`) exceeds the bound the fixed
+    /// input buffer holds — never an allocation.
+    InputTooLong,
+}
+
+/// Hard cap on one derivation's output: four SHA-256 blocks, well
+/// above the 32 bytes `aes*-ctr` + `hmac-sha2-256` ever needs. It
+/// exists so [`kdf`]'s input buffer is a fixed size.
+pub const KDF_MAX_OUTPUT: usize = 128;
+
+/// RFC4253 §7.2 key derivation, `HASH` supplied by the caller (the
+/// kernel passes audited SHA-256 — this crate has no primitive):
+///
+/// ```text
+/// K1 = HASH(mpint(K) || H || X || session_id)     (X = the letter)
+/// Kn = HASH(mpint(K) || H || K1 || … || Kn-1)
+/// key = K1 || K2 || … , truncated to out.len()
+/// ```
+///
+/// Encodings follow the RFC's parenthetical exactly and match
+/// OpenSSH's `derive_key` byte for byte: `K` as `mpint`
+/// ([`encode_mpint`]), `H` raw, the letter as a single raw byte, and
+/// `session_id` raw (for the first key set it *is* `H`, already
+/// hash-sized — no length prefix anywhere but `mpint(K)`).
+pub fn kdf(
+    hash: impl Fn(&[u8]) -> [u8; 32],
+    k: &[u8],
+    h: &[u8],
+    letter: u8,
+    session_id: &[u8],
+    out: &mut [u8],
+) -> Result<(), KdfError> {
+    if !(b'A'..=b'F').contains(&letter) {
+        return Err(KdfError::BadLetter);
+    }
+    if out.is_empty() || out.len() > KDF_MAX_OUTPUT {
+        return Err(KdfError::BadLength);
+    }
+    // Fixed input-buffer bounds: mpint(k) ≤ 4+1+64, plus h, letter,
+    // session_id (or the previous output) — see the buffer below.
+    if k.len() > 64 || h.len() > 64 || session_id.len() > 64 {
+        return Err(KdfError::InputTooLong);
+    }
+    // mpint(K) ≤ 4 + 1 + 64 = 69; chained input ≤ 69 + 64 + 128 = 261.
+    let mut input = [0u8; 264];
+    let mlen = encode_mpint(k, &mut input).ok_or(KdfError::InputTooLong)?;
+    input[mlen..mlen + h.len()].copy_from_slice(h);
+    let mut n = mlen + h.len();
+    input[n] = letter;
+    n += 1;
+    input[n..n + session_id.len()].copy_from_slice(session_id);
+    n += session_id.len();
+    let first = hash(&input[..n]);
+    let take = out.len().min(32);
+    out[..take].copy_from_slice(&first[..take]);
+    let mut have = take;
+    while have < out.len() {
+        let mlen = encode_mpint(k, &mut input).ok_or(KdfError::InputTooLong)?;
+        input[mlen..mlen + h.len()].copy_from_slice(h);
+        let n = mlen + h.len();
+        input[n..n + have].copy_from_slice(&out[..have]);
+        let block = hash(&input[..n + have]);
+        let take = (out.len() - have).min(32);
+        out[have..have + take].copy_from_slice(&block[..take]);
+        have += take;
+    }
+    Ok(())
+}
+
+/// Equality for MAC tags with no early exit on the first differing
+/// byte (the *length* is public — it is checked up front). A single
+/// flipped bit anywhere makes this `false`, which is exactly the
+/// fail-closed gate the encrypted phase needs.
+pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Directional packet protection for the encrypted phase (RFC4253
+/// §6.3/§6.4). The kernel implements it over audited primitives (the
+/// continuous AES-CTR keystream + HMAC-SHA256 keys from the RFC4253
+/// §7.2 KDF); the host tests implement it with the same crates at a
+/// fixed key/IV. This trait is protocol glue — `ssh-wire` itself
+/// contains no primitive.
+pub trait PacketProtector {
+    /// Cipher block size; packets align to `max(block, 8)` (16 for
+    /// every `aes*-ctr` we negotiate).
+    fn block_size(&self) -> usize;
+    /// Decrypt `buf` in place — AES-CTR is a stream cipher, so this is
+    /// the same keystream application as `seal`, applied over exactly
+    /// the ciphertext region, never the trailing MAC tag. The keystream
+    /// is continuous across packets (RFC4253 §6.3: IVs pass from one
+    /// packet to the next).
+    fn open(&mut self, buf: &mut [u8]);
+    /// Encrypt `buf` in place (the framed packet, plaintext order).
+    fn seal(&mut self, buf: &mut [u8]);
+    /// `MAC(key, seq_be32 || unencrypted_packet)` (RFC4253 §6.4).
+    fn tag(&mut self, seq: u32, packet: &[u8]) -> [u8; TAG_LEN];
+}
+
+/// Build the full encrypted-phase wire packet: frame `payload`
+/// ([`encode_packet`], random padding from `fill_pad`), MAC the
+/// **plaintext** with `seq`, encrypt in place, append the tag in the
+/// clear (RFC4253 §6.4). `None` when it does not fit `out`.
+pub fn seal_packet<P: PacketProtector>(
+    payload: &[u8],
+    fill_pad: impl FnMut(&mut [u8]),
+    p: &mut P,
+    seq: u32,
+    out: &mut [u8],
+) -> Option<usize> {
+    let total = encode_packet(payload, p.block_size(), fill_pad, out)?;
+    // The MAC covers the unencrypted packet — compute it before the
+    // keystream touches a byte, append it after.
+    let tag = p.tag(seq, &out[..total]);
+    p.seal(&mut out[..total]);
+    let wire = out.get_mut(total..total + TAG_LEN)?;
+    wire.copy_from_slice(&tag);
+    Some(total + TAG_LEN)
+}
+
+/// Why the encrypted receiver refused a packet. Fail-closed: every
+/// variant means the connection is unusable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenError {
+    /// The (decrypted) packet structure is illegal — bounds checked
+    /// before any wait.
+    Packet(PacketError),
+    /// The MAC tag does not verify: tampering or a desynced stream.
+    MacMismatch,
+    /// The fixed receive buffer is full before the packet completed
+    /// (or the declared packet plus tag could never fit it).
+    Full,
+    /// The declared `4 + packet_length + TAG_LEN` exceeds the fixed
+    /// receive buffer — a hostile length, refused from the header
+    /// alone, never waited on.
+    TooLarge,
+}
+
+/// Incremental receiver for the encrypted phase. smoltcp hands over
+/// arbitrary read splits and the packet length itself is ciphertext,
+/// so bytes are decrypted exactly up to the ciphertext/MAC boundary as
+/// they arrive (the boundary becomes known after the first four
+/// decrypted bytes, RFC4253 §6.3's "decrypt the length after the first
+/// block"), the tag is verified over the plaintext with the direction's
+/// sequence number, and only then does the payload surface. The buffer
+/// is fixed — a hostile declared length fails by bounds, never by
+/// allocation.
+#[derive(Debug)]
+pub struct EncryptedRx<'a> {
+    buf: &'a mut [u8],
+    /// Raw bytes received so far.
+    got: usize,
+    /// Start of the packet being assembled (bytes before it were
+    /// already consumed).
+    base: usize,
+    /// Bytes of `[base..]` already decrypted (the keystream frontier).
+    frontier: usize,
+    /// `4 + packet_length` of the current packet, once its header has
+    /// been decrypted and validated.
+    cipher_len: Option<usize>,
+    /// Shift to apply before the next packet (set by [`Self::next`],
+    /// applied by [`Self::consume`] — belt and braces, so a skipped
+    /// `consume` cannot desync the stream).
+    pending: Option<usize>,
+}
+
+impl<'a> EncryptedRx<'a> {
+    /// `initial` = bytes already in `buf` (ciphertext pipelined behind
+    /// the plaintext `SSH_MSG_NEWKEYS`). More than the buffer holds is
+    /// clamped — impossible from a correct caller, and dropping bytes
+    /// fails the MAC later rather than panicking.
+    pub fn new(buf: &'a mut [u8], initial: usize) -> Self {
+        Self {
+            got: initial.min(buf.len()),
+            base: 0,
+            frontier: 0,
+            cipher_len: None,
+            pending: None,
+            buf,
+        }
+    }
+
+    /// Free space for the next transport read.
+    pub fn spare(&mut self) -> Result<&mut [u8], OpenError> {
+        if self.got >= self.buf.len() {
+            return Err(OpenError::Full);
+        }
+        Ok(&mut self.buf[self.got..])
+    }
+
+    /// Record `n` freshly received bytes (from a read into
+    /// [`Self::spare`]).
+    pub fn commit(&mut self, n: usize) {
+        // `n` cannot exceed the spare slice; the clamp is belt and
+        // braces against a caller bug, never a panic.
+        self.got = (self.got + n).min(self.buf.len());
+    }
+
+    /// Copy already-received bytes into the buffer (the transport-read
+    /// step for callers that hold the bytes up front — the kernel
+    /// reads straight into [`Self::spare`] instead). `Err(Full)` when
+    /// they do not fit: the buffer never grows, a hostile stream is
+    /// refused rather than allocated.
+    pub fn push(&mut self, bytes: &[u8]) -> Result<(), OpenError> {
+        let end = self.got.checked_add(bytes.len()).ok_or(OpenError::Full)?;
+        if end > self.buf.len() {
+            return Err(OpenError::Full);
+        }
+        self.buf[self.got..end].copy_from_slice(bytes);
+        self.got = end;
+        Ok(())
+    }
+
+    /// All bytes received so far — the payload range from
+    /// [`Self::next`] indexes into this.
+    pub fn bytes(&self) -> &[u8] {
+        self.buf
+    }
+
+    /// Drop the packet [`Self::next`] just returned (payload + tag).
+    /// [`Self::next`] also applies a forgotten pending shift itself,
+    /// so the stream cannot desync either way.
+    pub fn consume(&mut self) {
+        self.apply_pending();
+    }
+
+    fn apply_pending(&mut self) {
+        let Some(shift) = self.pending.take() else {
+            return;
+        };
+        let shift = shift.min(self.got);
+        self.buf.copy_within(shift..self.got, 0);
+        self.got -= shift;
+        self.base = 0;
+        self.frontier = 0;
+        self.cipher_len = None;
+    }
+
+    /// Decrypt/verify/decode the packet at the front; on success
+    /// returns its payload's byte range within [`Self::bytes`]
+    /// (read it, then call [`Self::consume`]). `Ok(None)` = need more
+    /// bytes. `seq` is this direction's packet sequence number —
+    /// per-direction, never reset (RFC4253 §6.4).
+    pub fn next<P: PacketProtector>(
+        &mut self,
+        p: &mut P,
+        seq: u32,
+    ) -> Result<Option<(usize, usize)>, OpenError> {
+        self.apply_pending();
+        let block = p.block_size();
+        loop {
+            // 1. Decrypt what is knowable: up to the ciphertext
+            //    boundary once the header is known, otherwise only
+            //    the first four bytes (the length is ciphertext).
+            let target = match self.cipher_len {
+                Some(cl) => self.base + cl,
+                None => self.base + 4,
+            }
+            .min(self.got);
+            if self.frontier < target {
+                p.open(&mut self.buf[self.frontier..target]);
+                self.frontier = target;
+            }
+            // 2. Four bytes in: learn (and bound) the packet length.
+            if self.cipher_len.is_none() && self.got - self.base >= 4 {
+                let head = &self.buf[self.base..self.base + 4];
+                let cl = match packet_total(head, block).map_err(OpenError::Packet)? {
+                    Some(cl) => cl,
+                    // Fewer than four bytes — cannot happen here;
+                    // treat as "need more" rather than spin.
+                    None => return Ok(None),
+                };
+                if self.base + cl + TAG_LEN > self.buf.len() {
+                    return Err(OpenError::TooLarge);
+                }
+                self.cipher_len = Some(cl);
+                continue; // decrypt up to the new boundary
+            }
+            // 3. Complete ciphertext + tag in the buffer?
+            if let Some(cl) = self.cipher_len {
+                if self.got < self.base + cl + TAG_LEN {
+                    if self.got >= self.buf.len() {
+                        return Err(OpenError::Full);
+                    }
+                    return Ok(None);
+                }
+                let plain = &self.buf[self.base..self.base + cl];
+                let tag = p.tag(seq, plain);
+                let wire_tag = &self.buf[self.base + cl..self.base + cl + TAG_LEN];
+                if !ct_eq(&tag, wire_tag) {
+                    return Err(OpenError::MacMismatch);
+                }
+                let payload = match decode_packet_block(plain, block) {
+                    PacketStep::Done { consumed, payload } if consumed == cl => payload,
+                    // Defensive: same header, same block — but a
+                    // malicious `padding_length` still dies here.
+                    PacketStep::Done { .. } => {
+                        return Err(OpenError::Packet(PacketError::BadPadding));
+                    }
+                    PacketStep::Incomplete => return Err(OpenError::Packet(PacketError::TooSmall)),
+                    PacketStep::Failed(e) => return Err(OpenError::Packet(e)),
+                };
+                let start = self.base + 5;
+                let end = start + (payload.len());
+                self.pending = Some(cl + TAG_LEN);
+                return Ok(Some((start, end)));
+            }
+            // Header still short of four bytes.
+            if self.got >= self.buf.len() {
+                return Err(OpenError::Full);
+            }
+            return Ok(None);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aes::Aes128;
+    use aes::cipher::{KeyIvInit, StreamCipher};
+    use ctr::Ctr128BE;
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha2::Sha256;
+    use std::string::String;
     use std::vec;
     use std::vec::Vec;
 
@@ -1120,8 +1971,9 @@ mod tests {
         let n = intersect(&server);
         // Server lists nistp256 first — but RFC4253 §7.1 is
         // client-preference: our first list entry that exists on the
-        // server wins.
-        assert_eq!(n.kex, Some(KEX_ALGORITHMS));
+        // server wins (the trailing `ext-info-c` signal is not a kex —
+        // it is never selected as one).
+        assert_eq!(n.kex, Some(KEX_CHOSEN));
         assert_eq!(n.host_key, Some(HOST_KEY_ALGORITHMS));
         // Server lists aes256-ctr first; our list has aes128-ctr
         // first → aes128-ctr, independently for each direction.
@@ -1237,5 +2089,1013 @@ mod tests {
         assert!(padding >= MIN_PADDING);
         assert_eq!(4 + packet_length, n);
         assert!(wire[n - padding..n].iter().all(|&b| b == 0));
+    }
+
+    // ---- S2: RFC4251 mpint / string (exchange hash + KDF inputs) --
+
+    #[test]
+    fn mpint_matches_openssh_encoding() {
+        let mut out = [0u8; 64];
+        // No high bit: uint32 length + bytes.
+        assert_eq!(encode_mpint(&[0x01, 0x02], &mut out), Some(6));
+        assert_eq!(&out[..6], &[0, 0, 0, 2, 0x01, 0x02]);
+        // High bit set: a 0x00 is prepended *and counted* in the
+        // length (OpenSSH `sshbuf_put_bignum2_bytes`).
+        assert_eq!(encode_mpint(&[0x80, 0x01], &mut out), Some(7));
+        assert_eq!(&out[..7], &[0, 0, 0, 3, 0x00, 0x80, 0x01]);
+        // Leading zeros are stripped before the high-bit test.
+        assert_eq!(encode_mpint(&[0x00, 0x00, 0x01], &mut out), Some(5));
+        assert_eq!(&out[..5], &[0, 0, 0, 1, 0x01]);
+        assert_eq!(encode_mpint(&[0x00, 0x80], &mut out), Some(6));
+        assert_eq!(&out[..6], &[0, 0, 0, 2, 0x00, 0x80]);
+        // Zero is the empty mpint (length 0).
+        assert_eq!(encode_mpint(&[0x00, 0x00], &mut out), Some(4));
+        assert_eq!(&out[..4], &[0, 0, 0, 0]);
+        // A high-bit X25519 shared secret (the common case): 4 + 33.
+        let k = [0xFFu8; 32];
+        assert_eq!(encode_mpint(&k, &mut out), Some(37));
+        assert_eq!(out[..5], [0, 0, 0, 33, 0x00]);
+        // One byte short must fail; exact succeeds.
+        assert_eq!(encode_mpint(&[0x80, 0x01], &mut out[..6]), None);
+        assert_eq!(encode_mpint(&[0x80, 0x01], &mut out[..7]), Some(7));
+    }
+
+    #[test]
+    fn encode_string_prefixes_the_length() {
+        let mut out = [0u8; 16];
+        assert_eq!(encode_string(b"abc", &mut out), Some(7));
+        assert_eq!(&out[..7], &[0, 0, 0, 3, b'a', b'b', b'c']);
+        assert_eq!(encode_string(b"", &mut out), Some(4));
+        assert_eq!(&out[..4], &[0, 0, 0, 0]);
+        // One byte short must fail; exact succeeds.
+        assert_eq!(encode_string(b"abcd", &mut out[..7]), None);
+        assert_eq!(encode_string(b"abcd", &mut out[..8]), Some(8));
+    }
+
+    // ---- S2: encrypted-phase framing (RFC4253 §6) ------------------
+
+    #[test]
+    fn encode_packet_aligns_and_fills_padding() {
+        let mut out = [0u8; 256];
+        // block 8, one-byte payload: unpadded 6 → pad 2 < 4 → +8 =
+        // 10; total 16.
+        let n = encode_packet(&[21], 8, |p| p.fill(0xAA), &mut out).expect("fits");
+        assert_eq!(n, 16);
+        assert_eq!(n % 8, 0);
+        assert_eq!(out[4], 10); // padding_length
+        assert_eq!(&out[5..6], &[21]);
+        assert!(out[6..n].iter().all(|&b| b == 0xAA)); // exactly the pad
+        // block 16 (encrypted phase), three-byte payload: unpadded 8
+        // → pad 8; total 16.
+        let n = encode_packet(&[5, 0, 0], 16, |p| p.fill(0xBB), &mut out).expect("fits");
+        assert_eq!(n, 16);
+        assert_eq!(n % 16, 0);
+        assert_eq!(out[4], 8);
+        assert!(out[8..n].iter().all(|&b| b == 0xBB));
+        // Padding ≥ 4 and alignment hold for every payload size, in
+        // both block modes (the "recompute after the payload changed"
+        // property the encrypted phase depends on).
+        let payload = [0x42u8; 40];
+        for len in 1..payload.len() {
+            for block in [8usize, 16] {
+                let n =
+                    encode_packet(&payload[..len], block, |p| p.fill(0), &mut out).expect("fits");
+                assert_eq!(n % block, 0, "len {len} block {block}");
+                assert!(out[4] >= MIN_PADDING as u8, "len {len} block {block}");
+                assert_eq!(n, 4 + 1 + len + usize::from(out[4]));
+            }
+        }
+        // Refusals: empty payload, unusable block, tiny output.
+        assert_eq!(encode_packet(&[], 16, |p| p.fill(0), &mut out), None);
+        assert_eq!(encode_packet(&[21], 4, |p| p.fill(0), &mut out), None);
+        assert_eq!(encode_packet(&[21], 8, |p| p.fill(0), &mut out[..15]), None);
+        assert_eq!(
+            encode_packet(&[21], 8, |p| p.fill(0), &mut out[..16]),
+            Some(16)
+        );
+    }
+
+    #[test]
+    fn decode_packet_block_generalises_the_block_size() {
+        let mut wire = [0u8; 64];
+        let n = encode_packet(&[21], 16, |p| p.fill(7), &mut wire).expect("fits");
+        match decode_packet_block(&wire[..n], 16) {
+            PacketStep::Done { consumed, payload } => {
+                assert_eq!(consumed, n);
+                assert_eq!(payload, &[21]);
+            }
+            other => panic!("expected Done for block 16, got {other:?}"),
+        }
+        // 16-aligned is also 8-aligned: the plaintext wrapper decodes
+        // it too.
+        assert!(matches!(decode_packet(&wire[..n]), PacketStep::Done { .. }));
+        // An 8-aligned but not 16-aligned packet (total 24) is refused
+        // under block 16 and accepted under block 8.
+        let n = encode_packet(&[0u8; 12], 8, |p| p.fill(0), &mut wire).expect("fits");
+        assert_eq!(n, 24);
+        assert_eq!(
+            decode_packet_block(&wire[..n], 16),
+            PacketStep::Failed(PacketError::Misaligned)
+        );
+        assert!(matches!(
+            decode_packet_block(&wire[..n], 8),
+            PacketStep::Done { .. }
+        ));
+        // A zero block is refused, never a divide-by-zero.
+        assert_eq!(
+            decode_packet_block(&wire[..n], 0),
+            PacketStep::Failed(PacketError::Misaligned)
+        );
+    }
+
+    #[test]
+    fn packet_total_bounds_before_waiting() {
+        assert_eq!(packet_total(&[], 16), Ok(None));
+        assert_eq!(packet_total(&[0, 0], 16), Ok(None));
+        // pl = 60 → total 64: aligned for both blocks.
+        assert_eq!(packet_total(&60u32.to_be_bytes(), 16), Ok(Some(64)));
+        assert_eq!(packet_total(&60u32.to_be_bytes(), 8), Ok(Some(64)));
+        // pl = 52 → total 56: 8-aligned, not 16-aligned.
+        assert_eq!(packet_total(&52u32.to_be_bytes(), 8), Ok(Some(56)));
+        assert_eq!(
+            packet_total(&52u32.to_be_bytes(), 16),
+            Err(PacketError::Misaligned)
+        );
+        // Illegal headers fail on the four header bytes alone —
+        // before any body is ever waited on.
+        assert_eq!(
+            packet_total(&4u32.to_be_bytes(), 16),
+            Err(PacketError::TooSmall)
+        );
+        assert_eq!(
+            packet_total(&0u32.to_be_bytes(), 16),
+            Err(PacketError::TooSmall)
+        );
+        assert_eq!(
+            packet_total(&40_004u32.to_be_bytes(), 16),
+            Err(PacketError::TooLarge)
+        );
+        assert_eq!(
+            packet_total(&u32::MAX.to_be_bytes(), 16),
+            Err(PacketError::TooLarge)
+        );
+        assert_eq!(
+            packet_total(&60u32.to_be_bytes(), 0),
+            Err(PacketError::Misaligned)
+        );
+    }
+
+    // ---- S2: SSH_MSG_KEXDH_REPLY (RFC4253 §8 / RFC8731 §3) --------
+
+    /// `string "ssh-ed25519" || string key` with a caller-chosen
+    /// algorithm name (for the malformed cases).
+    fn ed_blob_alg(alg: &[u8], key: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&(alg.len() as u32).to_be_bytes());
+        v.extend_from_slice(alg);
+        v.extend_from_slice(&(key.len() as u32).to_be_bytes());
+        v.extend_from_slice(key);
+        v
+    }
+
+    fn ed_blob(key: &[u8]) -> Vec<u8> {
+        ed_blob_alg(b"ssh-ed25519", key)
+    }
+
+    fn kexdh_reply_payload(host_key: &[u8], f: &[u8], sig: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.push(SSH_MSG_KEXDH_REPLY);
+        v.extend_from_slice(&(host_key.len() as u32).to_be_bytes());
+        v.extend_from_slice(host_key);
+        v.extend_from_slice(&(f.len() as u32).to_be_bytes());
+        v.extend_from_slice(f);
+        v.extend_from_slice(&(sig.len() as u32).to_be_bytes());
+        v.extend_from_slice(sig);
+        v
+    }
+
+    fn valid_kexdh_reply() -> Vec<u8> {
+        kexdh_reply_payload(&ed_blob(&[0x11; 32]), &[0x22; 32], &ed_blob(&[0x33; 64]))
+    }
+
+    #[test]
+    fn kexdh_reply_roundtrip() {
+        let p = valid_kexdh_reply();
+        let r = parse_kexdh_reply(&p).expect("legal reply");
+        assert_eq!(r.host_key, ed_blob(&[0x11; 32]).as_slice());
+        assert_eq!(r.host_key_bytes, &[0x11; 32]);
+        assert_eq!(r.f, &[0x22; 32]);
+        assert_eq!(r.signature, ed_blob(&[0x33; 64]).as_slice());
+        assert_eq!(r.signature_bytes, &[0x33; 64]);
+    }
+
+    #[test]
+    fn kexdh_reply_rejects_every_truncation() {
+        let full = valid_kexdh_reply();
+        for cut in 0..full.len() {
+            match parse_kexdh_reply(&full[..cut]) {
+                Err(e) => assert!(
+                    matches!(
+                        e,
+                        KexDhError::Truncated
+                            | KexDhError::BadHostKey
+                            | KexDhError::BadPublicKey
+                            | KexDhError::BadSignature
+                    ),
+                    "cut {cut}: {e:?}"
+                ),
+                Ok(_) => panic!("cut {cut} parsed as a complete KEXDH_REPLY"),
+            }
+        }
+        assert!(parse_kexdh_reply(&full).is_ok());
+    }
+
+    #[test]
+    fn kexdh_reply_rejects_malformed_fields() {
+        // Wrong message byte.
+        let mut p = valid_kexdh_reply();
+        p[0] = SSH_MSG_KEXINIT;
+        assert_eq!(parse_kexdh_reply(&p), Err(KexDhError::WrongMessage));
+
+        // K_S: wrong algorithm, wrong key length, trailing bytes.
+        for hk in [
+            ed_blob_alg(b"ssh-ed2551X", &[0x11; 32]),
+            ed_blob_alg(b"ssh-ed25519", &[0x11; 31]),
+            ed_blob_alg(b"ssh-ed25519", &[0x11; 33]),
+            {
+                let mut v = ed_blob(&[0x11; 32]);
+                v.push(0); // nothing may follow the key inside K_S
+                v
+            },
+        ] {
+            let p = kexdh_reply_payload(&hk, &[0x22; 32], &ed_blob(&[0x33; 64]));
+            assert_eq!(
+                parse_kexdh_reply(&p),
+                Err(KexDhError::BadHostKey),
+                "accepted host key {hk:?}"
+            );
+        }
+
+        // f: wrong lengths and the all-zero (small-order) point.
+        for flen in [31usize, 33] {
+            let p = kexdh_reply_payload(
+                &ed_blob(&[0x11; 32]),
+                &vec![0x22u8; flen],
+                &ed_blob(&[0x33; 64]),
+            );
+            assert_eq!(parse_kexdh_reply(&p), Err(KexDhError::BadPublicKey));
+        }
+        let p = kexdh_reply_payload(&ed_blob(&[0x11; 32]), &[0u8; 32], &ed_blob(&[0x33; 64]));
+        assert_eq!(parse_kexdh_reply(&p), Err(KexDhError::ZeroPublicKey));
+
+        // Signature: wrong algorithm, wrong lengths, trailing bytes.
+        for sig in [
+            ed_blob_alg(b"ssh-ed2551X", &[0x33; 64]),
+            ed_blob_alg(b"ssh-ed25519", &[0x33; 63]),
+            ed_blob_alg(b"ssh-ed25519", &[0x33; 65]),
+            {
+                let mut v = ed_blob(&[0x33; 64]);
+                v.push(0);
+                v
+            },
+        ] {
+            let p = kexdh_reply_payload(&ed_blob(&[0x11; 32]), &[0x22; 32], &sig);
+            assert_eq!(
+                parse_kexdh_reply(&p),
+                Err(KexDhError::BadSignature),
+                "accepted signature {sig:?}"
+            );
+        }
+
+        // Nothing may follow the signature.
+        let mut p = valid_kexdh_reply();
+        p.push(0);
+        assert_eq!(parse_kexdh_reply(&p), Err(KexDhError::TrailingGarbage));
+        // Empty payload.
+        assert_eq!(parse_kexdh_reply(&[]), Err(KexDhError::Truncated));
+    }
+
+    // ---- S2: SSH_MSG_EXT_INFO (RFC8308) ----------------------------
+
+    fn ext_info_payload(count: u32, entries: &[(&[u8], &[u8])]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.push(SSH_MSG_EXT_INFO);
+        v.extend_from_slice(&count.to_be_bytes());
+        for (name, value) in entries {
+            v.extend_from_slice(&(name.len() as u32).to_be_bytes());
+            v.extend_from_slice(name);
+            v.extend_from_slice(&(value.len() as u32).to_be_bytes());
+            v.extend_from_slice(value);
+        }
+        v
+    }
+
+    #[test]
+    fn ext_info_iterates_and_finishes() {
+        let p = ext_info_payload(
+            2,
+            &[
+                (
+                    b"server-sig-algs".as_slice(),
+                    b"ssh-ed25519,rsa-sha2-512".as_slice(),
+                ),
+                (b"ping@openssh.com".as_slice(), b"0".as_slice()),
+            ],
+        );
+        let mut info = parse_ext_info(&p).expect("parses");
+        assert_eq!(
+            info.next_entry().expect("first"),
+            Some((
+                b"server-sig-algs".as_slice(),
+                b"ssh-ed25519,rsa-sha2-512".as_slice()
+            ))
+        );
+        assert_eq!(
+            info.next_entry().expect("second"),
+            Some((b"ping@openssh.com".as_slice(), b"0".as_slice()))
+        );
+        assert_eq!(info.next_entry().expect("exhausted"), None);
+        info.finish().expect("no trailer");
+    }
+
+    #[test]
+    fn ext_info_bounds_hostile_counts_and_names() {
+        // Count above the cap: refused from the header alone — no
+        // entry bytes follow and none are waited on.
+        let mut p = Vec::new();
+        p.push(SSH_MSG_EXT_INFO);
+        p.extend_from_slice(&((EXT_INFO_MAX as u32) + 1).to_be_bytes());
+        assert_eq!(parse_ext_info(&p).map(|_| ()), Err(ExtInfoError::TooMany));
+        // An absurd u32 count: same refusal, no allocation, no loop.
+        p.truncate(1);
+        p.extend_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(parse_ext_info(&p).map(|_| ()), Err(ExtInfoError::TooMany));
+        // Wrong message byte.
+        let mut p = ext_info_payload(0, &[]);
+        p[0] = SSH_MSG_NEWKEYS;
+        assert_eq!(
+            parse_ext_info(&p).map(|_| ()),
+            Err(ExtInfoError::WrongMessage)
+        );
+        // Empty / control-byte / space-bearing names are refused.
+        for name in [
+            b"".as_slice(),
+            b"bad\x01name".as_slice(),
+            b"bad name".as_slice(),
+        ] {
+            let p = ext_info_payload(1, &[(name, b"v".as_slice())]);
+            let mut info = parse_ext_info(&p).expect("header parses");
+            assert_eq!(
+                info.next_entry(),
+                Err(ExtInfoError::BadName),
+                "name {name:?}"
+            );
+        }
+        // Declared value runs past the payload.
+        let mut p = ext_info_payload(1, &[(b"n".as_slice(), b"vv".as_slice())]);
+        p.truncate(p.len() - 1);
+        let mut info = parse_ext_info(&p).expect("header parses");
+        assert_eq!(info.next_entry(), Err(ExtInfoError::Truncated));
+        // Bytes after the declared entries.
+        let mut p = ext_info_payload(1, &[(b"n".as_slice(), b"v".as_slice())]);
+        p.push(0);
+        let mut info = parse_ext_info(&p).expect("parses");
+        assert_eq!(
+            info.next_entry().expect("entry"),
+            Some((b"n".as_slice(), b"v".as_slice()))
+        );
+        assert_eq!(info.next_entry().expect("exhausted"), None);
+        assert_eq!(info.finish(), Err(ExtInfoError::TrailingGarbage));
+        // Every truncation of a one-entry payload is refused.
+        let p = ext_info_payload(1, &[(b"n".as_slice(), b"v".as_slice())]);
+        for cut in 0..p.len() {
+            let mut info = match parse_ext_info(&p[..cut]) {
+                Ok(info) => info,
+                Err(e) => {
+                    assert!(
+                        matches!(e, ExtInfoError::Truncated | ExtInfoError::TooMany),
+                        "cut {cut}: {e:?}"
+                    );
+                    continue;
+                }
+            };
+            assert!(
+                info.next_entry().is_err() || info.finish().is_err(),
+                "cut {cut} produced a clean entry"
+            );
+        }
+    }
+
+    // ---- S2: service request / none-auth probe ---------------------
+
+    #[test]
+    fn service_accept_roundtrip_and_rejections() {
+        let mut p = Vec::new();
+        p.push(SSH_MSG_SERVICE_ACCEPT);
+        p.extend_from_slice(&12u32.to_be_bytes());
+        p.extend_from_slice(b"ssh-userauth");
+        assert_eq!(parse_service_accept(&p), Ok(b"ssh-userauth".as_slice()));
+        // Wrong message byte.
+        let mut wrong = p.clone();
+        wrong[0] = SSH_MSG_SERVICE_REQUEST;
+        assert_eq!(
+            parse_service_accept(&wrong),
+            Err(ServiceError::WrongMessage)
+        );
+        // Every truncation fails; trailing bytes fail.
+        for cut in 0..p.len() {
+            assert!(parse_service_accept(&p[..cut]).is_err(), "cut {cut}");
+        }
+        let mut trailing = p.clone();
+        trailing.push(0);
+        assert_eq!(
+            parse_service_accept(&trailing),
+            Err(ServiceError::TrailingGarbage)
+        );
+    }
+
+    #[test]
+    fn userauth_failure_roundtrip_and_rejections() {
+        // RFC4252 §5.1 field order: name-list FIRST, then boolean —
+        // not the other way around (RFC4254 does not define this
+        // message; GitHub's server and OpenSSH's client both use this
+        // order).
+        fn uaf(methods: &[u8], partial: u8) -> Vec<u8> {
+            let mut v = Vec::new();
+            v.push(SSH_MSG_USERAUTH_FAILURE);
+            v.extend_from_slice(&(methods.len() as u32).to_be_bytes());
+            v.extend_from_slice(methods);
+            v.push(partial);
+            v
+        }
+        let p = uaf(b"publickey,password", 0);
+        let f = parse_userauth_failure(&p).expect("legal");
+        assert!(!f.partial_success);
+        assert_eq!(f.methods, b"publickey,password".as_slice());
+        // partial_success = true parses (the kernel refuses it there).
+        let p = uaf(b"none", 1);
+        let f = parse_userauth_failure(&p).expect("legal");
+        assert!(f.partial_success);
+
+        // Wrong message byte.
+        let mut wrong = uaf(b"publickey", 0);
+        wrong[0] = SSH_MSG_USERAUTH_REQUEST;
+        assert_eq!(
+            parse_userauth_failure(&wrong),
+            Err(UserAuthError::WrongMessage)
+        );
+        // partial_success (the trailing byte) is an RFC4251 boolean.
+        for byte in [2u8, 9, 255] {
+            let bad = uaf(b"publickey", byte);
+            assert_eq!(
+                parse_userauth_failure(&bad),
+                Err(UserAuthError::BadBoolean),
+                "accepted partial_success {byte}"
+            );
+        }
+        // Illegal method name-lists (same rules as KEXINIT lists).
+        for methods in [
+            b"pub lic".as_slice(),
+            b"none,".as_slice(),
+            b",none".as_slice(),
+        ] {
+            let bad = uaf(methods, 0);
+            assert_eq!(
+                parse_userauth_failure(&bad),
+                Err(UserAuthError::BadNameList),
+                "accepted methods {methods:?}"
+            );
+        }
+        // Every truncation fails; trailing bytes fail.
+        let full = uaf(b"publickey,password", 0);
+        for cut in 0..full.len() {
+            assert!(parse_userauth_failure(&full[..cut]).is_err(), "cut {cut}");
+        }
+        let mut trailing = full.clone();
+        trailing.push(0);
+        assert_eq!(
+            parse_userauth_failure(&trailing),
+            Err(UserAuthError::TrailingGarbage)
+        );
+    }
+
+    #[test]
+    fn kexdh_init_and_auth_payloads_have_exact_wire_shape() {
+        let mut out = [0u8; 64];
+        let n = kexdh_init_payload(&[0x5A; 32], &mut out).expect("fits");
+        assert_eq!(n, 37);
+        assert_eq!(out[0], SSH_MSG_KEXDH_INIT);
+        assert_eq!(&out[1..5], &[0, 0, 0, 32]);
+        assert_eq!(&out[5..37], &[0x5A; 32]);
+        assert_eq!(kexdh_init_payload(&[0x5A; 32], &mut out[..36]), None);
+
+        let n = service_request_payload(&mut out).expect("fits");
+        assert_eq!(n, 17);
+        assert_eq!(out[0], SSH_MSG_SERVICE_REQUEST);
+        assert_eq!(&out[1..17], b"\x00\x00\x00\x0cssh-userauth");
+
+        let n = userauth_none_payload(&mut out).expect("fits");
+        assert_eq!(n, 34);
+        let mut expect = Vec::new();
+        expect.push(SSH_MSG_USERAUTH_REQUEST);
+        expect.extend_from_slice(&3u32.to_be_bytes());
+        expect.extend_from_slice(b"git");
+        expect.extend_from_slice(&14u32.to_be_bytes());
+        expect.extend_from_slice(b"ssh-connection");
+        expect.extend_from_slice(&4u32.to_be_bytes());
+        expect.extend_from_slice(b"none");
+        assert_eq!(&out[..n], expect.as_slice());
+        assert_eq!(userauth_none_payload(&mut out[..33]), None);
+    }
+
+    // ---- S2: RFC4253 §7.2 key derivation ---------------------------
+
+    fn hex_of(bytes: &[u8]) -> String {
+        let mut s = String::new();
+        for b in bytes {
+            s.push_str(&std::format!("{b:02x}"));
+        }
+        s
+    }
+
+    fn sha256(data: &[u8]) -> [u8; 32] {
+        use sha2::Digest;
+        let mut d = Sha256::new();
+        d.update(data);
+        d.finalize().into()
+    }
+
+    #[test]
+    fn kdf_known_answer_letters_and_expansion() {
+        // Known-answer vectors generated with an *independent*
+        // Python (hashlib) implementation of the RFC4253 §7.2 text:
+        // K = 0x01..0x20, H = session_id = 0x21..0x40, mpint(K)
+        // stripped/prefixed per RFC4251. RFC4253 carries no test
+        // vector of its own, so this pins the composition.
+        let k: Vec<u8> = (1u8..=32).collect();
+        let h: Vec<u8> = (0x21u8..=0x40).collect();
+        let expected: [(u8, &str); 6] = [
+            (
+                b'A',
+                "b5912945de22ed382f019986f834b5dab2761d63e803d81ccf5c585045b33789",
+            ),
+            (
+                b'B',
+                "bd8fad0d24e41685f531d68f22ca90b6e2aaecd743ed2b2bc61d54deee6b7df7",
+            ),
+            (
+                b'C',
+                "4ca921bf4569ed82a8daafe9a663f6934d997304e3a6ac5cb72f8fe40aea7d10",
+            ),
+            (
+                b'D',
+                "ce1c24627709e070328155bb26b07e4e9ace1da957454d37bfac0fd25fd8a6da",
+            ),
+            (
+                b'E',
+                "829450113d57507f1f5d3b97dfee5f35e7e9240e0b893f821e8939043f36936f",
+            ),
+            (
+                b'F',
+                "0b4aa8944cc322be36621de2d490c97b0d6fdd438db847d753f0ed697a84c479",
+            ),
+        ];
+        for (letter, want) in expected {
+            let mut out = [0u8; 32];
+            kdf(sha256, &k, &h, letter, &h, &mut out).expect("derives");
+            assert_eq!(hex_of(&out), want, "letter {}", letter as char);
+        }
+        // Expansion past one SHA-256 block: K2 = HASH(mpint(K) || H
+        // || K1), key = K1 || K2 (truncated to 64).
+        let mut out = [0u8; 64];
+        kdf(sha256, &k, &h, b'C', &h, &mut out).expect("derives");
+        assert_eq!(
+            hex_of(&out),
+            "4ca921bf4569ed82a8daafe9a663f6934d997304e3a6ac5cb72f8fe40aea7d10\
+             8f9f47854240f1d65044ab822610679c8a1e873e0615a9cc492c047d3f7c1fe5"
+        );
+        // A high-bit shared secret changes the mpint (0x00 prepended).
+        let k2: Vec<u8> = (0x81u8..=0xA0).collect();
+        let mut out = [0u8; 32];
+        kdf(sha256, &k2, &h, b'A', &h, &mut out).expect("derives");
+        assert_eq!(
+            hex_of(&out),
+            "3b3292c9bb4eabe495af0ff2f5bc4cc366870a4ae7952930941864f56fdc9f8b"
+        );
+        // Leading zeros strip: K3 = 0x00 0x00 || K derives as K.
+        let k3: Vec<u8> = {
+            let mut v = vec![0u8; 2];
+            v.extend_from_slice(&k);
+            v
+        };
+        let mut out = [0u8; 32];
+        kdf(sha256, &k3, &h, b'A', &h, &mut out).expect("derives");
+        assert_eq!(hex_of(&out), expected[0].1);
+    }
+
+    #[test]
+    fn kdf_feeds_the_exact_rfc4253_inputs() {
+        // A recording "hash" (no primitive — this crate has none):
+        // captures the exact bytes fed to each invocation and returns
+        // a distinguishable block, proving the composition
+        //   K1 = HASH(mpint(K) || H || X || session_id)
+        //   K2 = HASH(mpint(K) || H || K1)
+        // and the truncation/expansion behaviour around it.
+        use std::cell::RefCell;
+        let seen: RefCell<Vec<Vec<u8>>> = RefCell::new(Vec::new());
+        let hash = |data: &[u8]| -> [u8; 32] {
+            seen.borrow_mut().push(data.to_vec());
+            let n = seen.borrow().len() as u8;
+            let mut out = [0u8; 32];
+            for (i, b) in out.iter_mut().enumerate() {
+                *b = n.wrapping_add(i as u8);
+            }
+            out
+        };
+        let k = [0x01u8; 4];
+        let h = [0xAAu8; 32];
+        let mut out = [0u8; 40]; // > 32 forces one chained expansion
+        kdf(hash, &k, &h, b'A', &h, &mut out).expect("derives");
+        let calls = seen.borrow().clone();
+        assert_eq!(calls.len(), 2, "expected K1 then one expansion block");
+        // K1 input: mpint(K) || H || 'A' || session_id — K and H get
+        // no length prefix beyond mpint's, session_id is raw (H).
+        let mut want = Vec::new();
+        want.extend_from_slice(&4u32.to_be_bytes());
+        want.extend_from_slice(&k);
+        want.extend_from_slice(&h);
+        want.push(b'A');
+        want.extend_from_slice(&h);
+        assert_eq!(calls[0], want, "K1 input");
+        // K2 input: mpint(K) || H || K1 (K1 = the first output block).
+        let mut want = Vec::new();
+        want.extend_from_slice(&4u32.to_be_bytes());
+        want.extend_from_slice(&k);
+        want.extend_from_slice(&h);
+        want.extend_from_slice(&out[..32]);
+        assert_eq!(calls[1], want, "K2 input");
+        // K2 filled the remainder (40 - 32 = 8 bytes taken).
+        assert_eq!(out[..32], {
+            let mut b = [0u8; 32];
+            for (i, x) in b.iter_mut().enumerate() {
+                *x = 1u8.wrapping_add(i as u8);
+            }
+            b
+        });
+    }
+
+    #[test]
+    fn kdf_refuses_bad_inputs_and_is_deterministic() {
+        let k = [1u8; 32];
+        let h = [2u8; 32];
+        let mut out = [0u8; 32];
+        for letter in [b'G', b'a', b'@', 0u8] {
+            assert_eq!(
+                kdf(sha256, &k, &h, letter, &h, &mut out),
+                Err(KdfError::BadLetter),
+                "accepted letter {letter}"
+            );
+        }
+        assert_eq!(
+            kdf(sha256, &k, &h, b'A', &h, &mut []),
+            Err(KdfError::BadLength)
+        );
+        assert_eq!(
+            kdf(sha256, &k, &h, b'A', &h, &mut [0u8; KDF_MAX_OUTPUT + 1]),
+            Err(KdfError::BadLength)
+        );
+        let big = [0u8; 65];
+        assert_eq!(
+            kdf(sha256, &big, &h, b'A', &h, &mut out),
+            Err(KdfError::InputTooLong)
+        );
+        assert_eq!(
+            kdf(sha256, &k, &big, b'A', &h, &mut out),
+            Err(KdfError::InputTooLong)
+        );
+        assert_eq!(
+            kdf(sha256, &k, &h, b'A', &big, &mut out),
+            Err(KdfError::InputTooLong)
+        );
+        // Deterministic; distinct per letter.
+        let mut a = [0u8; 32];
+        let mut b = [0u8; 32];
+        kdf(sha256, &k, &h, b'A', &h, &mut a).expect("derives");
+        kdf(sha256, &k, &h, b'A', &h, &mut b).expect("derives");
+        assert_eq!(a, b);
+        kdf(sha256, &k, &h, b'B', &h, &mut b).expect("derives");
+        assert_ne!(a, b);
+        // A shorter output is a prefix of a longer one.
+        let mut long = [0u8; 40];
+        kdf(sha256, &k, &h, b'A', &h, &mut long).expect("derives");
+        let mut short = [0u8; 16];
+        kdf(sha256, &k, &h, b'A', &h, &mut short).expect("derives");
+        assert_eq!(short, long[..16]);
+    }
+
+    #[test]
+    fn ct_eq_accepts_only_exact_matches() {
+        assert!(ct_eq(b"tag", b"tag"));
+        assert!(ct_eq(b"", b""));
+        assert!(!ct_eq(b"tag", b"tak")); // one flipped bit
+        assert!(!ct_eq(b"tag", b"tag2")); // different length
+        assert!(!ct_eq(b"", b"x"));
+        let mut a = [0x5Au8; TAG_LEN];
+        let b = a;
+        assert!(ct_eq(&a, &b));
+        a[17] ^= 0x01;
+        assert!(!ct_eq(&a, &b));
+        a[17] ^= 0x01;
+        assert!(ct_eq(&a, &b));
+    }
+
+    // ---- S2: encrypted packets end to end (real AES + HMAC) -------
+    //
+    // The dev-dependencies (aes/ctr/hmac/sha2 — the audited crates the
+    // kernel uses) make these roundtrips the real thing at a fixed
+    // key/IV: seal_packet and EncryptedRx run exactly the code paths
+    // the kernel drives against github.com:22, proven live by the
+    // smoke's SSH_KEX_OK.
+
+    /// One direction at a fixed key/IV: continuous AES-128-CTR
+    /// keystream + HMAC-SHA256, i.e. a `PacketProtector` built from
+    /// the same crates as `kernel::ssh::Direction`.
+    struct TestDir {
+        ctr: Ctr128BE<Aes128>,
+        mac_key: [u8; 32],
+    }
+
+    impl TestDir {
+        fn new() -> Self {
+            let key = [0x42u8; 16];
+            let iv = [0x24u8; 16];
+            Self {
+                ctr: Ctr128BE::<Aes128>::new_from_slices(&key, &iv).expect("16-byte key and IV"),
+                mac_key: [0x99u8; 32],
+            }
+        }
+    }
+
+    impl PacketProtector for TestDir {
+        fn block_size(&self) -> usize {
+            ENC_BLOCK
+        }
+        fn open(&mut self, buf: &mut [u8]) {
+            self.ctr.apply_keystream(buf);
+        }
+        fn seal(&mut self, buf: &mut [u8]) {
+            self.ctr.apply_keystream(buf);
+        }
+        fn tag(&mut self, seq: u32, packet: &[u8]) -> [u8; TAG_LEN] {
+            let mut mac = Hmac::<Sha256>::new_from_slice(&self.mac_key).expect("32-byte key");
+            mac.update(&seq.to_be_bytes());
+            mac.update(packet);
+            mac.finalize().into_bytes().into()
+        }
+    }
+
+    #[test]
+    fn seal_packet_roundtrip_with_fixed_key_iv() {
+        let mut tx = TestDir::new();
+        let mut rx = TestDir::new(); // fresh keystream at the same IV
+        let payload = b"\x05\x00\x00\x00\x0cssh-userauth";
+        let mut wire = [0u8; 256];
+        let n = seal_packet(payload, |p| p.fill(0x77), &mut tx, 7, &mut wire).expect("fits");
+        assert_eq!(n % ENC_BLOCK, 0, "ciphertext + tag stay block-aligned");
+        // AES-CTR actually ran: the wire bytes are not the plaintext.
+        assert_ne!(&wire[5..5 + payload.len()], payload.as_slice());
+        // Decrypt with the receiver (CTR keystream is symmetric) and
+        // decode exactly like the kernel does.
+        let mut buf = wire[..n].to_vec();
+        rx.seal(&mut buf[..n - TAG_LEN]);
+        match decode_packet_block(&buf[..n - TAG_LEN], ENC_BLOCK) {
+            PacketStep::Done {
+                consumed,
+                payload: got,
+            } => {
+                assert_eq!(consumed, n - TAG_LEN);
+                assert_eq!(got, payload.as_slice());
+            }
+            other => panic!("decrypted packet does not decode: {other:?}"),
+        }
+        // The tag in the clear is HMAC(key, seq || plaintext packet).
+        let mut mac = Hmac::<Sha256>::new_from_slice(&[0x99u8; 32]).expect("32-byte key");
+        mac.update(&7u32.to_be_bytes());
+        mac.update(&buf[..n - TAG_LEN]);
+        let expected: [u8; 32] = mac.finalize().into_bytes().into();
+        assert_eq!(&expected[..], &wire[n - TAG_LEN..n]);
+    }
+
+    #[test]
+    fn seal_packet_refuses_bit_flips() {
+        let mut tx = TestDir::new();
+        let payload = b"\x33\x44\x55";
+        let mut wire = [0u8; 128];
+        let n = seal_packet(payload, |p| p.fill(1), &mut tx, 3, &mut wire).expect("fits");
+        let mac_over = |seq: u32, plain: &[u8]| -> [u8; TAG_LEN] {
+            let mut mac = Hmac::<Sha256>::new_from_slice(&[0x99u8; 32]).expect("32-byte key");
+            mac.update(&seq.to_be_bytes());
+            mac.update(plain);
+            mac.finalize().into_bytes().into()
+        };
+        // The untampered plaintext packet (the MAC's input — the wire
+        // bytes are ciphertext) and the transmitted tag.
+        let plain = {
+            let mut rx = TestDir::new();
+            let mut b = wire[..n].to_vec();
+            rx.seal(&mut b[..n - TAG_LEN]);
+            b
+        };
+        assert!(ct_eq(
+            &mac_over(3, &plain[..n - TAG_LEN]),
+            &wire[n - TAG_LEN..n]
+        ));
+
+        // Flip one ciphertext byte: after decryption the recomputed
+        // MAC over the tampered plaintext no longer matches the tag.
+        let mut tampered = wire;
+        tampered[6] ^= 0x01;
+        let mut rx = TestDir::new();
+        rx.seal(&mut tampered[..n - TAG_LEN]);
+        assert!(
+            !ct_eq(
+                &mac_over(3, &tampered[..n - TAG_LEN]),
+                &tampered[n - TAG_LEN..n]
+            ),
+            "flipped ciphertext accepted"
+        );
+
+        // Flip one tag byte: same refusal, ciphertext untouched.
+        let mut tampered = wire;
+        tampered[n - 1] ^= 0x01;
+        assert!(
+            !ct_eq(
+                &mac_over(3, &plain[..n - TAG_LEN]),
+                &tampered[n - TAG_LEN..n]
+            ),
+            "flipped tag accepted"
+        );
+    }
+
+    #[test]
+    fn seal_packet_recomputes_padding_for_block_16() {
+        // One sender and one receiver in lockstep: the keystream is
+        // continuous across packets (RFC4253 §6.3), so each packet's
+        // framing is inspected through the matching decryptor.
+        let mut tx = TestDir::new();
+        let mut rx = TestDir::new();
+        let payload = [0x11u8; 40];
+        for len in 1..=payload.len() {
+            let mut wire = [0u8; 256];
+            let n = seal_packet(&payload[..len], |p| p.fill(0xEE), &mut tx, 0, &mut wire)
+                .expect("fits");
+            let total = n - TAG_LEN;
+            assert_eq!(total % ENC_BLOCK, 0, "len {len}");
+            let mut plain = wire[..n].to_vec();
+            rx.seal(&mut plain[..total]);
+            assert!(plain[4] >= MIN_PADDING as u8, "len {len}");
+            assert_eq!(total, 4 + 1 + len + usize::from(plain[4]), "len {len}");
+        }
+        // Refuses to overflow its output (never a panic).
+        let mut wire = [0u8; 32];
+        assert_eq!(
+            seal_packet(&payload, |p| p.fill(0), &mut tx, 0, &mut wire),
+            None
+        );
+    }
+
+    #[test]
+    fn encrypted_rx_reassembles_chunked_packets() {
+        let mut tx = TestDir::new();
+        let mut rx_prot = TestDir::new();
+        let payload = b"\x06\x00\x00\x00\x0cssh-userauth";
+        let mut wire = [0u8; 256];
+        let n = seal_packet(payload, |p| p.fill(9), &mut tx, 4, &mut wire).expect("fits");
+
+        let mut buf = [0u8; 512];
+        let mut erx = EncryptedRx::new(&mut buf, 0);
+        // One byte at a time: every smoltcp read split must be
+        // tolerated, and no early byte may surface a payload.
+        for (i, byte) in wire[..n].iter().enumerate() {
+            erx.push(&[*byte]).expect("space");
+            let got = erx.next(&mut rx_prot, 4).expect("no refusal");
+            if i + 1 < n {
+                assert_eq!(got, None, "packet complete early at byte {i}");
+            } else {
+                let (s, e) = got.expect("complete at the last byte");
+                assert_eq!(&erx.bytes()[s..e], payload.as_slice());
+                erx.consume();
+            }
+        }
+        // Buffer drained: nothing more, no refusal.
+        assert_eq!(erx.next(&mut rx_prot, 4).expect("no refusal"), None);
+        // spare() refuses once the buffer is full — the read loop can
+        // never grow it.
+        let mut small = [0u8; 4];
+        let mut erx = EncryptedRx::new(&mut small, 4);
+        assert_eq!(erx.spare().map(|_| ()), Err(OpenError::Full));
+        assert_eq!(erx.push(&[0; 5]), Err(OpenError::Full));
+    }
+
+    #[test]
+    fn encrypted_rx_handles_pipelined_packets() {
+        let mut tx = TestDir::new();
+        let mut rx_prot = TestDir::new();
+        let p1: &[u8] = b"\x07\x00\x00\x00\x00"; // EXT_INFO, zero entries
+        let p2: &[u8] = b"\x06\x00\x00\x00\x0cssh-userauth";
+        let mut w1 = [0u8; 128];
+        let n1 = seal_packet(p1, |p| p.fill(1), &mut tx, 0, &mut w1).expect("fits");
+        let mut w2 = [0u8; 128];
+        let n2 = seal_packet(p2, |p| p.fill(2), &mut tx, 1, &mut w2).expect("fits");
+
+        let mut buf = [0u8; 512];
+        buf[..n1].copy_from_slice(&w1[..n1]);
+        buf[n1..n1 + n2].copy_from_slice(&w2[..n2]);
+        // `initial` models ciphertext that arrived pipelined behind
+        // the plaintext SSH_MSG_NEWKEYS.
+        let mut erx = EncryptedRx::new(&mut buf, n1 + n2);
+        let (s, e) = erx
+            .next(&mut rx_prot, 0)
+            .expect("no refusal")
+            .expect("first packet complete");
+        assert_eq!(&erx.bytes()[s..e], p1);
+        // Deliberately *not* consuming: the next call must apply the
+        // pending shift itself, so a skipped consume cannot desync.
+        let (s, e) = erx
+            .next(&mut rx_prot, 1)
+            .expect("no refusal")
+            .expect("second packet complete");
+        assert_eq!(&erx.bytes()[s..e], p2);
+        erx.consume();
+        assert_eq!(erx.next(&mut rx_prot, 2).expect("no refusal"), None);
+    }
+
+    #[test]
+    fn encrypted_rx_refuses_bad_tags_lengths_and_padding() {
+        let payload: &[u8] = b"\x06\x00\x00\x00\x0cssh-userauth";
+        let mut wire = [0u8; 256];
+        let n = {
+            let mut tx = TestDir::new();
+            seal_packet(payload, |p| p.fill(3), &mut tx, 5, &mut wire).expect("fits")
+        };
+
+        // A flipped tag byte → MacMismatch; the payload never surfaces.
+        let mut bad = wire;
+        bad[n - 1] ^= 0x80;
+        let mut buf = [0u8; 512];
+        let mut erx = EncryptedRx::new(&mut buf, 0);
+        erx.push(&bad[..n]).expect("space");
+        let mut rx_prot = TestDir::new();
+        assert_eq!(erx.next(&mut rx_prot, 5), Err(OpenError::MacMismatch));
+
+        // A flipped ciphertext byte → the recomputed MAC misses too.
+        let mut bad = wire;
+        bad[9] ^= 0x01;
+        let mut erx = EncryptedRx::new(&mut buf, 0);
+        erx.push(&bad[..n]).expect("space");
+        let mut rx_prot = TestDir::new();
+        assert_eq!(erx.next(&mut rx_prot, 5), Err(OpenError::MacMismatch));
+
+        // A hostile declared length is refused from the four decrypted
+        // header bytes — TooLarge, before any body is waited on.
+        for hostile in [35_004u32, 3_996u32] {
+            let mut sealer = TestDir::new();
+            let mut head = [0u8; 16];
+            head[..4].copy_from_slice(&hostile.to_be_bytes());
+            head[4] = 4;
+            sealer.seal(&mut head);
+            let mut opener = TestDir::new();
+            let mut erx = EncryptedRx::new(&mut buf, 0);
+            erx.push(&head).expect("space");
+            let want = if hostile > MAX_PACKET_LENGTH {
+                // Above the RFC4253 §6.1 cap: refused by packet_total.
+                OpenError::Packet(PacketError::TooLarge)
+            } else {
+                // Legal length but larger than the fixed buffer.
+                OpenError::TooLarge
+            };
+            assert_eq!(erx.next(&mut opener, 5), Err(want), "pl {hostile}");
+        }
+
+        // Defense in depth: a MAC-valid packet (we hold the key) with
+        // an illegal padding_length is still refused by the framing.
+        let mut pkt = [0u8; 16];
+        pkt[..4].copy_from_slice(&12u32.to_be_bytes()); // total 16, 16-aligned
+        pkt[4] = 3; // padding_length below MIN_PADDING
+        pkt[5] = 0x06;
+        let mut mac_dir = TestDir::new();
+        let tag = mac_dir.tag(9, &pkt);
+        let mut sealer = TestDir::new();
+        sealer.seal(&mut pkt);
+        let mut wire = [0u8; 48];
+        wire[..16].copy_from_slice(&pkt);
+        wire[16..].copy_from_slice(&tag);
+        let mut opener = TestDir::new();
+        let mut erx = EncryptedRx::new(&mut buf, 0);
+        erx.push(&wire).expect("space");
+        assert_eq!(
+            erx.next(&mut opener, 9),
+            Err(OpenError::Packet(PacketError::BadPadding))
+        );
     }
 }
