@@ -34,6 +34,7 @@ mod pit;
 mod port;
 mod rtc;
 mod shell;
+mod sky2;
 mod ssh;
 mod tls;
 mod vga;
@@ -97,7 +98,13 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
     // magic — the main smoke has no disk, so its marker chain is untouched.
     crate::ata::probe();
 
-    let mut stack = crate::e1000::init(&scan).map(|dev| {
+    // QEMU's e1000 first (byte-identical history: on a machine with
+    // an e1000 the sky2 probe never even runs), then the MacBook's
+    // sky2 — `sky2::init` prints nothing when the device is absent.
+    let nic = crate::e1000::init(&scan)
+        .map(netstack::Nic::e1000)
+        .or_else(|| crate::sky2::init(&scan).map(netstack::Nic::sky2));
+    let mut stack = nic.map(|dev| {
         // Two draws: smoltcp's random_seed feeds its sPCG32 (TCP ISNs,
         // source ports, DHCP xids) — R1, non-negotiable
         // (docs/smoltcp-eval.md §5).

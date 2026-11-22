@@ -1,7 +1,8 @@
-//! smoltcp integration: the e1000 driver behind `phy::Device`, the
-//! static storage the stack lives in, and the `Stack` the boot chain
-//! and the shell drive. The evaluation, verified facts and migration
-//! plan live in `docs/smoltcp-eval.md`.
+//! smoltcp integration: the NIC behind `phy::Device` ([`Nic`] — the
+//! e1000 in QEMU, the sky2 on the real MacBook), the static storage
+//! the stack lives in, and the `Stack` the boot chain and the shell
+//! drive. The evaluation, verified facts and migration plan live in
+//! `docs/smoltcp-eval.md`.
 //!
 //! Boot phases mirror the smoke's marker order exactly (all16
 //! markers keep their meaning — only producers moved):
@@ -19,6 +20,7 @@
 
 use crate::clock;
 use crate::e1000::E1000;
+use crate::sky2::Sky2;
 use core::ptr::addr_of_mut;
 use net::http;
 use net::{SLIRP_GATEWAY, SLIRP_GUEST_IP};
@@ -32,6 +34,10 @@ use smoltcp::wire::{
     DnsQueryType, EthernetAddress, HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr,
     Ipv4Address, Ipv4Cidr,
 };
+
+/// Link state reported by the active NIC (re-exported so the shell
+/// and `netinfo` only need this module) — see `crate::sky2::LinkState`.
+pub use crate::sky2::LinkState;
 
 /// Deadline for every boot/shell network operation: DHCP10 s, DNS10 s,
 /// TCP10 s (smoltcp retransmits inside the window — spin counts are
@@ -51,28 +57,83 @@ fn fatal(msg: &str) -> ! {
 /// 1500 B MTU) — also the bound of one e1000 ring slot.
 pub const FRAME: usize = 1514;
 
-/// Our e1000 driver behind smoltcp's [`Device`]: copies frames in and
-/// out of the synchronous 16-descriptor ring exactly like the old
-/// hand-rolled path did, and sniffs the gateway's ARP reply so the
-/// boot chain can still print `NET_OK` with its historical meaning —
-/// smoltcp's neighbor cache is private, but the driver sees every
-/// frame (docs/smoltcp-eval.md §9).
-pub struct E1000Phy {
-    dev: E1000,
-    /// The stack resolved the gateway and a reply came back on RX.
-    pub saw_arp_reply: bool,
+/// Which NIC sits behind the stack: QEMU's Intel e1000 or the real
+/// MacBook's Marvell 88E8053 (sky2). The stack only ever needs
+/// `mac()`, transmit, receive and (for `netinfo`) link state, so this
+/// enum is the whole abstraction — each arm owns its driver plus the
+/// ARP-reply sniff state, which is shared behaviour of the RX path
+/// (docs/smoltcp-eval.md §9: the boot chain prints `NET_OK` when the
+/// gateway's ARP reply is seen on the wire, because smoltcp's
+/// neighbor cache is private but the driver sees every frame).
+pub enum Nic {
+    /// QEMU's NIC (`kernel/src/e1000.rs`) — the only one CI can test.
+    E1000 {
+        dev: E1000,
+        /// The stack resolved the gateway and a reply came back on RX.
+        saw_arp_reply: bool,
+    },
+    /// The MacBook's NIC (`kernel/src/sky2.rs`) — silent in QEMU.
+    Sky2 {
+        dev: Sky2,
+        /// Same sniff as the e1000 arm.
+        saw_arp_reply: bool,
+    },
 }
 
-impl E1000Phy {
-    pub fn new(dev: E1000) -> Self {
-        E1000Phy {
+impl Nic {
+    /// Wrap an initialized e1000.
+    pub fn e1000(dev: E1000) -> Self {
+        Nic::E1000 {
             dev,
             saw_arp_reply: false,
         }
     }
 
+    /// Wrap an initialized sky2.
+    pub fn sky2(dev: Sky2) -> Self {
+        Nic::Sky2 {
+            dev,
+            saw_arp_reply: false,
+        }
+    }
+
+    /// Driver name for log lines (`FATAL: <kind>: …`, `netinfo`).
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Nic::E1000 { .. } => "e1000",
+            Nic::Sky2 { .. } => "sky2",
+        }
+    }
+
+    /// The station MAC address of the active driver.
     pub fn mac(&self) -> [u8; 6] {
-        self.dev.mac()
+        match self {
+            Nic::E1000 { dev, .. } => dev.mac(),
+            Nic::Sky2 { dev, .. } => dev.mac(),
+        }
+    }
+
+    /// Send one Ethernet frame through the active driver.
+    pub fn send_frame(&mut self, frame: &[u8]) -> Result<(), &'static str> {
+        match self {
+            Nic::E1000 { dev, .. } => dev.transmit(frame),
+            Nic::Sky2 { dev, .. } => dev.transmit(frame),
+        }
+    }
+
+    /// Poll one Ethernet frame from the active driver.
+    pub fn recv_frame(&mut self, buf: &mut [u8]) -> Option<usize> {
+        match self {
+            Nic::E1000 { dev, .. } => dev.receive(buf),
+            Nic::Sky2 { dev, .. } => dev.receive(buf),
+        }
+    }
+
+    /// Did the gateway's ARP reply pass through the driver yet?
+    pub fn saw_arp_reply(&self) -> bool {
+        match self {
+            Nic::E1000 { saw_arp_reply, .. } | Nic::Sky2 { saw_arp_reply, .. } => *saw_arp_reply,
+        }
     }
 
     /// Same filter the old `arp_resolve` used: an ARP *reply* whose
@@ -92,12 +153,39 @@ impl E1000Phy {
         if frame[28..32] != SLIRP_GATEWAY {
             return; // not from the gateway we are resolving
         }
-        if frame[0..6] != self.dev.mac() {
+        if frame[0..6] != self.mac() {
             return; // not addressed to us
         }
-        self.saw_arp_reply = true;
+        match self {
+            Nic::E1000 { saw_arp_reply, .. } | Nic::Sky2 { saw_arp_reply, .. } => {
+                *saw_arp_reply = true
+            }
+        }
+    }
+
+    /// Link state of the active NIC (the sky2 reads its PHY live; the
+    /// e1000 driver does not track link).
+    pub fn link(&self) -> LinkState {
+        match self {
+            Nic::E1000 { .. } => LinkState::Unknown,
+            Nic::Sky2 { dev, .. } => dev.link(),
+        }
+    }
+
+    /// RX frames the driver had to drop, when it keeps a counter
+    /// (today: the sky2's transmit-wait scratch overflow).
+    pub fn rx_dropped(&self) -> Option<u32> {
+        match self {
+            Nic::E1000 { .. } => None,
+            Nic::Sky2 { dev, .. } => Some(dev.rx_dropped()),
+        }
     }
 }
+
+/// Historical name of the stack's device type, kept as an alias of
+/// [`Nic`] so `tls.rs` — frozen for the sky2 milestone — compiles
+/// untouched. New code should name [`Nic`].
+pub type E1000Phy = Nic;
 
 /// RX token: one frame copied out of the ring (the slot is reclaimed
 /// inside `E1000::receive`, before the token is even handed over).
@@ -116,10 +204,10 @@ impl RxToken for Rx {
 }
 
 /// TX token: fills a scratch frame through the closure, then commits
-/// it to the ring — the "payload written, descriptor published"
-/// pairing `E1000::transmit` already implements.
+/// it to the active driver — the "payload written, descriptor
+/// published" pairing `E1000::transmit` / `Sky2::transmit` implement.
 pub struct Tx<'a> {
-    phy: &'a mut E1000Phy,
+    nic: &'a mut Nic,
 }
 
 impl TxToken for Tx<'_> {
@@ -129,17 +217,19 @@ impl TxToken for Tx<'_> {
     {
         let mut buf = [0u8; FRAME];
         let result = f(&mut buf[..len]);
-        if let Err(e) = self.phy.dev.transmit(&buf[..len]) {
+        if let Err(e) = self.nic.send_frame(&buf[..len]) {
             // Boot-time policy: a ring that never completes is fatal,
             // exactly as every other transmit path in this driver.
-            serial_println!("FATAL: e1000: {e}");
+            // (`kind()` keeps the historical `FATAL: e1000: …` text
+            // on the QEMU path byte-identical.)
+            serial_println!("FATAL: {}: {e}", self.nic.kind());
             crate::halt();
         }
         result
     }
 }
 
-impl Device for E1000Phy {
+impl Device for Nic {
     type RxToken<'a>
         = Rx
     where
@@ -151,13 +241,13 @@ impl Device for E1000Phy {
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Rx, Tx<'_>)> {
         let mut frame = [0u8; FRAME];
-        let len = self.dev.receive(&mut frame)?;
+        let len = self.recv_frame(&mut frame)?;
         self.sniff_arp_reply(&frame[..len]);
-        Some((Rx { frame, len }, Tx { phy: self }))
+        Some((Rx { frame, len }, Tx { nic: self }))
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Tx<'_>> {
-        Some(Tx { phy: self })
+        Some(Tx { nic: self })
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -242,7 +332,7 @@ static mut STORAGE: Storage = Storage::new();
 /// phases and the shell drive, all static-backed (no allocator).
 pub struct Stack {
     pub iface: Interface,
-    pub dev: E1000Phy,
+    pub dev: Nic,
     pub sockets: SocketSet<'static>,
     pub tcp_handle: SocketHandle,
     pub tcp2_handle: SocketHandle,
@@ -257,12 +347,13 @@ pub struct Stack {
 }
 
 impl Stack {
-    /// Wrap the initialized e1000. `random_seed` is **mandatory**
+    /// Wrap the initialized NIC (`Nic::e1000` in QEMU, `Nic::sky2`
+    /// on the MacBook). `random_seed` is **mandatory**
     /// (risk R1 of docs/smoltcp-eval.md): smoltcp draws TCP ISNs,
     /// source ports and DHCP transaction ids from an sPCG32 seeded
     /// here — default 0 would be a per-boot-constant ISN stream, a
     /// regression against the CSPRNG defense in `entropy.rs`.
-    pub fn new(dev: E1000, random_seed: u64) -> Self {
+    pub fn new(nic: Nic, random_seed: u64) -> Self {
         // SAFETY: single-use static (see STORAGE); single core, the
         // IRQ0 handler never touches it.
         let storage: &'static mut Storage = unsafe { &mut *addr_of_mut!(STORAGE) };
@@ -290,7 +381,7 @@ impl Stack {
             net::SLIRP_DNS[3],
         ));
 
-        let mut dev = E1000Phy::new(dev);
+        let mut dev = nic;
         let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(dev.mac())));
         config.random_seed = random_seed; // R1 condition
         let iface = Interface::new(config, &mut dev, clock::now());
@@ -394,7 +485,7 @@ impl Stack {
         let mut sent = false;
         loop {
             self.poll();
-            if !net_ok && self.dev.saw_arp_reply {
+            if !net_ok && self.dev.saw_arp_reply() {
                 serial_println!("NET_OK"); // machine-checked by `cargo xtask smoke`
                 net_ok = true;
             }

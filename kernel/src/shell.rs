@@ -22,7 +22,7 @@
 //! unreachable host prints a line and returns to the prompt; only an
 //! explicit `halt` stops the machine.
 
-use crate::netstack::Stack;
+use crate::netstack::{LinkState, Stack};
 use crate::{keyboard, memory, pit, serial};
 use smoltcp::wire::Ipv4Address;
 
@@ -171,7 +171,7 @@ fn execute(stack: &mut Stack, line: &str) {
              \x20 about             what this system is\n\
              \x20 uptime            time since boot\n\
              \x20 meminfo           free physical memory\n\
-             \x20 netinfo           DHCP lease: ip/mask/router/dns\n\
+             \x20 netinfo           DHCP lease + NIC/link state\n\
              \x20 ping <a.b.c.d>    ICMP echo roundtrip\n\
              \x20 resolve <host>    DNS A lookup\n\
              \x20 tui               full-screen TUI demo (Esc quits)\n\
@@ -219,6 +219,28 @@ fn execute(stack: &mut Stack, line: &str) {
                     }
                 }
                 None => serial_println!("          (static addressing, no lease)"),
+            }
+            // Which NIC is up and (for the sky2) what its PHY says —
+            // the on-hardware observability hook for the MacBook boot
+            // (kernel/src/sky2.rs module docs).
+            let kind = stack.dev.kind();
+            match stack.dev.link() {
+                LinkState::Up {
+                    speed_mbps,
+                    full_duplex,
+                } => {
+                    let dup = if full_duplex { "full" } else { "half" };
+                    serial_println!(
+                        "          nic {kind}: link up, {speed_mbps} Mbps {dup} duplex"
+                    );
+                }
+                LinkState::Down => serial_println!("          nic {kind}: link down"),
+                LinkState::Unknown => serial_println!("          nic {kind}: link not tracked"),
+            }
+            if let Some(dropped) = stack.dev.rx_dropped()
+                && dropped > 0
+            {
+                serial_println!("          nic {kind}: {dropped} rx frames dropped");
             }
         }
         "ping" => match net::parse_ipv4(rest) {

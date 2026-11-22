@@ -575,6 +575,7 @@ dependencies = [
  "rand_core 0.9.5",
  "ratatui",
  "rtc",
+ "sky2-wire",
  "smoltcp",
  "ssh-wire",
  "uart_16550",
@@ -942,6 +943,10 @@ dependencies = [
  "digest",
  "rand_core 0.10.1",
 ]
+
+[[package]]
+name = "sky2-wire"
+version = "0.1.0"
 
 [[package]]
 name = "smoltcp"
