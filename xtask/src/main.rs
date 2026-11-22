@@ -514,7 +514,7 @@ fn qemu_std_args(iso: &str, monitor: &str) -> Vec<String> {
     qemu_std_args_ex(iso, monitor, "stdio", None)
 }
 
-/// [`qemu_std_args`] with the serial destination and an optional
+/// [`qemu_std_args_ex`] with the serial destination and an optional
 /// `hostfwd` rule (S5's two-VM harness: the server VM publishes guest
 /// :2222 on the container's loopback, so the client VM's slirp gateway
 /// `10.0.2.2:2222` reaches it). `serial` is a QEMU chardev spec —
@@ -524,6 +524,20 @@ fn qemu_std_args_ex(
     monitor: &str,
     serial: &str,
     hostfwd: Option<(&str, u16, u16)>,
+) -> Vec<String> {
+    let rules: Vec<(&str, u16, u16)> = hostfwd.into_iter().collect();
+    qemu_std_args_fw(iso, monitor, serial, &rules)
+}
+
+/// [`qemu_std_args_ex`] with **any number of** `hostfwd` rules
+/// (hwtest needs two: the sshd forward :2223→:2222 *and* the netlog
+/// forward :2224→:2224 on the same slirp netdev). Empty slice = no
+/// forwards, exactly like `None`.
+fn qemu_std_args_fw(
+    iso: &str,
+    monitor: &str,
+    serial: &str,
+    hostfwds: &[(&str, u16, u16)],
 ) -> Vec<String> {
     let mut args = vec![
         "-m".into(),
@@ -542,7 +556,7 @@ fn qemu_std_args_ex(
         "-boot".into(),
         "order=dc".into(),
     ];
-    args.extend(qemu_device_args(serial, monitor, hostfwd));
+    args.extend(qemu_device_args_fw(serial, monitor, hostfwds));
     args
 }
 
@@ -562,6 +576,14 @@ fn qemu_disk_args(monitor: &str) -> Vec<String> {
 /// display, and the devices every smoke expects (e1000 with a fixed
 /// MAC, USB + boot keyboard). Shared by the ISO and disk invocations.
 fn qemu_device_args(serial: &str, monitor: &str, hostfwd: Option<(&str, u16, u16)>) -> Vec<String> {
+    let rules: Vec<(&str, u16, u16)> = hostfwd.into_iter().collect();
+    qemu_device_args_fw(serial, monitor, &rules)
+}
+
+/// [`qemu_device_args`] with **any number of** `hostfwd` rules, all
+/// on the same slirp netdev — QEMU takes them comma-separated
+/// (`user,id=net0,hostfwd=…,hostfwd=…`). Empty slice = no forwards.
+fn qemu_device_args_fw(serial: &str, monitor: &str, hostfwds: &[(&str, u16, u16)]) -> Vec<String> {
     let args = vec![
         "-serial".into(),
         serial.into(),
@@ -574,11 +596,14 @@ fn qemu_device_args(serial: &str, monitor: &str, hostfwd: Option<(&str, u16, u16
         // peer that answers ARP (gateway 10.0.2.2). Explicit device
         // (with fixed MAC) instead of relying on QEMU's implicit default.
         "-netdev".into(),
-        match hostfwd {
-            Some((host, host_port, guest_port)) => {
-                format!("user,id=net0,hostfwd=tcp:{host}:{host_port}-:{guest_port}")
+        if hostfwds.is_empty() {
+            "user,id=net0".into()
+        } else {
+            let mut spec = String::from("user,id=net0");
+            for (host, host_port, guest_port) in hostfwds {
+                spec.push_str(&format!(",hostfwd=tcp:{host}:{host_port}-:{guest_port}"));
             }
-            None => "user,id=net0".into(),
+            spec
         },
         "-device".into(),
         "e1000,netdev=net0,mac=52:54:00:12:34:56".into(),
@@ -1441,10 +1466,14 @@ fn run(root: &Path) -> bool {
 /// `cargo xtask hwtest` — prove the **hardware bring-up path** in
 /// QEMU: the ISO carries the `sshd` multiboot2 module, so the kernel
 /// skips the smoke chain, takes a static address (plus the slirp one,
-/// so `hostfwd` reaches it) and serves sshd on guest :2222; xtask
-/// then runs the container's **real OpenSSH client** through
-/// `hostfwd=tcp:0.0.0.0:2223-:2222` and requires the exec output.
-/// The server's serial (with every drop/auth reason — the exact
+/// so `hostfwd` reaches it), serves sshd on guest :2222 and serves
+/// **netlog** on guest :2224 (the serial ring over TCP); xtask then
+/// runs the container's **real OpenSSH client** through
+/// `hostfwd=tcp:0.0.0.0:2223-:2222` and requires the exec output,
+/// and connects to `hostfwd=tcp:0.0.0.0:2224-:2224` to require the
+/// known boot lines out of the netlog stream (`hwtest: netlog PASS
+/// — <n> bytes`). Both are required for this harness to PASS. The
+/// server's serial (with every drop/auth reason — the exact
 /// diagnosis the real MacBook needs) is printed live as `hwtest| …`.
 fn hwtest(root: &Path) -> bool {
     if !iso_inner(root, true) {
@@ -1456,11 +1485,14 @@ fn hwtest(root: &Path) -> bool {
     if !sh(root, "docker", &["build", "-t", TOOLS_IMAGE, "tools"]) {
         return false;
     }
-    let args = qemu_std_args_ex(
+    let args = qemu_std_args_fw(
         "/iso/os.iso",
         &format!("tcp:127.0.0.1:{},server,nowait", monitor_port(root)),
         "stdio",
-        Some(("0.0.0.0", 2223, 2222)),
+        // Two forwards on the same slirp netdev: the sshd repro
+        // harness (:2223 → guest :2222) and netlog (:2224 → guest
+        // :2224, the serial ring over TCP).
+        &[("0.0.0.0", 2223, 2222), ("0.0.0.0", 2224, 2224)],
     );
     let mut docker_args: Vec<String> = vec![
         "run".into(),
@@ -1511,7 +1543,20 @@ fn hwtest(root: &Path) -> bool {
         }
     }
     let mut ok = false;
+    let mut netlog_ok = false;
     if listening {
+        // 0. netlog first (milestone netlog): the serial ring served
+        //    over TCP on guest :2224. The kernel is inside the sshd
+        //    accept window below — polling the stack, which is exactly
+        //    what pumps the ring — so the history (boot lines) plus a
+        //    live tail are available right now.
+        match netlog_probe(&container) {
+            Ok(bytes) => {
+                netlog_ok = true;
+                println!("hwtest: netlog PASS — {bytes} bytes");
+            }
+            Err(e) => eprintln!("hwtest: netlog FAIL — {e}"),
+        }
         // 1. An abrupt mid-KEX connection (open the TCP stream, say
         //    nothing, hang up): the server's step deadline fires and
         //    stores the failure reason — the input the banner replay
@@ -1575,8 +1620,12 @@ fn hwtest(root: &Path) -> bool {
     let _ = child.kill();
     let _ = child.wait();
     rm_container(&container);
-    if ok {
-        println!("hwtest: PASS — real OpenSSH authenticated over hostfwd");
+    if ok && netlog_ok {
+        println!(
+            "hwtest: PASS — real OpenSSH authenticated over hostfwd; netlog served the serial ring"
+        );
+    } else if ok {
+        eprintln!("hwtest: FAIL — OpenSSH interop passed but netlog did not (see above)");
     } else {
         eprintln!("hwtest: FAIL — see the hwtest| server lines above");
         for line in &collected {
@@ -1585,7 +1634,49 @@ fn hwtest(root: &Path) -> bool {
             }
         }
     }
-    ok
+    ok && netlog_ok
+}
+
+/// The netlog phase: connect to the guest's serial-over-TCP port from
+/// **inside** the container (`hostfwd=tcp:0.0.0.0:2224-:2224` binds
+/// the container's own interfaces, so `/dev/tcp/127.0.0.1/2224`
+/// reaches it) and read for a bounded few seconds — the stream never
+/// ends on its own (the server keeps streaming the live tail until
+/// the client hangs up, which is what `timeout … cat` does).
+///
+/// Returns the byte count when the stream carries a known boot line
+/// (`hw: bring-up mode` or `BOOT_OK`); a detailed error — bytes
+/// received plus the first lines — otherwise.
+fn netlog_probe(container: &str) -> Result<usize, String> {
+    // bash provides /dev/tcp (the same idiom the sshd phases use),
+    // coreutils provides `timeout`. Exit 11 = connect refused; the
+    // `timeout` kill (124) is the *expected* end of an open-ended
+    // stream, so the verdict is the content, not the exit status.
+    let script = "exec 3<>/dev/tcp/127.0.0.1/2224 || exit 11; timeout 8 cat <&3";
+    let out = match Command::new("docker")
+        .args(["exec", container, "bash", "-c", script])
+        .output()
+    {
+        Ok(out) => out,
+        Err(e) => return Err(format!("cannot run docker exec: {e}")),
+    };
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if out.stdout.is_empty() {
+        return Err(format!(
+            "0 bytes received (status: {}; stderr: {})",
+            out.status,
+            stderr.trim()
+        ));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    if !text.contains("hw: bring-up mode") && !text.contains("BOOT_OK") {
+        let head: String = text.lines().take(8).map(|l| format!("  {l}\n")).collect();
+        return Err(format!(
+            "{} bytes received but no known boot line; first lines:\n{head}",
+            out.stdout.len()
+        ));
+    }
+    Ok(out.stdout.len())
 }
 
 fn smoke(root: &Path) -> bool {

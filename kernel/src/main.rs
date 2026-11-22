@@ -54,6 +54,7 @@ mod vga;
 // The network chain runs on smoltcp (docs/smoltcp-eval.md — M2):
 // e1000 is the phy::Device, the old per-protocol drivers are gone.
 mod clock;
+mod netlog;
 mod netstack;
 
 use core::panic::PanicInfo;

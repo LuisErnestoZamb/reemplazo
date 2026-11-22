@@ -276,7 +276,7 @@ pub struct LeaseInfo {
 /// sizes in docs/smoltcp-eval.md §1.6 — ~11 KiB, plus the seven extra
 /// TCP pairs the sequential smoke connections need ≈ +56 KiB).
 pub struct Storage {
-    pub slots: [SocketStorage<'static>; 13],
+    pub slots: [SocketStorage<'static>; 14],
     /// First connection (the plain-HTTP proof).
     pub tcp_rx: [u8; 4096],
     pub tcp_tx: [u8; 4096],
@@ -321,6 +321,12 @@ pub struct Storage {
     /// touches a port, so the 29-marker `smoke` chain is neutral.
     pub tcp10_rx: [u8; 4096],
     pub tcp10_tx: [u8; 4096],
+    /// The netlog listener (serial over TCP, port 2224): created
+    /// closed; `netlog_listen` is called **only** by the hardware
+    /// bring-up mode (`kernel/src/hwtest.rs`), so a normal boot never
+    /// opens the port and never answers a SYN on it.
+    pub tcp11_rx: [u8; 4096],
+    pub tcp11_tx: [u8; 4096],
     pub icmp_rx_pkts: [icmp::PacketMetadata; 1],
     pub icmp_rx: [u8; 256],
     pub icmp_tx_pkts: [icmp::PacketMetadata; 1],
@@ -332,7 +338,7 @@ pub struct Storage {
 impl Storage {
     pub const fn new() -> Self {
         Storage {
-            slots: [SocketStorage::EMPTY; 13],
+            slots: [SocketStorage::EMPTY; 14],
             tcp_rx: [0; 4096],
             tcp_tx: [0; 4096],
             tcp2_rx: [0; 4096],
@@ -353,6 +359,8 @@ impl Storage {
             tcp9_tx: [0; 4096],
             tcp10_rx: [0; 4096],
             tcp10_tx: [0; 4096],
+            tcp11_rx: [0; 4096],
+            tcp11_tx: [0; 4096],
             icmp_rx_pkts: [icmp::PacketMetadata::EMPTY; 1],
             icmp_rx: [0; 256],
             icmp_tx_pkts: [icmp::PacketMetadata::EMPTY; 1],
@@ -393,6 +401,21 @@ pub struct Stack {
     /// S5 sshd listener: a socket that stays `Closed` until
     /// [`Stack::listen_ssh`] puts it in `Listen`.
     pub listen_handle: SocketHandle,
+    /// netlog listener (serial over TCP, :2224): a socket that stays
+    /// `Closed` until [`Stack::netlog_listen`] puts it in `Listen` —
+    /// which only the hardware bring-up mode does.
+    pub netlog_handle: SocketHandle,
+    /// netlog armed by [`Stack::netlog_listen`]: `pump` returns
+    /// after this bool test is `false`, which is every normal boot.
+    pub netlog_enabled: bool,
+    /// A netlog client is connected and being streamed (session
+    /// state: history replay → live tail → reset on disconnect).
+    pub netlog_streaming: bool,
+    /// Absolute ring cursor of the current netlog session.
+    pub netlog_cursor: u64,
+    /// Bytes that fell out of the ring but are not yet reported to
+    /// the client (the report line waits for tx-buffer space).
+    pub netlog_report: u64,
     pub icmp_handle: SocketHandle,
     pub dns_handle: SocketHandle,
     /// Added only after PING_OK (R7 — see module docs).
@@ -434,6 +457,8 @@ impl Stack {
             tcp9_tx,
             tcp10_rx,
             tcp10_tx,
+            tcp11_rx,
+            tcp11_tx,
             icmp_rx_pkts,
             icmp_rx,
             icmp_tx_pkts,
@@ -494,6 +519,15 @@ impl Stack {
             tcp::SocketBuffer::new(&mut tcp10_rx[..]),
             tcp::SocketBuffer::new(&mut tcp10_tx[..]),
         ));
+        // netlog (serial over TCP): same closed-until-listen shape as
+        // the sshd listener, one buffer pair more. Deliberately **not**
+        // in the timeout/congestion loop below: a netlog client may sit
+        // quiet between lines, so the connection must live until the
+        // client hangs up — no smoltcp idle timeout.
+        let netlog_handle = sockets.add(tcp::Socket::new(
+            tcp::SocketBuffer::new(&mut tcp11_rx[..]),
+            tcp::SocketBuffer::new(&mut tcp11_tx[..]),
+        ));
         let icmp_handle = sockets.add(icmp::Socket::new(
             icmp::PacketBuffer::new(&mut icmp_rx_pkts[..], &mut icmp_rx[..]),
             icmp::PacketBuffer::new(&mut icmp_tx_pkts[..], &mut icmp_tx[..]),
@@ -535,6 +569,11 @@ impl Stack {
             tcp8_handle,
             tcp9_handle,
             listen_handle,
+            netlog_handle,
+            netlog_enabled: false,
+            netlog_streaming: false,
+            netlog_cursor: 0,
+            netlog_report: 0,
             icmp_handle,
             dns_handle,
             dhcp_handle: None,
@@ -562,11 +601,34 @@ impl Stack {
         sock.listen(port).is_ok()
     }
 
+    /// Put the netlog socket into `Listen` on `port` (milestone
+    /// netlog): the serial ring served to one TCP client at a time
+    /// through `netlog::pump`. Called **only** by the hardware
+    /// bring-up mode (`kernel/src/hwtest.rs`) — every other boot
+    /// leaves the socket `Closed`, so `netlog::pump` exits on its
+    /// bool test and no port is ever touched (the smoke's neutrality
+    /// requirement). No idle timeout is set: a client may sit quiet
+    /// between log lines; the connection ends when the *client*
+    /// hangs up.
+    pub fn netlog_listen(&mut self, port: u16) -> bool {
+        let sock = self.sockets.get_mut::<tcp::Socket>(self.netlog_handle);
+        if sock.is_open() {
+            sock.abort();
+        }
+        let ok = sock.listen(port).is_ok();
+        if ok {
+            self.netlog_enabled = true;
+        }
+        ok
+    }
+
     /// Run one stack iteration: ingress, egress, timers. Every phase
-    /// loops on this (docs/smoltcp-eval.md §4-M2).
+    /// loops on this (docs/smoltcp-eval.md §4-M2). The netlog pump
+    /// runs last — one bool test unless `netlog_listen` armed it.
     pub fn poll(&mut self) {
         self.iface
             .poll(clock::now(), &mut self.dev, &mut self.sockets);
+        crate::netlog::pump(self);
     }
 
     /// Static addressing for the pre-DHCP phase: the smoke's

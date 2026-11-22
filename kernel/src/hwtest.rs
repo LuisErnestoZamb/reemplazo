@@ -9,7 +9,10 @@
 //! 2. assigns a **static** address on the wired LAN (the smoke's
 //!    slirp constants do not apply to real hardware),
 //! 3. serves sshd, so an operator can reach the machine over the
-//!    network — the only observability channel this hardware has.
+//!    network — the only observability channel this hardware has,
+//! 4. serves **netlog** on :2224: every serial print since the first
+//!    line of boot, streamed over TCP (`crate::netlog`) — the
+//!    diagnosis channel for everything sshd cannot show.
 //!
 //! Failures self-heal: no NIC → [`no_nic`] reboots after a grace
 //! period; a NIC that comes up but accepts no client for two accept
@@ -51,6 +54,18 @@ pub fn run(stack: &mut Stack, cfg: &ServerConfig) -> ! {
     // in-QEMU repro harness reaches the same sshd. Harmless on the
     // real LAN — nothing routes to it there.
     stack.add_ipv4(net::SLIRP_GUEST_IP, 24);
+    // netlog (serial over TCP, :2224): the observability channel this
+    // mode exists for — the ring captured from the first print on,
+    // served to one client (history first, then the live tail). Only
+    // this bring-up path ever arms it; normal boots never listen.
+    if stack.netlog_listen(crate::netlog::PORT) {
+        serial_println!(
+            "hw: netlog on :{} (serial over TCP) — history + live tail",
+            crate::netlog::PORT
+        );
+    } else {
+        serial_println!("hw: netlog could not listen on :{}", crate::netlog::PORT);
+    }
     serial_println!(
         "hw: sshd on 192.168.1.79:{} (sky2) — waiting for a client",
         crate::sshd::LISTEN_PORT
