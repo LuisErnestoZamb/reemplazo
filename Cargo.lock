@@ -723,6 +723,7 @@ dependencies = [
  "ssh-wire",
  "uart_16550",
  "url",
+ "usbwire",
 ]
 
 [[package]]
@@ -1398,6 +1399,10 @@ dependencies = [
  "idna",
  "percent-encoding",
 ]
+
+[[package]]
+name = "usbwire"
+version = "0.1.0"
 
 [[package]]
 name = "utf8_iter"

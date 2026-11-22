@@ -1,4 +1,5 @@
-//! Polled i8042 (PS/2) keyboard driver — the QEMU input path.
+//! Polled i8042 (PS/2) keyboard driver — the QEMU input path — plus
+//! the USB fallback for machines without one.
 //!
 //! # The MacBook reality (docs/hardware.md §2.1)
 //!
@@ -8,10 +9,31 @@
 //! machine (`i8042: PNP: No PS/2 controller found.`). This driver
 //! therefore serves the **QEMU path** — QEMU's `pc` machine always
 //! exposes an i8042 at ports `0x60`/`0x64`. On the MacBook, [`init`]
-//! fails soft: every wait is bounded, nothing panics, and keyboard input
-//! stays unavailable until the later **UHCI + HID** milestone (§2.7
-//! step 7). Ports `0x60`/`0x64` are unclaimed there, so a status read
-//! floats to `0xFF` and bring-up bails out immediately (§2.1).
+//! fails soft: every wait is bounded, nothing panics, and input comes
+//! from the **UHCI + HID** driver instead (`crate::usb`, §2.7 step 7):
+//! [`poll_decoded`] reads the i8042 first and *also* drains the USB
+//! driver's translated set-1 byte stream, feeding the *same*
+//! `pc-keyboard` decoder — one decoder, one consumer, whichever wire
+//! the bytes came from.
+//!
+//! # Why both sources are drained (and why that can't double-type)
+//!
+//! QEMU's input dispatch is **unicast**, not broadcast:
+//! `qemu_input_event_send_impl` (`ui/input.c`) delivers each event to
+//! exactly one handler — the first match in `qemu_input_find_handler` —
+//! and `hid_init` (`hw/input/hid.c`) calls
+//! `qemu_input_handler_activate` on the USB keyboard handler, moving
+//! it to the head of that list. Consequence: with QEMU's
+//! `-device usb-kbd` attached (the smoke's flags), **every injected
+//! `sendkey` lands on the USB keyboard and the PS/2 handler sees
+//! none** — verified by tracing (`-trace enable=ps2_*` shows zero
+//! `ps2_keyboard_event` hits for injected keys, while without
+//! usb-kbd... the handler simply never wins the race). So the USB
+//! queue must be drained *alongside* PS/2 or `KEYBOARD_OK` would have
+//! nothing to type through. Because dispatch is unicast, one keystroke
+//! can only ever arrive via **one** of the two wires — draining both
+//! cannot double-type. On the real MacBook there is no i8042 at all
+//! (§2.1), so only the USB path exists there.
 //!
 //! # Scope (hardware.md §2.7 steps 2–3 — polled first, no IRQ)
 //!
@@ -98,8 +120,8 @@ pub fn init() {
             serial_println!("keyboard: i8042 ready (translation on → scancode set 1)");
         }
         Err(why) => serial_println!(
-            "keyboard: no i8042 controller ({why}) — PS/2 input disabled \
-             (MacBook: built-in keyboard is USB HID, UHCI milestone)"
+            "keyboard: no i8042 controller ({why}) — PS/2 input disabled, \
+             USB path active if a UHCI keyboard was found (crate::usb)"
         ),
     }
 }
@@ -184,18 +206,40 @@ pub fn next_event() -> Option<Key> {
 }
 
 /// One shared poll→decode step for [`next_char`] and [`next_event`]:
-/// controller check, aux byte drop, one scancode byte in, one
-/// [`DecodedKey`] out (`None` = nothing usable this iteration).
+/// one scancode byte in (PS/2 first, then USB), one [`DecodedKey`]
+/// out (`None` = nothing usable this iteration).
 ///
 /// SAFETY contract: the decoder has exactly **one** consumer at a
 /// time — the shell's idle loop (`next_char`), or a builtin that
 /// borrowed the loop's stack for its whole run (`next_event`); no IRQ
 /// handler reads the controller (IRQ1 stays masked, polled
-/// milestone), so no re-entry or aliasing is possible.
+/// milestone), so no re-entry or aliasing is possible. The USB queue
+/// obeys the same rule: `crate::usb`'s bytes are drained only here.
 fn poll_decoded() -> Option<DecodedKey> {
-    if !AVAILABLE.load(Ordering::Relaxed) {
-        return None;
+    // PS/2 first — the i8042 path is untouched and preferred whenever
+    // a byte is waiting (module header: QEMU's dispatch is unicast, so
+    // exactly one of the two sources ever carries a keystroke).
+    if AVAILABLE.load(Ordering::Relaxed)
+        && let Some(key) = poll_ps2()
+    {
+        return Some(key);
     }
+    // USB HID path (the MacBook; and in QEMU, the usb-kbd wire — see
+    // the module header): pump one interrupt-IN transfer, then feed
+    // one translated set-1 byte into the same decoder — `usbwire` did
+    // the usage→set-1 translation, `pc-keyboard` still owns decoding.
+    crate::usb::poll();
+    let byte = crate::usb::next_scancode()?;
+    // SAFETY: see the function docs — single consumer, polled, no IRQ
+    // handler touches DECODER.
+    let decoder = unsafe { &mut *core::ptr::addr_of_mut!(DECODER) };
+    let event = decoder.add_byte(byte).ok().flatten()?;
+    decoder.process_keyevent(event)
+}
+
+/// One PS/2 byte → decoded key: controller check, aux byte drop, one
+/// scancode byte from port `0x60` (reading it also clears OBF, §2.2).
+fn poll_ps2() -> Option<DecodedKey> {
     let st = status();
     if st & OBF == 0 {
         return None;
@@ -204,9 +248,9 @@ fn poll_decoded() -> Option<DecodedKey> {
         let _ = read_data(); // mouse byte: drop it (IRQ12 stays masked)
         return None;
     }
-    let byte = read_data(); // reading 0x60 also clears OBF (§2.2)
+    let byte = read_data();
 
-    // SAFETY: see the function docs — single consumer, polled, no IRQ
+    // SAFETY: see `poll_decoded` — single consumer, polled, no IRQ
     // handler touches DECODER.
     let decoder = unsafe { &mut *core::ptr::addr_of_mut!(DECODER) };
     // Err = unknown scancode (ignored, decoder state already reset),

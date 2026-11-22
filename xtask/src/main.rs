@@ -134,6 +134,8 @@ fn check(root: &Path) -> bool {
                 "-p",
                 "editorbuf",
                 "-p",
+                "usbwire",
+                "-p",
                 "sky2-wire",
                 "-p",
                 "mbi",
@@ -183,6 +185,8 @@ fn check(root: &Path) -> bool {
                 "ssh-wire",
                 "-p",
                 "editorbuf",
+                "-p",
+                "usbwire",
                 "-p",
                 "sky2-wire",
                 "-p",
@@ -307,6 +311,20 @@ fn qemu_std_args(iso: &str, monitor: &str) -> Vec<String> {
         "user,id=net0".into(),
         "-device".into(),
         "e1000,netdev=net0,mac=52:54:00:12:34:56".into(),
+        // USB HID keyboard milestone: `-usb` creates QEMU's PIIX3 UHCI
+        // companion (hw/i386/pc_piix.c passes machine_usb() to the
+        // south bridge's `has-usb`; hw/isa/piix.c then realizes
+        // `piix3-usb-uhci` at devfn+2 = 00:01.2, 8086:7020, I/O BAR4)
+        // and `-device usb-kbd` attaches a boot keyboard to it — the
+        // device the kernel's `usb::init` enumerates for USB_KBD_OK.
+        // Verified empirically: without `-usb` QEMU rejects usb-kbd
+        // ("No 'usb-bus' bus found"); with it, `info pci` shows the
+        // controller at 00:01.2. `sendkey` still feeds PS/2, so the
+        // KEYBOARD_OK phase is unaffected (keyboard.rs keeps PS/2
+        // primary whenever an i8042 exists).
+        "-usb".into(),
+        "-device".into(),
+        "usb-kbd".into(),
     ]
 }
 
@@ -619,6 +637,8 @@ fn run(root: &Path) -> bool {
 /// milestone's serial marker in order — `BOOT_OK` (Multiboot2 parse),
 /// `MEM_OK` (frame-allocator selftest), `ALLOC_OK` (kernel heap: `Vec`
 /// push/check/drop round-trip), `PCI_OK` (config scan),
+/// `USB_KBD_OK` (UHCI probe + HID boot-keyboard enumeration,
+/// configuration and one live interrupt-IN poll),
 /// `E1000_OK` (NIC probe + MMIO + MAC), `NET_OK` (TX/RX rings + ARP
 /// roundtrip through slirp), `PING_OK` (IPv4/ICMP echo with validated
 /// checksums), `DHCP_OK` (full DISCOVER/OFFER/REQUEST/ACK lease),
@@ -649,7 +669,8 @@ fn run(root: &Path) -> bool {
 ///
 /// This is the test that fails on a broken boot path (header, trampoline,
 /// GDT, paging, mbi parse), the VGA text mirror, memory path, heap path
-/// (carve + global allocator), PCI scan, e1000 driver, network path,
+/// (carve + global allocator), PCI scan, UHCI enumeration (HID boot
+/// keyboard via `usbwire` + `kernel/src/usb.rs`), e1000 driver, network path,
 /// DHCP/DNS/TCP clients, TLS and HTTP clients, interrupt path (IDT,
 /// stubs, EOI, timer), the A1 screen layer (cell diff flush into the
 /// text buffer, ratatui backend, full-screen frame readback), the A2
@@ -667,13 +688,14 @@ fn run(root: &Path) -> bool {
 /// It runs **without a disk**, so the `ata::probe` that sits between
 /// `PCI_OK` and `E1000_OK` stays silent here.
 fn smoke(root: &Path) -> bool {
-    const MARKERS: [&str; 24] = [
+    const MARKERS: [&str; 25] = [
         "BOOT_OK",
         "VGA_OK",
         "MEM_OK",
         "ALLOC_OK",
         "RTC_OK",
         "PCI_OK",
+        "USB_KBD_OK",
         "E1000_OK",
         "NET_OK",
         "PING_OK",
