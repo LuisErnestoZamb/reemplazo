@@ -47,6 +47,21 @@
 //! own their adapters independently, and the rule of three says a third
 //! user is what justifies extracting a shared one.
 //!
+//! # G6 push (additive): the objects a server needs
+//!
+//! [`plan_push`] reads `/.git/refs/heads/main` from a fresh mount and
+//! walks commit → trees → blob ids **from the volume** (nothing is
+//! trusted from the earlier in-memory fetch), returning an oid-sorted
+//! map capped at [`MAX_OBJECTS`]; [`write_push_pack`] then reads each
+//! loose object back — one at a time, so peak heap is one object plus
+//! the pack — and appends it to a `git-pack` [`PackWriter`] (full
+//! non-delta objects; `receive-pack` accepts that, delta encoding is
+//! deferred). The writer's trailer covers only the appended pack, so
+//! the caller can prepend the receive-pack command pkt-lines and POST
+//! one buffer (`kernel/src/git_push.rs`). A gitlink's commit is not in
+//! a shallow store, so it is not sent; the parent commit is the
+//! server's own head and is not sent either.
+//!
 //! # Bounds
 //!
 //! Object count ≤ [`MAX_OBJECTS`], tree entries ≤ [`MAX_TREE_ENTRIES`],
@@ -59,11 +74,11 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 use core::ptr::addr_of_mut;
-use git_pack::{EntryMode, Kind as PackKind};
+use git_pack::{EncodeLimits, EntryMode, Kind as PackKind, PackWriter};
 use git_store::{
     IndexEntry, Kind as StoreKind, Mode, PathEntry, Signature, build_tree_hierarchy, decode_loose,
-    encode_commit, encode_head, encode_index, encode_loose, encode_ref, loose_path, parse_index,
-    parse_ref,
+    decode_loose_with_limit, encode_commit, encode_head, encode_index, encode_loose, encode_ref,
+    loose_path, parse_index, parse_ref,
 };
 
 /// Tree nesting cap (the fetch's walk uses the same bound).
@@ -74,6 +89,15 @@ const MAX_TREE_ENTRIES: usize = 4096;
 const PATH_CAP: usize = 255;
 /// Objects the store will write (the fetch already caps the pack).
 const MAX_OBJECTS: usize = 10_000;
+/// G6 push: the same object-count cap for the pack the push builds.
+const MAX_PUSH_OBJECTS: u32 = 10_000;
+/// G6 push: per-object content cap handed to `git-pack`'s writer (the
+/// fetch's own decoder cap).
+const MAX_PUSH_OBJECT: usize = 4 * 1024 * 1024;
+/// G6 push: pack-size cap. This repo's local commit + tree + 123 blobs
+/// compress to well under 1 MiB; 2 MiB leaves headroom and is the exact
+/// bound the POST body inherits (see `git_push`).
+pub(crate) const PUSH_PACK_CAP: usize = 2 * 1024 * 1024;
 /// Read-back buffer: one file at a time, comfortably over this repo's
 /// largest compressed blob (~160 KiB). Anything larger is a hard
 /// failure, never a truncated "pass".
@@ -745,6 +769,225 @@ pub(crate) fn realize(
         "git: store: verified {verified} object(s) + index ({index_entries} entries) from a fresh mount"
     );
     serial_println!("GIT_STORE_OK"); // machine-checked by `cargo xtask smoke-install`
+}
+
+// ---------------------------------------------------------------------------
+// G6 push: the objects a receive-pack needs, read back from the on-disk
+// `.git` (docs/git-ssh-deps.md §A.4 row G6; milestone G5 in the plan)
+// ---------------------------------------------------------------------------
+
+/// What a push must send, computed from the store the previous phase
+/// wrote — the local ref's commit, every tree under it, and every blob
+/// its trees name. The parent commit is deliberately absent: it is the
+/// server's own advertised head in a real push and the mock does not
+/// need it (`receive-pack` never receives objects it already has).
+pub(crate) struct PushPlan {
+    /// The local ref's value — the `new` object id of the push.
+    pub(crate) local: [u8; 20],
+    /// The `.git/shallow` boundary (the fetched head = our commit's
+    /// parent), reported so the log shows the graph is what G5 wrote.
+    pub(crate) base: [u8; 20],
+    /// object id → type, oid-sorted (a [`BTreeMap`]) so the pack is
+    /// deterministic.
+    objects: BTreeMap<[u8; 20], StoreKind>,
+}
+
+impl PushPlan {
+    /// Number of objects the pack will hold.
+    pub(crate) fn count(&self) -> usize {
+        self.objects.len()
+    }
+}
+
+fn store_pack_kind(kind: StoreKind) -> PackKind {
+    match kind {
+        StoreKind::Commit => PackKind::Commit,
+        StoreKind::Tree => PackKind::Tree,
+        StoreKind::Blob => PackKind::Blob,
+        StoreKind::Tag => PackKind::Tag,
+    }
+}
+
+/// Read one loose object through a **fresh** mount of the volume
+/// (`SCRATCH` holds the compressed file; the largest blob in this repo
+/// is ~160 KiB, and anything over the 512 KiB scratch fails loudly as
+/// `FATAL: git: store: …` rather than truncating).
+fn read_loose<D: fat::BlockDevice + ?Sized>(
+    fs: &fat::Fat16<'_, D>,
+    scratch: &mut [u8],
+    oid: &[u8; 20],
+) -> git_store::Object {
+    let mut path_buf = [0u8; 128];
+    let path = git_path(&loose_path(oid), &mut path_buf);
+    let n = read_into(fs, path, scratch);
+    match decode_loose_with_limit(scratch.get(..n).unwrap_or_default(), MAX_PUSH_OBJECT) {
+        Ok(object) => object,
+        Err(e) => {
+            serial_println!("FATAL: git: store: push: loose {path} refused: {e:?}");
+            crate::halt()
+        }
+    }
+}
+
+/// G6 first half: read `/.git/refs/heads/main`, walk the commit → tree →
+/// blob graph from disk, and return the object set the pack will hold.
+/// One mount, trees only — blobs are discovered by id and read in the
+/// write phase, so nothing but the (small) tree contents lives in RAM
+/// here.
+pub(crate) fn plan_push(drive: &ata::Drive) -> PushPlan {
+    let disk = GitDisk {
+        drive,
+        cache: RefCell::new(SectorCache::new()),
+    };
+    let fs = match fat::Fat16::mount(&disk) {
+        Ok(fs) => fs,
+        Err(e) => fatal_fat(e),
+    };
+    // SAFETY: single-use static (see `SCRATCH`); the write phase below
+    // mounts again and re-uses it only after this function returns.
+    let scratch = unsafe { &mut *addr_of_mut!(SCRATCH) };
+
+    let n = read_into(&fs, REF_PATH, scratch);
+    let local = match parse_ref(scratch.get(..n).unwrap_or_default()) {
+        Ok(oid) => oid,
+        Err(_) => fatal("push: refs/heads/main does not name an object id"),
+    };
+    let n = read_into(&fs, SHALLOW_PATH, scratch);
+    let base = match parse_ref(scratch.get(..n).unwrap_or_default()) {
+        Ok(oid) => oid,
+        Err(_) => fatal("push: .git/shallow does not name an object id"),
+    };
+
+    let commit = read_loose(&fs, scratch, &local);
+    if commit.kind != StoreKind::Commit || commit.oid != local {
+        fatal("push: the local ref does not name a commit object");
+    }
+    let root = match git_pack::parse_commit_tree(&commit.data) {
+        Ok(tree) => tree,
+        Err(e) => {
+            serial_println!("FATAL: git: store: push: local commit refused: {e:?}");
+            crate::halt()
+        }
+    };
+
+    let mut objects: BTreeMap<[u8; 20], StoreKind> = BTreeMap::new();
+    objects.insert(local, StoreKind::Commit);
+    objects.insert(root, StoreKind::Tree);
+    let mut pending: Vec<[u8; 20]> = Vec::new();
+    pending.push(root);
+    while let Some(tree_oid) = pending.pop() {
+        let tree = read_loose(&fs, scratch, &tree_oid);
+        if tree.kind != StoreKind::Tree || tree.oid != tree_oid {
+            fatal("push: a tree entry does not name a tree object");
+        }
+        let mut offset = 0usize;
+        while offset < tree.data.len() {
+            let Some(tail) = tree.data.get(offset..) else {
+                fatal("push: tree entry offset out of range");
+            };
+            let (entry, consumed) = match git_pack::parse_tree_entry(tail) {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    serial_println!("FATAL: git: store: push: malformed tree entry: {e:?}");
+                    crate::halt()
+                }
+            };
+            offset = match offset.checked_add(consumed) {
+                Some(next) => next,
+                None => fatal("push: tree entry offset overflow"),
+            };
+            match entry.mode {
+                EntryMode::Tree => {
+                    // `entry` breaks a corrupt tree that names itself
+                    // (or a cycle): the store is ours, but the walker
+                    // still fails closed instead of looping.
+                    if let alloc::collections::btree_map::Entry::Vacant(slot) =
+                        objects.entry(entry.oid)
+                    {
+                        slot.insert(StoreKind::Tree);
+                        pending.push(entry.oid);
+                    }
+                }
+                EntryMode::Blob | EntryMode::Executable | EntryMode::Symlink => {
+                    objects.insert(entry.oid, StoreKind::Blob);
+                }
+                // A gitlink's commit is not in a shallow fetch; sending
+                // it is impossible and a real receive-pack already has it.
+                EntryMode::Gitlink => {}
+            }
+            if objects.len() > MAX_OBJECTS {
+                fatal("push: the local graph exceeds the push object bound");
+            }
+        }
+    }
+
+    PushPlan {
+        local,
+        base,
+        objects,
+    }
+}
+
+/// G6 second half: append a v2 pack of the plan's objects (full,
+/// non-delta — `receive-pack` accepts that; delta encoding is
+/// deferred) to `out`, one object read from disk at a time. Returns the
+/// pack length in bytes. `out` may already hold the receive-pack
+/// command pkt-lines: the writer's trailer covers only the appended
+/// pack.
+pub(crate) fn write_push_pack(drive: &ata::Drive, out: &mut Vec<u8>, plan: &PushPlan) -> usize {
+    let disk = GitDisk {
+        drive,
+        cache: RefCell::new(SectorCache::new()),
+    };
+    let fs = match fat::Fat16::mount(&disk) {
+        Ok(fs) => fs,
+        Err(e) => fatal_fat(e),
+    };
+    // SAFETY: single-use static (see `SCRATCH`); `plan_push` is done.
+    let scratch = unsafe { &mut *addr_of_mut!(SCRATCH) };
+
+    let count = match u32::try_from(plan.count()) {
+        Ok(count) => count,
+        Err(_) => fatal("push: object count does not fit the pack header"),
+    };
+    let limits = EncodeLimits {
+        max_objects: MAX_PUSH_OBJECTS,
+        max_object_size: MAX_PUSH_OBJECT,
+        max_pack_bytes: PUSH_PACK_CAP,
+    };
+    let mut writer = match PackWriter::new(out, count, limits) {
+        Ok(writer) => writer,
+        Err(e) => {
+            serial_println!("FATAL: git: store: push: pack header refused: {e:?}");
+            crate::halt()
+        }
+    };
+    let mut written = 0usize;
+    for (&oid, &kind) in plan.objects.iter() {
+        let object = read_loose(&fs, scratch, &oid);
+        if object.oid != oid || object.kind != kind {
+            fatal("push: a loose object does not match the planned id/type");
+        }
+        match writer.object(store_pack_kind(kind), &object.data) {
+            Ok(id) if id == oid => {}
+            Ok(_) => fatal("push: encoder produced a different object id"),
+            Err(e) => {
+                serial_println!("FATAL: git: store: push: pack object refused: {e:?}");
+                crate::halt()
+            }
+        }
+        written += 1;
+    }
+    if written != plan.count() {
+        fatal("push: not every planned object reached the pack");
+    }
+    match writer.finish() {
+        Ok(len) => len,
+        Err(e) => {
+            serial_println!("FATAL: git: store: push: pack trailer refused: {e:?}");
+            crate::halt()
+        }
+    }
 }
 
 /// Build `/.git/<rel>` in `buf` (rel is the `git-store` relative path,

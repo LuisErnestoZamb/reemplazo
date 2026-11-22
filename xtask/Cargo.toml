@@ -27,3 +27,12 @@ ed25519-dalek = { version = "3.0", default-features = false }
 # check of installer I1.
 fat = { path = "../fat" }
 gptwire = { path = "../gptwire" }
+# G6 push proof: the host validates the pack the guest uploaded with the
+# same in-tree codecs the kernel used — `git-pktline` for the command
+# list, `git-pack` for the pack (decode, independent of the encoder's
+# bytes), `git-store` for the on-disk `.git` ids the pack must match.
+# Path crates only (no new external dependency); real host `git` is the
+# independent check on top (see `verify_pushed_pack`).
+git-pktline = { path = "../git-pktline" }
+git-pack = { path = "../git-pack" }
+git-store = { path = "../git-store" }

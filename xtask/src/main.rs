@@ -8,8 +8,9 @@
 //!           then type a command through QEMU's monitor (KEYBOARD_OK)
 //!   smoke-install  boot with a FAT16 source disk + a blank target disk;
 //!           assert BLK_OK + FAT_OK + FS_WRITE_OK + FS_TREE_OK + INST_OK
-//!           + GIT_CHECKOUT_OK + GIT_STORE_OK + NETINST_OK, then re-verify target.img
-//!           on the host
+//!           + GIT_CHECKOUT_OK + GIT_STORE_OK + GIT_PUSH_OK + NETINST_OK,
+//!           verify the pushed pack on the host (git-pack + real git),
+//!           then re-verify target.img on the host
 //!   smoke-ssh  boot TWO VMs in one container: the first runs the sshd
 //!           from its disk, the second authenticates and execs through
 //!           QEMU's hostfwd (SSHD_OK + SSHD_EXEC_OK)
@@ -537,7 +538,7 @@ fn host_qemu() -> bool {
 // (`sotranslate_out4` in libslirp: guest→gateway connects connect to
 // 127.0.0.1 of the machine QEMU runs on). QEMU runs inside the
 // `reemplazo-tools` container during the smoke, so the mock must be a
-// process in that container — see [`MOCK_LOOP`]. The host-QEMU
+// process in that container — see [`mock_loop`]. The host-QEMU
 // backend (no host QEMU exists today) gets the same mock as a child
 // process ([`spawn_chat_mock`]) so both paths stay consistent.
 // ---------------------------------------------------------------------------
@@ -573,6 +574,84 @@ fn chat_mock_response() -> Vec<u8> {
 /// inside the ISO itself, just beside it.
 fn write_chat_mock(iso_dir: &Path) -> std::io::Result<()> {
     std::fs::write(iso_dir.join("chat-mock-response.txt"), chat_mock_response())
+}
+
+// ---------------------------------------------------------------------------
+// G6 push mock (docs/git-ssh-deps.md §A.4 row G6; milestone G5 in the
+// plan): a **static** receive-pack responder. The advertisement is a
+// canned smart-HTTP reply, the POST answer is the v0 `report-status`
+// every git client expects, and the received request bytes are appended
+// to `/iso/push-capture.bin` for the host-side pack check that runs
+// after QEMU exits. Two ports, because one `nc` loop cannot choose its
+// canned response by request method (documented deviation: a real
+// server serves both on one origin).
+// ---------------------------------------------------------------------------
+
+/// The advertised `old` id. A real server advertises its own HEAD, which
+/// a static in-container `nc` cannot know; the client echoes this
+/// **obviously synthetic** placeholder as the command's `old` (the
+/// protocol requires echoing the advertisement) and sends the local
+/// commit's graph — exactly what a server already holding the fetched
+/// head would need. The mock is not a repository; the pack is validated
+/// for real on the host (`verify_pushed_pack`).
+const PUSH_OLD_OID: &str = "c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00";
+
+/// One pkt-line data packet (fixed small payloads: 4 hex + payload).
+fn pkt_line(payload: &[u8]) -> Vec<u8> {
+    let mut buf = vec![0u8; payload.len() + 4];
+    match git_pktline::encode_data(payload, &mut buf) {
+        Some(len) => {
+            buf.truncate(len);
+            buf
+        }
+        None => Vec::new(),
+    }
+}
+
+/// Canned `HTTP/1.1 200` with a computed `Content-Length` (never
+/// hand-counted — the `chat_mock_response` rule).
+fn canned_http(content_type: &str, body: &[u8]) -> Vec<u8> {
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let mut response = head.into_bytes();
+    response.extend_from_slice(body);
+    response
+}
+
+/// `# service=git-receive-pack` + flush + one ref with `report-status`
+/// + flush (http-protocol advertisement, v0).
+fn push_advertisement() -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&pkt_line(b"# service=git-receive-pack\n"));
+    body.extend_from_slice(b"0000");
+    let mut line = Vec::new();
+    line.extend_from_slice(PUSH_OLD_OID.as_bytes());
+    line.extend_from_slice(b" refs/heads/main\0report-status\n");
+    body.extend_from_slice(&pkt_line(&line));
+    body.extend_from_slice(b"0000");
+    canned_http("application/x-git-receive-pack-advertisement", &body)
+}
+
+/// `unpack ok` / `ok refs/heads/main` / flush — the report the kernel
+/// asserts before it prints `GIT_PUSH_OK`.
+fn push_ack() -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&pkt_line(b"unpack ok\n"));
+    body.extend_from_slice(&pkt_line(b"ok refs/heads/main\n"));
+    body.extend_from_slice(b"0000");
+    canned_http("application/x-git-receive-pack-result", &body)
+}
+
+/// Write the two canned push responses beside the ISO. The capture file
+/// is *not* touched here (the `nc` loop appends to it), so a later
+/// invocation (the installed-disk boot phase) cannot wipe the evidence
+/// of the first one before it is validated.
+fn write_push_mock(iso_dir: &Path) -> std::io::Result<()> {
+    std::fs::write(iso_dir.join("push-advertisement.txt"), push_advertisement())?;
+    std::fs::write(iso_dir.join("push-ack.txt"), push_ack())
 }
 
 /// Build the I2 payload the guest fetches with its own stack:
@@ -622,40 +701,63 @@ fn write_payload_mock(root: &Path, iso_dir: &Path) -> std::io::Result<()> {
     std::fs::write(iso_dir.join("payload-http.txt"), response)
 }
 
+/// The G6 push mock: advertisement on `:8090`, the receive-pack ACK on
+/// `:8091`, each a **bounded** loop of one-shot `nc` servers on the
+/// container's loopback (two ports — see the section note above). The
+/// ACK server **appends** every POST request to
+/// `/iso/push-capture.bin`, which the host decodes after QEMU exits.
+/// Both loops run for six connections: `smoke-install` needs one pair,
+/// `smoke-ssh` boots two VMs that each push.
+fn push_mock_loop() -> String {
+    "for i in 1 2 3 4 5 6; do \
+     nc -l -s 127.0.0.1 -p 8090 < /iso/push-advertisement.txt > /dev/null 2>&1 || true; \
+     done & \
+     for i in 1 2 3 4 5 6; do \
+     nc -l -s 127.0.0.1 -p 8091 < /iso/push-ack.txt >> /iso/push-capture.bin 2>/dev/null || true; \
+     done & "
+        .to_string()
+}
+
 /// The in-container mock: a **bounded** loop of `nc` one-shot servers
 /// on the container's loopback — `:8099` serves the canned chat
 /// response, `:8080` serves the canned *payload* response (I2: the
-/// guest's `GET /payload.tar` over its own stack) — backgrounded,
-/// then QEMU is `exec`'d, so QEMU becomes the container's main
-/// process and, when the container stops (`--rm` / `docker rm -f`),
-/// every process in it dies with it: no host-side orphans, which this
-/// repo checks with `ps` after every run. `nc` serves the canned
-/// response the moment a connection is accepted (HTTP lets the server
-/// write first; the guest sends-then-reads), exits per connection
-/// when the peer closes, and `|| true` keeps the loop running through
-/// a refused bind. stdout/stderr → `/dev/null` so the request bytes
-/// the guest sends can never pollute the serial log the markers are
-/// read from. Verified end-to-end (`nc -l -s 127.0.0.1 -p 8099` +
-/// delayed and sequential clients) in the A3 commit; `:8080` is the
-/// same shape with `payload-http.txt` (I2).
-const MOCK_LOOP: &str = "for i in 1 2 3 4 5; do \
-     nc -l -s 127.0.0.1 -p 8099 < /iso/chat-mock-response.txt > /dev/null 2>&1 || true; \
-     done & \
-     for i in 1 2 3 4 5; do \
-     nc -l -s 127.0.0.1 -p 8080 < /iso/payload-http.txt > /dev/null 2>&1 || true; \
-     done & exec qemu-system-x86_64 \"$@\"";
+/// guest's `GET /payload.tar` over its own stack) and [`push_mock_loop`]
+/// adds the G6 receive-pack pair — backgrounded, then QEMU is
+/// `exec`'d, so QEMU becomes the container's main process and, when the
+/// container stops (`--rm` / `docker rm -f`), every process in it dies
+/// with it: no host-side orphans, which this repo checks with `ps`
+/// after every run. `nc` serves the canned response the moment a
+/// connection is accepted (HTTP lets the server write first; the guest
+/// sends-then-reads), exits per connection when the peer closes, and
+/// `|| true` keeps the loop running through a refused bind.
+/// stdout/stderr of the chat/payload servers → `/dev/null` so request
+/// bytes can never pollute the serial log the markers are read from.
+fn mock_loop() -> String {
+    format!(
+        "{}for i in 1 2 3 4 5; do \
+         nc -l -s 127.0.0.1 -p 8099 < /iso/chat-mock-response.txt > /dev/null 2>&1 || true; \
+         done & \
+         for i in 1 2 3 4 5; do \
+         nc -l -s 127.0.0.1 -p 8080 < /iso/payload-http.txt > /dev/null 2>&1 || true; \
+         done & exec qemu-system-x86_64 \"$@\"",
+        push_mock_loop()
+    )
+}
 
 /// The `xtask chat-mock` subcommand (host-QEMU backend): serve
-/// [`chat_mock_response`] on 127.0.0.1:8099 **and** the I2 payload
-/// response on 127.0.0.1:8080 (the container backend's `MOCK_LOOP`
-/// does the same two ports with `nc`), for a bounded number of
-/// connections and a bounded lifetime, so a wedged guest can never
-/// leave this process running on its own. Spawned as a child by
-/// [`qemu_invocation`] and killed in `stop_vm`; also reachable
-/// manually for debugging the kernel's `ai` builtin against a host
-/// VM.
+/// [`chat_mock_response`] on 127.0.0.1:8099, the I2 payload response on
+/// 127.0.0.1:8080 and the G6 push responses on 8090/8091 (the container
+/// backend's [`mock_loop`] does the same four ports with `nc`), for a
+/// bounded number of connections and a bounded lifetime, so a wedged
+/// guest can never leave this process running on its own. The 8091
+/// server reads the POST body and appends it to
+/// `target/iso-root/push-capture.bin` — the host backend's equivalent of
+/// `nc >> /iso/push-capture.bin`. Spawned as a child by
+/// [`qemu_invocation`] and killed in `stop_vm`; also reachable manually
+/// for debugging against a host VM.
 fn serve_chat_mock(root: &Path) {
-    let file = root.join("target/iso-root/chat-mock-response.txt");
+    let iso_dir = root.join("target/iso-root");
+    let file = iso_dir.join("chat-mock-response.txt");
     let chat = match std::fs::read(&file) {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -663,37 +765,47 @@ fn serve_chat_mock(root: &Path) {
             exit(1);
         }
     };
-    let payload = match std::fs::read(root.join("target/iso-root/payload-http.txt")) {
+    let payload = match std::fs::read(iso_dir.join("payload-http.txt")) {
         Ok(bytes) => bytes,
         Err(e) => {
             eprintln!("xtask chat-mock: cannot read payload-http.txt: {e}");
             exit(1);
         }
     };
-    let chat_listener = match std::net::TcpListener::bind(("127.0.0.1", 8099)) {
-        Ok(listener) => listener,
+    let push_adv = match std::fs::read(iso_dir.join("push-advertisement.txt")) {
+        Ok(bytes) => bytes,
         Err(e) => {
-            eprintln!("xtask chat-mock: cannot bind 127.0.0.1:8099: {e}");
+            eprintln!("xtask chat-mock: cannot read push-advertisement.txt: {e}");
             exit(1);
         }
     };
-    let payload_listener = match std::net::TcpListener::bind(("127.0.0.1", 8080)) {
-        Ok(listener) => listener,
+    let push_ack = match std::fs::read(iso_dir.join("push-ack.txt")) {
+        Ok(bytes) => bytes,
         Err(e) => {
-            eprintln!("xtask chat-mock: cannot bind 127.0.0.1:8080: {e}");
+            eprintln!("xtask chat-mock: cannot read push-ack.txt: {e}");
             exit(1);
         }
     };
-    if chat_listener.set_nonblocking(true).is_err()
-        || payload_listener.set_nonblocking(true).is_err()
-    {
-        exit(1);
+    let mut listeners = Vec::new();
+    for port in [8099u16, 8080, 8090, 8091] {
+        match std::net::TcpListener::bind(("127.0.0.1", port)) {
+            Ok(listener) => {
+                if listener.set_nonblocking(true).is_err() {
+                    exit(1);
+                }
+                listeners.push((port, listener));
+            }
+            Err(e) => {
+                eprintln!("xtask chat-mock: cannot bind 127.0.0.1:{port}: {e}");
+                exit(1);
+            }
+        }
     }
     let deadline = Instant::now() + Duration::from_secs(120);
     let mut served = 0usize;
-    while served < 10 && Instant::now() < deadline {
+    while served < 16 && Instant::now() < deadline {
         let mut connected = false;
-        for (listener, response) in [(&chat_listener, &chat), (&payload_listener, &payload)] {
+        for (port, listener) in &listeners {
             let (mut stream, _) = match listener.accept() {
                 Ok(pair) => pair,
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
@@ -704,29 +816,126 @@ fn serve_chat_mock(root: &Path) {
             };
             connected = true;
             let _ = stream.set_nonblocking(true); // no client can wedge us
-            let _ = stream.write_all(response);
-            // Drain the request before closing: closing with
-            // unread inbound data sends RST, which can discard the
-            // response on the client side. Bounded either way.
-            let mut buf = [0u8; 512];
-            let drain_deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                match stream.read(&mut buf) {
-                    Ok(0) => break, // peer finished — clean close
-                    Ok(_) => {}
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        if Instant::now() >= drain_deadline {
-                            break;
-                        }
-                        std::thread::sleep(Duration::from_millis(20));
+            match *port {
+                8099 => {
+                    let _ = stream.write_all(&chat);
+                    drain_briefly(&mut stream);
+                }
+                8080 => {
+                    let _ = stream.write_all(&payload);
+                    drain_briefly(&mut stream);
+                }
+                8090 => {
+                    let _ = stream.write_all(&push_adv);
+                    drain_briefly(&mut stream);
+                }
+                _ => {
+                    // Read the whole POST before answering, so the
+                    // capture has the pack (the `nc` redirect's job in
+                    // the container backend).
+                    if let Some(request) = read_http_request(&mut stream) {
+                        append_capture(&iso_dir.join("push-capture.bin"), &request);
                     }
-                    Err(_) => break,
+                    let _ = stream.write_all(&push_ack);
+                    drain_briefly(&mut stream);
                 }
             }
             served += 1;
         }
         if !connected {
             std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+/// Read one HTTP request (head + `Content-Length` body) from a
+/// nonblocking stream, bounded in bytes and time.
+fn read_http_request(stream: &mut TcpStream) -> Option<Vec<u8>> {
+    const CAP: usize = 4 * 1024 * 1024;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let mut want: Option<usize> = None;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.len() > CAP {
+                    return None;
+                }
+                if want.is_none()
+                    && let Some(sep) = buf.windows(4).position(|w| w == b"\r\n\r\n")
+                    && let Some(len) = header_content_length(&buf[..sep])
+                {
+                    want = Some(sep.checked_add(4)?.checked_add(len)?);
+                }
+                if let Some(total) = want
+                    && buf.len() >= total
+                {
+                    buf.truncate(total);
+                    return Some(buf);
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => break,
+        }
+    }
+    None
+}
+
+/// `Content-Length` from a complete HTTP head (the xtask mock's own
+/// request reader; the kernel does not use this). Lines without a colon
+/// (the request line) and the terminating empty line are skipped.
+fn header_content_length(head: &[u8]) -> Option<usize> {
+    for line in head.split(|&b| b == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            break;
+        }
+        let Some(colon) = line.iter().position(|&b| b == b':') else {
+            continue;
+        };
+        if line[..colon].eq_ignore_ascii_case(b"content-length") {
+            return std::str::from_utf8(&line[colon + 1..])
+                .ok()?
+                .trim()
+                .parse()
+                .ok();
+        }
+    }
+    None
+}
+
+/// Append a captured request to `path` (the `nc >> file` equivalent).
+fn append_capture(path: &Path, bytes: &[u8]) {
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = file.write_all(bytes);
+    }
+}
+
+/// Best-effort drain of a request, bounded in time (closing with unread
+/// inbound data sends RST, which can discard the response).
+fn drain_briefly(stream: &mut TcpStream) {
+    let mut buf = [0u8; 512];
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break, // peer finished — clean close
+            Ok(_) => {}
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => break,
         }
     }
 }
@@ -772,7 +981,7 @@ type Invocation = (String, Vec<String>, Option<String>, Option<Child>);
 /// `/iso/<name>`. Host QEMU first; otherwise build the toolchain image
 /// and run in Docker. `container` is the fixed name used for
 /// force-cleanup of stale VMs. `mock_child` is the A3 chat mock on the
-/// host backend only (the container backend runs [`MOCK_LOOP`] inside
+/// host backend only (the container backend runs [`mock_loop`] inside
 /// itself) — every caller must kill it, which `stop_vm` does.
 /// Both backends get an HMP monitor on this checkout's [`monitor_port`]:
 /// host QEMU binds `127.0.0.1` itself, the container publishes its
@@ -794,6 +1003,14 @@ fn qemu_invocation(
         );
         return None;
     }
+    if let Err(e) = write_push_mock(iso_dir) {
+        eprintln!("xtask: cannot write the push mock: {e}");
+        return None;
+    }
+    // A new VM means a new capture; the previous boot's file must not
+    // be read back as this one's. (The installed-disk phase is a boot
+    // too, but it validates first.)
+    let _ = std::fs::remove_file(iso_dir.join("push-capture.bin"));
     if let Err(e) = write_payload_mock(root, iso_dir) {
         eprintln!("xtask: cannot build the payload mock: {e}",);
         return None;
@@ -833,7 +1050,7 @@ fn qemu_invocation(
         // "$@" ($0 carries the binary name).
         "sh".into(),
         "-c".into(),
-        MOCK_LOOP.into(),
+        mock_loop(),
         "qemu-system-x86_64".into(),
     ];
     let monitor = format!("tcp:0.0.0.0:{port},server,nowait");
@@ -853,7 +1070,7 @@ fn qemu_invocation(
 /// installed `target.img` as the only IDE disk, `-boot order=c`. The A3
 /// chat mock is still started (the installed kernel runs its normal,
 /// fail-closed boot chain, and `apps::ai` halts without the mock) — the
-/// in-container `MOCK_LOOP` comes along with the same bind mount; the
+/// in-container `mock_loop` comes along with the same bind mount; the
 /// host backend's `chat-mock` child serves both ports. Everything else
 /// (serial on stdout, one monitor, e1000, USB) matches [`qemu_invocation`].
 fn qemu_invocation_disk(
@@ -867,6 +1084,13 @@ fn qemu_invocation_disk(
             "xtask: cannot write {}: {e}",
             iso_dir.join("chat-mock-response.txt").display()
         );
+        return None;
+    }
+    // Responses only: the capture of the *install* boot is validated
+    // before this phase ever runs, and this boot has no source disk, so
+    // deleting it here would only destroy evidence.
+    if let Err(e) = write_push_mock(iso_dir) {
+        eprintln!("xtask: cannot write the push mock: {e}");
         return None;
     }
     if let Err(e) = write_payload_mock(root, iso_dir) {
@@ -901,7 +1125,7 @@ fn qemu_invocation_disk(
         TOOLS_IMAGE.into(),
         "sh".into(),
         "-c".into(),
-        MOCK_LOOP.into(),
+        mock_loop(),
         "qemu-system-x86_64".into(),
     ];
     let monitor = format!("tcp:0.0.0.0:{port},server,nowait");
@@ -1112,17 +1336,25 @@ fn smoke(root: &Path) -> bool {
 /// GPT written and re-read through `gptwire`, p2 formatted FAT16 with
 /// the shared `fat::format_fat16`, payload copied from the source
 /// volume, p2 re-mounted and read back byte-exact — see
-/// `kernel/src/install.rs`), and `NETINST_OK` (I2: after the boot
+/// `kernel/src/install.rs`), `GIT_STORE_OK` (G5's `.git` + local commit
+/// proved from a fresh mount) and `GIT_PUSH_OK` (G6: the local commit's
+/// graph encoded as a full-object pack, POSTed to the in-container
+/// receive-pack mock, whose `unpack ok` / `ok refs/heads/main` report
+/// the guest asserts), and `NETINST_OK` (I2: after the boot
 /// network chain, the kernel fetches `payload.tar` (the built kernel
 /// and README, served by the in-container responder on `10.0.2.2:8080`
 /// from `payload-http.txt`, written by [`write_payload_mock`]) over
 /// its own stack, walks the ustar headers, reinstalls onto the target
 /// and reads every file back byte-exact).
 ///
-/// After the VM passes, [`verify_installed_image`] re-checks
-/// `target.img` **on the host** — docs/installer.md §7.3's "assert
-/// after QEMU exits": GPT parsed independently of the running kernel,
-/// layout checked, and the installed `/KERNEL.ELF` compared
+/// After the VM passes, [`verify_pushed_pack`] proves the **upload**
+/// on the host: the request bytes the mock captured are decoded with
+/// `git-pack`, compared object-for-object against the `.git` on
+/// `disk.img`, and finally handed to real `git index-pack
+/// --strict`/`cat-file`/`ls-tree`. Then [`verify_installed_image`]
+/// re-checks `target.img` **on the host** — docs/installer.md §7.3's
+/// "assert after QEMU exits": GPT parsed independently of the running
+/// kernel, layout checked, and the installed `/KERNEL.ELF` compared
 /// byte-for-byte against the **built kernel binary** (ground truth on
 /// the host — a corrupted download fails here even though the guest
 /// verified its own copy).
@@ -1156,12 +1388,21 @@ fn smoke_install(root: &Path) -> bool {
             "INST_OK",
             "GIT_CHECKOUT_OK",
             "GIT_STORE_OK",
+            "GIT_PUSH_OK",
             "NETINST_OK",
         ],
         INSTALL_TIMEOUT,
         &disks,
         false,
     ) {
+        return false;
+    }
+    // G6: the push's host-side proof — the pack the mock actually
+    // received (captured by the in-container `nc`) is decoded and
+    // compared against the `.git` on the source volume, then handed to
+    // real host `git`. The guest already asserted the server's
+    // `unpack ok` / `ok refs/heads/main` report (`GIT_PUSH_OK`).
+    if !verify_pushed_pack(root, &disk) {
         return false;
     }
     if !verify_installed_image(&target) {
@@ -1313,6 +1554,11 @@ fn run_two_vm_ssh(root: &Path, iso_dir: &Path, server_disk: &Path, client_disk: 
         eprintln!("xtask: smoke-ssh: cannot write the chat mock: {e}");
         return false;
     }
+    if let Err(e) = write_push_mock(iso_dir) {
+        eprintln!("xtask: smoke-ssh: cannot write the push mock: {e}");
+        return false;
+    }
+    let _ = std::fs::remove_file(iso_dir.join("push-capture.bin"));
     let container = vm_container(root, "smoke-ssh");
     rm_container(&container); // stale VM from a killed session
     if !sh(root, "docker", &["build", "-t", TOOLS_IMAGE, "tools"]) {
@@ -1355,7 +1601,8 @@ fn run_two_vm_ssh(root: &Path, iso_dir: &Path, server_disk: &Path, client_disk: 
     let server_cmd = format!("qemu-system-x86_64 {}", join_shell_args(&server_args));
     let script = format!(
         "{} {} >/dev/null 2>&1 & exec qemu-system-x86_64 \"$@\"",
-        MOCK_LOOP_PREFIX, server_cmd
+        mock_loop_prefix(),
+        server_cmd
     );
 
     let mut docker_args: Vec<String> = vec![
@@ -1446,10 +1693,16 @@ fn run_two_vm_ssh(root: &Path, iso_dir: &Path, server_disk: &Path, client_disk: 
 
 /// The A3/A5 chat mock without the `exec` tail: the two-VM script needs
 /// it in the background beside the server VM (same five connections,
-/// same `/iso` response file — VM2 is the only VM that posts).
-const MOCK_LOOP_PREFIX: &str = "for i in 1 2 3 4 5; do \
-     nc -l -s 127.0.0.1 -p 8099 < /iso/chat-mock-response.txt > /dev/null 2>&1 || true; \
-     done &";
+/// same `/iso` response file — VM2 is the only VM that posts). The G6
+/// push mock rides along: two VMs, each with a disk, each pushes.
+fn mock_loop_prefix() -> String {
+    format!(
+        "{}for i in 1 2 3 4 5; do \
+         nc -l -s 127.0.0.1 -p 8099 < /iso/chat-mock-response.txt > /dev/null 2>&1 || true; \
+         done &",
+        push_mock_loop()
+    )
+}
 
 /// Join already-space-free QEMU arguments into one `sh -c` word list.
 /// Every argument this harness builds is a path/flag with no spaces
@@ -1887,6 +2140,470 @@ impl fat::BlockDevice for PartSlice<'_> {
         let abs = self.1.checked_add(offset).ok_or(fat::Error::OutOfRange)?;
         self.0.read_at(abs, buf)
     }
+}
+
+/// G6 host-side proof of the **pushed pack** (docs/git-ssh-deps.md §A.4
+/// row G6). The in-container mock captured the bytes the guest actually
+/// uploaded (`push-capture.bin`); this function:
+///
+/// 1. frames the captured HTTP request (`POST /git-receive-pack`,
+///    `Content-Length` exact) and parses the v0 command section with
+///    `git-pktline` — one `<old> <new> refs/heads/main\0report-status`
+///    command (the advertised placeholder as `old`, checked), a flush,
+///    then the pack;
+/// 2. decodes the pack with `git-pack` (independent of the encoder: the
+///    trailer SHA-1 and every object id are re-derived) and requires it
+///    to hold **exactly** the local commit's reachable graph — commit,
+///    trees, blobs — with the commit's `parent` equal to `.git/shallow`'s
+///    fetched head, cross-checked against the `.git` the guest wrote on
+///    the source volume (read here through the host `fat` crate);
+/// 3. hands the same bytes to **real host git**: `git index-pack
+///    --strict`, `cat-file -t/-p` on the pushed commit and `ls-tree -r`
+///    (whose line count must equal the pack's blob count). That is the
+///    independent implementation check the G4 agent used with `git fsck`
+///    — a `fsck` here would report the fetched head as a missing parent,
+///    which is exactly what a push omits (the server has it).
+fn verify_pushed_pack(root: &Path, disk: &Path) -> bool {
+    fn fail(msg: impl std::fmt::Display) -> bool {
+        eprintln!("smoke-install: push verify failed: {msg}");
+        false
+    }
+
+    let capture_path = root.join("target/iso-root/push-capture.bin");
+    let capture = match std::fs::read(&capture_path) {
+        Ok(bytes) => bytes,
+        Err(e) => return fail(format_args!("cannot read {}: {e}", capture_path.display())),
+    };
+    let Some(sep) = capture.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return fail("the captured upload has no HTTP head terminator");
+    };
+    let head = &capture[..sep];
+    let body = &capture[sep + 4..];
+    if !head.starts_with(b"POST /git-receive-pack HTTP/1.1") {
+        return fail("the captured request is not POST /git-receive-pack");
+    }
+    match header_content_length(head) {
+        Some(len) if len == body.len() => {}
+        Some(len) => {
+            return fail(format_args!(
+                "Content-Length {len} but {} body byte(s) were captured",
+                body.len()
+            ));
+        }
+        None => return fail("the captured request has no Content-Length"),
+    }
+
+    // --- command section (pkt-lines) --------------------------------
+    let mut pos = 0usize;
+    let command = match git_pktline::decode(body.get(pos..).unwrap_or_default()) {
+        git_pktline::Step::Done {
+            consumed,
+            pkt: git_pktline::Pkt::Data(line),
+        } => {
+            pos += consumed;
+            line
+        }
+        other => return fail(format_args!("command pkt-line not found: {other:?}")),
+    };
+    match git_pktline::decode(body.get(pos..).unwrap_or_default()) {
+        git_pktline::Step::Done {
+            consumed,
+            pkt: git_pktline::Pkt::Flush,
+        } => pos += consumed,
+        other => {
+            return fail(format_args!(
+                "command section does not end in a flush: {other:?}"
+            ));
+        }
+    }
+    let Some(sp1) = command.iter().position(|&b| b == b' ') else {
+        return fail("command line has no first separator");
+    };
+    let Some(old_hex) = command.get(..sp1) else {
+        return fail("command line object id truncated");
+    };
+    let Some(rest) = command.get(sp1 + 1..) else {
+        return fail("command line object id truncated");
+    };
+    let Some(sp2) = rest.iter().position(|&b| b == b' ') else {
+        return fail("command line has no second separator");
+    };
+    let Some(new_hex) = rest.get(..sp2) else {
+        return fail("command line new id truncated");
+    };
+    let Some(tail) = rest.get(sp2 + 1..) else {
+        return fail("command line ref truncated");
+    };
+    let Some(nul) = tail.iter().position(|&b| b == 0) else {
+        return fail("command line has no capability NUL");
+    };
+    let (Some(name), Some(caps)) = (tail.get(..nul), tail.get(nul + 1..)) else {
+        return fail("command line ref/caps truncated");
+    };
+    if old_hex != PUSH_OLD_OID.as_bytes() {
+        return fail("command `old` is not the advertised placeholder");
+    }
+    if name != b"refs/heads/main" {
+        return fail("command does not push refs/heads/main");
+    }
+    if caps.strip_suffix(b"\n").unwrap_or(caps) != b"report-status" {
+        return fail("command does not ask for report-status");
+    }
+    let new_oid = match git_store::parse_oid(new_hex) {
+        Ok(oid) => oid,
+        Err(_) => return fail("command `new` is not a 40-hex object id"),
+    };
+
+    // --- the pack ---------------------------------------------------
+    let pack = body.get(pos..).unwrap_or_default();
+    if !pack.starts_with(git_pack::PACK_MAGIC.as_slice()) {
+        return fail("the body after the flush is not a packfile");
+    }
+    let (objects, index) = match git_pack::decode_with_index(pack) {
+        Ok(decoded) => decoded,
+        Err(e) => return fail(format_args!("git-pack refused the pushed pack: {e:?}")),
+    };
+    if objects.len() != index.len() {
+        return fail("the pack index does not cover every object");
+    }
+    let mut by_oid: std::collections::BTreeMap<[u8; 20], &git_pack::Object> =
+        std::collections::BTreeMap::new();
+    for object in &objects {
+        if by_oid.insert(object.oid(), object).is_some() {
+            return fail("the pushed pack holds a duplicate object id");
+        }
+    }
+
+    // --- the store the guest wrote, read independently --------------
+    let image = match std::fs::read(disk) {
+        Ok(bytes) => MemImage::from_vec(bytes),
+        Err(e) => return fail(format_args!("cannot read {}: {e}", disk.display())),
+    };
+    let fs = match fat::Fat16::mount(&image) {
+        Ok(fs) => fs,
+        Err(e) => return fail(format_args!("source volume does not mount: {e:?}")),
+    };
+    let mut buf = vec![0u8; 64 * 1024];
+    let n = match fs.read_file("/.git/refs/heads/main", &mut buf) {
+        Ok(n) => n,
+        Err(e) => return fail(format_args!("/.git/refs/heads/main: {e:?}")),
+    };
+    let ref_oid = match git_store::parse_ref(&buf[..n]) {
+        Ok(oid) => oid,
+        Err(_) => return fail("/.git/refs/heads/main is not a 40-hex ref"),
+    };
+    if ref_oid != new_oid {
+        return fail(format_args!(
+            "command `new` {} is not the local ref {}",
+            hex40(&new_oid),
+            hex40(&ref_oid)
+        ));
+    }
+    let n = match fs.read_file("/.git/shallow", &mut buf) {
+        Ok(n) => n,
+        Err(e) => return fail(format_args!("/.git/shallow: {e:?}")),
+    };
+    let base_oid = match git_store::parse_ref(&buf[..n]) {
+        Ok(oid) => oid,
+        Err(_) => return fail("/.git/shallow is not a 40-hex ref"),
+    };
+    // The advertised head itself, as the guest stored it (a zlib loose
+    // object). It is *not* in the pack — a push omits what the server
+    // already has — but seeding it lets real `git index-pack --strict`
+    // run its connectivity check against server-like state instead of
+    // failing on exactly that correct omission.
+    let mut loose_path = Vec::from(&b"/.git/"[..]);
+    loose_path.extend_from_slice(&git_store::loose_path(&base_oid));
+    let loose_path = match std::str::from_utf8(&loose_path) {
+        Ok(path) => path.to_string(),
+        Err(_) => return fail("loose object path is not ASCII"),
+    };
+    let n = match fs.read_file(&loose_path, &mut buf) {
+        Ok(n) => n,
+        Err(e) => return fail(format_args!("{loose_path}: {e:?}")),
+    };
+    let base_object = buf[..n].to_vec();
+
+    // --- exact reachable set ---------------------------------------
+    let Some(commit) = by_oid.get(&new_oid) else {
+        return fail("the pushed pack does not contain the local commit");
+    };
+    if commit.kind != git_pack::Kind::Commit {
+        return fail("the local ref object is not a commit");
+    }
+    if !commit_parent_is(&commit.data, &base_oid) {
+        return fail("the pushed commit's parent is not the shallow boundary");
+    }
+    let root_tree = match git_pack::parse_commit_tree(&commit.data) {
+        Ok(tree) => tree,
+        Err(e) => return fail(format_args!("pushed commit refused: {e:?}")),
+    };
+    let mut reachable: std::collections::BTreeMap<[u8; 20], git_pack::Kind> =
+        std::collections::BTreeMap::new();
+    reachable.insert(new_oid, git_pack::Kind::Commit);
+    reachable.insert(root_tree, git_pack::Kind::Tree);
+    let mut pending = vec![root_tree];
+    let mut trees = 0usize;
+    // Paths, not unique blobs: `git ls-tree -r` lists one line per tree
+    // entry, and the same blob may appear at two paths.
+    let mut paths = 0usize;
+    while let Some(tree_oid) = pending.pop() {
+        let Some(tree) = by_oid.get(&tree_oid) else {
+            return fail(format_args!(
+                "tree {} is missing from the pack",
+                hex40(&tree_oid)
+            ));
+        };
+        if tree.kind != git_pack::Kind::Tree {
+            return fail(format_args!("{} is not a tree", hex40(&tree_oid)));
+        }
+        trees += 1;
+        let mut offset = 0usize;
+        while offset < tree.data.len() {
+            let (entry, consumed) = match git_pack::parse_tree_entry(&tree.data[offset..]) {
+                Ok(parsed) => parsed,
+                Err(e) => return fail(format_args!("pushed tree refused: {e:?}")),
+            };
+            offset = match offset.checked_add(consumed) {
+                Some(next) => next,
+                None => return fail("tree entry offset overflow"),
+            };
+            match entry.mode {
+                git_pack::EntryMode::Tree => {
+                    if let std::collections::btree_map::Entry::Vacant(slot) =
+                        reachable.entry(entry.oid)
+                    {
+                        slot.insert(git_pack::Kind::Tree);
+                        pending.push(entry.oid);
+                    }
+                }
+                git_pack::EntryMode::Blob
+                | git_pack::EntryMode::Executable
+                | git_pack::EntryMode::Symlink => {
+                    reachable.entry(entry.oid).or_insert(git_pack::Kind::Blob);
+                    paths += 1;
+                }
+                // The store skips gitlinks (their commit is not in a
+                // shallow fetch); one appearing in the pushed pack is a
+                // graph this proof cannot vouch for.
+                git_pack::EntryMode::Gitlink => {
+                    return fail("the pushed tree names a gitlink");
+                }
+            }
+        }
+    }
+    if reachable.len() != objects.len() {
+        return fail(format_args!(
+            "pack holds {} object(s) but only {} are reachable from the pushed commit",
+            objects.len(),
+            reachable.len()
+        ));
+    }
+    for (oid, kind) in &reachable {
+        match by_oid.get(oid) {
+            Some(object) if object.kind == *kind => {}
+            Some(_) => return fail("a reachable object has the wrong type in the pack"),
+            None => return fail("a reachable object is missing from the pack"),
+        }
+    }
+    let blobs = reachable
+        .values()
+        .filter(|kind| **kind == git_pack::Kind::Blob)
+        .count();
+    println!(
+        "smoke-install: push pack ok — {} object(s) reachable from {}, \
+         pack {} B (1 commit, {} tree(s), {} blob(s) at {} path(s), parent {} = .git/shallow)",
+        objects.len(),
+        hex40(&new_oid),
+        pack.len(),
+        trees,
+        blobs,
+        paths,
+        hex40(&base_oid),
+    );
+
+    // --- independent implementation: real host git ------------------
+    let commit_hex = hex40(&new_oid);
+    let tree_hex = hex40(&root_tree);
+    let base_hex = hex40(&base_oid);
+    if !host_git_accepts_pack(
+        root,
+        pack,
+        &commit_hex,
+        &tree_hex,
+        paths,
+        &base_oid,
+        &base_object,
+    ) {
+        return false;
+    }
+    println!(
+        "smoke-install: host git accepted the pushed pack (index-pack --strict with the \
+         advertised head {base_hex} seeded as the shallow boundary, cat-file commit \
+         {commit_hex}, ls-tree -r {tree_hex} = {paths} path(s))"
+    );
+    true
+}
+
+/// Lowercase hex of an object id (host-side reporting).
+fn hex40(oid: &[u8; 20]) -> String {
+    String::from_utf8_lossy(&git_store::hex_oid(oid)).into_owned()
+}
+
+/// True when a commit object's second line is exactly `parent <oid>`
+/// (git's commit format: `tree`, then zero or more `parent` lines).
+fn commit_parent_is(data: &[u8], parent: &[u8; 20]) -> bool {
+    let mut lines = data.split(|&b| b == b'\n');
+    let _tree = lines.next();
+    let Some(line) = lines.next() else {
+        return false;
+    };
+    let Some(hex) = line.strip_prefix(b"parent ") else {
+        return false;
+    };
+    match git_store::parse_oid(hex) {
+        Ok(oid) => oid == *parent,
+        Err(_) => false,
+    }
+}
+
+/// Hand the pushed pack to **real host `git`** in a throwaway bare repo:
+/// `index-pack --strict` (pack checksum, object hashes, link and
+/// connectivity checks), `cat-file -t/-p` on the pushed commit (type +
+/// tree line) and `ls-tree -r` (whose line count must equal the pack's
+/// path count).
+///
+/// The pack's parent commit is deliberately absent — it is the server's
+/// own head, which a push never resends. To let `--strict`'s
+/// connectivity check pass **for the right reason**, the advertised head
+/// (`base`, read from the guest's own `.git/objects` as its zlib bytes)
+/// is seeded as a loose object and named in `$GIT_DIR/shallow`: exactly
+/// the state a real server is in (it has the old head, and this clone is
+/// shallow there), so the check proves the pushed pack completes that
+/// graph rather than merely decoding.
+fn host_git_accepts_pack(
+    root: &Path,
+    pack: &[u8],
+    commit_hex: &str,
+    tree_hex: &str,
+    paths: usize,
+    base: &[u8; 20],
+    base_object: &[u8],
+) -> bool {
+    fn fail(msg: impl std::fmt::Display) -> bool {
+        eprintln!("smoke-install: host git check failed: {msg}");
+        false
+    }
+    let dir = root.join("target/push-check");
+    let _ = std::fs::remove_dir_all(&dir);
+    let run = |args: &[&str]| -> Result<std::process::Output, std::io::Error> {
+        Command::new("git")
+            .arg("--git-dir")
+            .arg(&dir)
+            .args(args)
+            .output()
+    };
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return fail(format_args!("cannot create {}: {e}", dir.display()));
+    }
+    match Command::new("git")
+        .args(["init", "--bare", "--quiet"])
+        .arg(&dir)
+        .output()
+    {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => {
+            return fail(format_args!(
+                "git init failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Err(e) => return fail(format_args!("cannot run git: {e}")),
+    }
+    let pack_dir = dir.join("objects/pack");
+    if let Err(e) = std::fs::create_dir_all(&pack_dir) {
+        return fail(format_args!("cannot create {}: {e}", pack_dir.display()));
+    }
+    // Seed the server's advertised head + the shallow boundary (see the
+    // function docs). The bytes are the guest's own zlib loose object,
+    // copied verbatim — git's loose-object layout.
+    let base_hex = hex40(base);
+    let Some((prefix, suffix)) = base_hex.split_at_checked(2) else {
+        return fail("object id is too short");
+    };
+    let loose_dir = dir.join("objects").join(prefix);
+    if let Err(e) = std::fs::create_dir_all(&loose_dir) {
+        return fail(format_args!("cannot create {}: {e}", loose_dir.display()));
+    }
+    if let Err(e) = std::fs::write(loose_dir.join(suffix), base_object) {
+        return fail(format_args!("cannot seed the advertised head: {e}"));
+    }
+    if let Err(e) = std::fs::write(dir.join("shallow"), format!("{base_hex}\n")) {
+        return fail(format_args!("cannot write the shallow boundary: {e}"));
+    }
+    let pack_path = pack_dir.join("pack-reemplazo.pack");
+    if let Err(e) = std::fs::write(&pack_path, pack) {
+        return fail(format_args!("cannot write the pack: {e}"));
+    }
+    let pack_arg = pack_path.display().to_string();
+    match run(&["index-pack", "--strict", &pack_arg]) {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => {
+            return fail(format_args!(
+                "git index-pack --strict refused the pack: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Err(e) => return fail(format_args!("cannot run git index-pack: {e}")),
+    }
+    match run(&["cat-file", "-t", commit_hex]) {
+        Ok(out) if out.status.success() && out.stdout.trim_ascii() == b"commit" => {}
+        Ok(out) => {
+            return fail(format_args!(
+                "git cat-file -t {commit_hex} did not answer `commit` ({} {})",
+                String::from_utf8_lossy(&out.stdout).trim(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Err(e) => return fail(format_args!("cannot run git cat-file: {e}")),
+    }
+    match run(&["cat-file", "-p", commit_hex]) {
+        Ok(out) if out.status.success() => {
+            let text = String::from_utf8_lossy(&out.stdout);
+            if !text.lines().any(|line| line == format!("tree {tree_hex}")) {
+                return fail("git cat-file -p does not name the pushed tree");
+            }
+        }
+        Ok(out) => {
+            return fail(format_args!(
+                "git cat-file -p failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Err(e) => return fail(format_args!("cannot run git cat-file: {e}")),
+    }
+    match run(&["ls-tree", "-r", commit_hex]) {
+        Ok(out) if out.status.success() => {
+            let lines = String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count();
+            if lines != paths {
+                return fail(format_args!(
+                    "git ls-tree -r lists {lines} path(s), the pack's trees hold {paths}"
+                ));
+            }
+        }
+        Ok(out) => {
+            return fail(format_args!(
+                "git ls-tree -r failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Err(e) => return fail(format_args!("cannot run git ls-tree: {e}")),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    true
 }
 
 /// Host-side verification of `target.img` after the VM passed —

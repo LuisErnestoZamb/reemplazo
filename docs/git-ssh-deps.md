@@ -112,7 +112,7 @@ Honest sizing for a full clone (numbers derived from [pack-format](https://git-s
 | G3 | fetch (v0 `want`/`deepen=1`) → pack stream → **index-pack** (offset table + delta resolution + `.idx` write) | **`GIT_FETCH_OK`** (verify pack+idx against a real `git` on the host) | G1, G2, heap (tables) |
 | G4 | checkout of depth-1 tree (tree/blob parse, paths, file write) | **`GIT_CHECKOUT_OK`** | G3, heap, VFS/FS writes |
 | G5 | local object store: loose object write (sha1 + miniz_oxide), refs, commit creation → `git commit` equivalent | **`GIT_STORE_OK`** (smoke-install; the plan's `GIT_COMMIT_OK` name was folded into the store proof) | G4 |
-| G6 | push: serialize full-object pack + idx, `receive-pack` state machine | **`GIT_PUSH_OK`** against a test repo | G5, G1 |
+| G6 | push: serialize full-object pack + idx, `receive-pack` state machine | **`GIT_PUSH_OK`** against a test repo (landed 2026-11-22 against an in-container mock; pack writer is `git-pack::write`, no idx file yet) | G5, G1 |
 | G7 | git over ssh (`git-upload-pack` exec channel) | **`GIT_SSH_OK`** | G2 + S4 (§B.4) |
 
 **Status (G3, landed 2026-11-22; full checkout landed with FS3):**
@@ -170,10 +170,51 @@ the id its path encodes. An independent host check (throwaway: the
 `fat` fixture image mounted through the host crate, `.git` extracted,
 then `git fsck --strict`, `git log`, `git status --porcelain`) passes
 with an empty `status`, so the store is a real git repository.
-**Remaining for a full `git`:** the `.idx` file write, pack-objects +
-`push` (G6, `GIT_PUSH_OK`), git over ssh (G7, reusing S4's channel),
-and a user-facing `log`/`status` on top of this store (the read side is
-the crate's `decode_loose`/`parse_index`, wired to the shell).
+**Remaining for a full `git`:** the `.idx` file write, a real GitHub
+push (credentials + the pinned TLS path) and git over ssh (G7, reusing
+S4's channel), and a user-facing `log`/`status` on top of this store
+(the read side is the crate's `decode_loose`/`parse_index`, wired to the
+shell).
+
+**G6 push (landed 2026-11-22, `GIT_PUSH_OK`; milestone G5 in the agent
+plan):** two halves, both in-tree, no new crate.
+
+- **Encoder** (`git-pack/src/write.rs`): `PackWriter` (header → one
+  `Kind` + content per call → SHA-1 trailer) and `encode`
+  (`&[(oid, kind, data)]` → oid-sorted pack, duplicate/wrong-oid
+  refusal). Deliberately **full (non-delta) objects** — legal for
+  `receive-pack`, exactly §A.3 item 4; delta encoding stays deferred.
+  Caps: 100 000 objects / 16 MiB per object / 256 MiB pack by default,
+  tightened by the kernel to 10 000 / 4 MiB / 2 MiB. 21 new host tests
+  (round-trip of all four kinds + empty object + 256 KiB object + size
+  varint boundaries, header/trailer exactness, deterministic oid order,
+  encode→`decode_with_index` agreement, count/size/pack caps, oid
+  mismatch, duplicate ids, non-empty `out`, prefix-safe writer for the
+  kernel's command+pack buffer, corrupted-output refusal).
+- **Client** (`kernel/src/git_push.rs`, `git_store::{plan_push,
+  write_push_pack}`): reads `/.git/refs/heads/main` and walks
+  commit → trees → blob ids from the volume (fresh mount, `git-store`'s
+  `decode_loose`), fetches the advertisement over plain HTTP to the
+  mock, sends the v0 command list + flush + pack in one buffer (the
+  writer appends after the pkt-lines), asserts `unpack ok` / `ok
+  refs/heads/main` / flush and prints `GIT_PUSH_OK`. Peak heap is the
+  pack plus one object at a time (the fetch's decoded pack is dropped
+  before this runs) plus the POST's documented one copy.
+- **Proof** (`smoke-install`): the in-container responder gained a
+  receive-pack mock — advertisement on `:8090`, ACK on `:8091` (two
+  ports: one `nc` loop cannot choose its response by method, documented
+  deviation), the POST request appended to
+  `target/iso-root/push-capture.bin`. After QEMU exits xtask frames
+  that capture, decodes the pack with `git-pack` and requires exactly
+  the local commit's reachable graph (parent = `.git/shallow`, a
+  measured 196 objects = 1 commit / 60 trees / 135 blobs, 1 094 398 B),
+  then real host `git index-pack --strict` (advertised head seeded as a
+  loose object + shallow boundary, so connectivity reflects a server
+  that already has the old head), `cat-file -t/-p` and `ls-tree -r`.
+  `smoke` stays 30/30 (no disk → no store → no push); `smoke-ssh` is
+  untouched by assertion and both its VMs push successfully against the
+  same mock. **Pending:** a real GitHub push (credentials + the pinned
+  TLS path), delta/side-band encoding, and the `.idx` write.
 
 **Filesystem extension it needed:** the `fat` crate's directories were
 capped at their first cluster (FS3's documented limit); git's

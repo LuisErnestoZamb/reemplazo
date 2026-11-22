@@ -27,6 +27,7 @@ mod entropy;
 mod fs;
 mod git;
 mod git_fetch;
+mod git_push;
 mod git_store;
 mod heap;
 mod idt;
@@ -204,6 +205,18 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
         // walk (GIT_FETCH_OK), then — only with a disk attached — the
         // FAT16 checkout + re-mount read-back (GIT_CHECKOUT_OK).
         git_fetch::fetch(stack, github_ip, head, source_drive.as_ref());
+        // G6 push (docs/git-ssh-deps.md §A.4): only with a disk — the
+        // push sends the local commit G5 wrote into `.git` (its trees
+        // and blobs, read back from the volume), so without a store
+        // there is nothing to push and the diskless `smoke` stays
+        // exactly 30 markers. Runs **after** `fetch` returns, so the
+        // decoded fetch pack is already dropped (peak heap is the push
+        // pack + one object). Prints GIT_PUSH_OK only after the mock's
+        // `unpack ok` / `ok refs/heads/main` report; every violation is
+        // `FATAL: git: push:` + halt.
+        if let Some(drive) = source_drive.as_ref() {
+            crate::git_push::push(stack, drive); // GIT_PUSH_OK
+        }
         ssh::kex_smoke(stack, github_ip); // SSH_KEXINIT_OK + SSH_KEX_OK
         // S5: the client VM's half of the two-VM proof — connect to the
         // peer sshd through slirp → hostfwd, authenticate, exec.

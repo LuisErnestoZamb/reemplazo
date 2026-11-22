@@ -31,7 +31,10 @@
 //! - **Read-only decode**: header → per-object zlib streams → delta
 //!   resolution → [`Object`]s in pack order. The 20-byte SHA-1 trailer
 //!   must match the bytes before it (fail-closed, checked before any
-//!   object is trusted).
+//!   object is trusted). **Writing** is the additive [`write`] module
+//!   (G6 push): pack v2 of **full (non-delta) objects**, which
+//!   `receive-pack` accepts; delta *encoding* is explicitly deferred
+//!   (docs/git-ssh-deps.md §A.3 item 4).
 //! - **Thin packs are refused** ([`Error::ThinPack`]): a `REF_DELTA`
 //!   whose base is not an object of *this* pack is out of scope for v1
 //!   (per docs/git-ssh-deps.md fetch notes — the server is asked for a
@@ -81,8 +84,10 @@ use miniz_oxide::inflate::core::{DecompressorOxide, decompress, inflate_flags};
 use sha1::{Digest, Sha1};
 
 mod tree;
+mod write;
 
 pub use tree::{EntryMode, ObjectError, TreeEntry, parse_commit_tree, parse_tree_entry};
+pub use write::{EncodeError, EncodeLimits, PackWriter, encode, encode_with_limits};
 
 /// The four-byte packfile signature.
 pub const PACK_MAGIC: [u8; 4] = *b"PACK";
@@ -204,6 +209,17 @@ impl Kind {
             Kind::Tree => "tree",
             Kind::Blob => "blob",
             Kind::Tag => "tag",
+        }
+    }
+
+    /// The 3-bit pack type byte (inverse of [`Kind::from_type_byte`];
+    /// used by the G6 pack writer).
+    pub fn type_byte(self) -> u8 {
+        match self {
+            Kind::Commit => 1,
+            Kind::Tree => 2,
+            Kind::Blob => 3,
+            Kind::Tag => 4,
         }
     }
 }
