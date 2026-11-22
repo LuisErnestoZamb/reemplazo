@@ -24,13 +24,10 @@ rustflags = [
     "target-cpu=x86-64",
     "-C",
     "relocation-model=static",
-    # The userland ELF lives at USER_BASE = 0x8000_0000_0000 (512 GiB),
-    # far above the small code model's signed-32-bit absolute relocation
-    # range. The large code model keeps the static relocation model
-    # (link-time only, no dynamic relocs) but uses 64-bit absolute forms.
-    # The kernel (linked at 2 MiB) builds unchanged with it.
-    "-C",
-    "code-model=large",
+    # NOTE: user-hello needs code-model=large because its ELF lives at
+    # 0x8000_0000_0000; that flag is scoped to that crate via its build.rs
+    # (cargo:rustc-link-arg), NOT here — setting it globally changes the
+    # kernel's codegen (observed: 2.4 MiB -> 3.6 MiB, boot broke).
     # curve25519-dalek 5 (via x25519-dalek, S2 of docs/git-ssh-deps.md)
     # picks its field backend from the *architecture alone*
     # (build.rs: x86_64 + 64-bit → "simd"), and that "simd" backend is

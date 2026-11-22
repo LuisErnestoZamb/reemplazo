@@ -15,5 +15,7 @@
 // allow once both call sites exist.
 #![allow(dead_code)]
 
+pub mod process;
+pub mod sched;
 pub mod syscall;
 pub mod userptr;

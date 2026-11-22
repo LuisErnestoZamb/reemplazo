@@ -330,19 +330,37 @@ fn build_kernel(root: &Path) -> bool {
 /// config; this command deliberately does not touch the existing
 /// `iso()`/`smoke*` paths, so their ISOs stay byte-identical.
 fn build_user(root: &Path) -> bool {
-    if !sh(
-        root,
-        "cargo",
-        &[
+    // The user ELF is linked at USER_BASE = 0x8000_0000_0000 (512 GiB),
+    // outside the small code model's signed-32-bit absolute relocation
+    // range. `code-model=large` is scoped to THIS cargo invocation via
+    // RUSTFLAGS — setting it in the global .cargo/config.toml changed the
+    // kernel's codegen (2.4 -> 3.6 MiB) and broke boot. Keep the two
+    // targets strictly separate.
+    let status = Command::new("cargo")
+        .args([
             "build",
             "-p",
             "user-hello",
             "--release",
             "--target",
             "x86_64-unknown-none",
-        ],
-    ) {
-        return false;
+        ])
+        .env(
+            "RUSTFLAGS",
+            "-C target-cpu=x86-64 -C relocation-model=static -C code-model=large",
+        )
+        .current_dir(root)
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => {
+            eprintln!("xtask user: cargo build failed with {s}");
+            return false;
+        }
+        Err(e) => {
+            eprintln!("xtask user: cannot run cargo: {e}");
+            return false;
+        }
     }
     let elf = root.join("target/x86_64-unknown-none/release/user-hello");
     let boot = root.join("target/iso-root/boot");

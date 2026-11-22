@@ -3,6 +3,9 @@
 
 fn main() {
     let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set by cargo");
+    // Code model: see user/hello/.cargo/config.toml — it applies
+    // `-C code-model=large` to rustc for THIS crate only (the global
+    // .cargo/config.toml must not change the kernel's codegen).
     println!("cargo:rustc-link-arg=-T{manifest}/user.ld");
     // 4 KiB is the x86-64 base page size and matches the kernel's own
     // linker build arg. Every PT_LOAD then has p_vaddr % 4096 == p_offset
