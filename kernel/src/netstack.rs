@@ -590,6 +590,17 @@ impl Stack {
         let _ = self.iface.routes_mut().add_default_ipv4_route(gateway);
     }
 
+    /// Push an **additional** address (the hardware bring-up repro
+    /// harness needs the slirp guest address alongside the LAN one so
+    /// QEMU's `hostfwd` reaches the guest; claiming it on a real LAN
+    /// is harmless — nothing routes there).
+    pub fn add_ipv4(&mut self, addr: [u8; 4], prefix: u8) {
+        let ip = Ipv4Address::new(addr[0], addr[1], addr[2], addr[3]);
+        self.iface.update_ip_addrs(|addrs| {
+            let _ = addrs.push(IpCidr::Ipv4(Ipv4Cidr::new(ip, prefix)));
+        });
+    }
+
     /// ICMP echo roundtrip to the gateway: prints `NET_OK` the moment
     /// the gateway's ARP reply is sniffed (historical meaning kept —
     /// smoltcp resolved the neighbor itself) and `PING_OK` when the

@@ -42,6 +42,11 @@ const IDLE_WINDOWS: u32 = 2;
 pub fn run(stack: &mut Stack, cfg: &ServerConfig) -> ! {
     serial_println!("hw: bring-up mode (sshd module present)");
     stack.set_static_ipv4_at(ADDR, PREFIX, GW);
+    // QEMU's `hostfwd` targets the slirp guest address (10.0.2.15),
+    // which is not our LAN address: claim it as a secondary so the
+    // in-QEMU repro harness reaches the same sshd. Harmless on the
+    // real LAN — nothing routes to it there.
+    stack.add_ipv4(net::SLIRP_GUEST_IP, 24);
     serial_println!(
         "hw: sshd on 192.168.1.79:{} (sky2) — waiting for a client",
         crate::sshd::LISTEN_PORT

@@ -1405,6 +1405,23 @@ pub fn parse_userauth_success(payload: &[u8]) -> Result<(), UserAuthError> {
     }
 }
 
+/// Build an `SSH_MSG_USERAUTH_BANNER` **payload** (RFC4252 §5.4): the
+/// message byte, an empty language string and the message string.
+/// `None` when the message does not fit `out`.
+pub fn userauth_banner_payload(message: &[u8], out: &mut [u8]) -> Option<usize> {
+    let msg_len = u32::try_from(message.len()).ok()?;
+    let total = 1usize
+        .checked_add(4)?
+        .checked_add(4)?
+        .checked_add(message.len())?;
+    let buf = out.get_mut(..total)?;
+    buf[0] = SSH_MSG_USERAUTH_BANNER;
+    buf[1..5].copy_from_slice(&0u32.to_be_bytes()); // language tag: ""
+    buf[5..9].copy_from_slice(&msg_len.to_be_bytes());
+    buf[9..].copy_from_slice(message);
+    Some(total)
+}
+
 /// A parsed `SSH_MSG_USERAUTH_BANNER` (RFC4252 §5.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UserAuthBanner<'a> {

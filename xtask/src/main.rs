@@ -140,8 +140,11 @@ fn main() {
         "smoke-install" => smoke_install(&root),
         "smoke-ssh" => smoke_ssh(&root),
         "run" => run(&root),
+        "hwtest" => hwtest(&root),
         _ => {
-            eprintln!("usage: cargo xtask <check|build|iso|smoke|smoke-install|smoke-ssh|run>");
+            eprintln!(
+                "usage: cargo xtask <check|build|iso|smoke|smoke-install|smoke-ssh|run|hwtest>"
+            );
             false
         }
     };
@@ -357,6 +360,15 @@ ls -l /work/boot/boot.img /work/boot/core.img /work/boot/grubpayload.bin
 ";
 
 fn iso(root: &Path) -> bool {
+    iso_inner(root, false)
+}
+
+/// [`iso`] with the hardware bring-up module: when `hwtest` is set,
+/// the ISO carries `boot/sshd.bin` (one keypair: host seed ‖ the
+/// authorized client's raw public key) and the GRUB config loads it
+/// as the multiboot2 module `sshd`, which switches the kernel into
+/// `crate::hwtest` (static address, sshd, no smoke chain).
+fn iso_inner(root: &Path, hwtest: bool) -> bool {
     if !build_kernel(root) {
         return false;
     }
@@ -378,6 +390,65 @@ fn iso(root: &Path) -> bool {
     ) {
         eprintln!("xtask: cannot copy grub.cfg: {e}");
         return false;
+    }
+
+    if hwtest {
+        // Keys + module: one keypair serves as the host key and the
+        // authorized client key (self-signed bring-up setup).
+        let mut client_seed = [0u8; 32];
+        let mut server_seed = [0u8; 32];
+        let mut authorized = Vec::new();
+        if let Err(e) = generate_ssh_smoke_keys(
+            &iso_root,
+            &mut client_seed,
+            &mut server_seed,
+            &mut authorized,
+        ) {
+            eprintln!("xtask hwtest: cannot write the sshd keys: {e}");
+            return false;
+        }
+        let key_file = iso_root.join(INTEROP_KEY_FILE);
+        let raw_key = match std::fs::read(&key_file) {
+            Ok(raw) => raw,
+            Err(e) => {
+                eprintln!("xtask hwtest: cannot read {}: {e}", key_file.display());
+                return false;
+            }
+        };
+        let (seed, public) = match parse_openssh_ed25519(&raw_key) {
+            Ok(pair) => pair,
+            Err(e) => {
+                eprintln!("xtask hwtest: cannot parse {}: {e}", key_file.display());
+                return false;
+            }
+        };
+        let mut module = [0u8; 64];
+        module[..32].copy_from_slice(&seed);
+        module[32..].copy_from_slice(&public);
+        let module_path = iso_root.join("boot/sshd.bin");
+        if let Err(e) = std::fs::write(&module_path, module) {
+            eprintln!("xtask hwtest: cannot write {}: {e}", module_path.display());
+            return false;
+        }
+        // Load it as the multiboot2 module `sshd` (the kernel matches
+        // the command line, not the file name).
+        let cfg_path = boot_dir.join("grub.cfg");
+        let cfg = match std::fs::read_to_string(&cfg_path) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                eprintln!("xtask hwtest: cannot read {}: {e}", cfg_path.display());
+                return false;
+            }
+        };
+        let cfg = cfg.replacen(
+            "    boot\n",
+            "    module2 /boot/sshd.bin sshd\n    boot\n",
+            1,
+        );
+        if let Err(e) = std::fs::write(&cfg_path, cfg) {
+            eprintln!("xtask hwtest: cannot write {}: {e}", cfg_path.display());
+            return false;
+        }
     }
     // I1b: the config embedded in the installed disk's core.img.
     if let Err(e) = std::fs::write(iso_root.join("boot/early.cfg"), GRUB_EARLY_CFG) {
@@ -1367,6 +1438,112 @@ fn run(root: &Path) -> bool {
 ///
 /// It runs **without a disk**, so the `ata::probe` that sits between
 /// `PCI_OK` and `E1000_OK` stays silent here.
+/// `cargo xtask hwtest` — prove the **hardware bring-up path** in
+/// QEMU: the ISO carries the `sshd` multiboot2 module, so the kernel
+/// skips the smoke chain, takes a static address (plus the slirp one,
+/// so `hostfwd` reaches it) and serves sshd on guest :2222; xtask
+/// then runs the container's **real OpenSSH client** through
+/// `hostfwd=tcp:0.0.0.0:2223-:2222` and requires the exec output.
+/// The server's serial (with every drop/auth reason — the exact
+/// diagnosis the real MacBook needs) is printed live as `hwtest| …`.
+fn hwtest(root: &Path) -> bool {
+    if !iso_inner(root, true) {
+        return false;
+    }
+    let iso_dir = root.join("target/iso-root");
+    let container = vm_container(root, "hwtest");
+    rm_container(&container); // stale VM from a killed session
+    if !sh(root, "docker", &["build", "-t", TOOLS_IMAGE, "tools"]) {
+        return false;
+    }
+    let args = qemu_std_args_ex(
+        "/iso/os.iso",
+        &format!("tcp:127.0.0.1:{},server,nowait", monitor_port(root)),
+        "stdio",
+        Some(("0.0.0.0", 2223, 2222)),
+    );
+    let mut docker_args: Vec<String> = vec![
+        "run".into(),
+        "--rm".into(),
+        "-i".into(),
+        "--name".into(),
+        container.clone(),
+        "-v".into(),
+        format!("{}:/iso", iso_dir.display()),
+        TOOLS_IMAGE.into(),
+        "sh".into(),
+        "-c".into(),
+        String::from("exec qemu-system-x86_64 \"$@\""),
+        "qemu-system-x86_64".into(),
+    ];
+    docker_args.extend(args.iter().cloned());
+    let mut child = match Command::new("docker")
+        .args(&docker_args)
+        .current_dir(root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            eprintln!("xtask hwtest: cannot start docker: {e}");
+            rm_container(&container);
+            return false;
+        }
+    };
+    let rx = spawn_line_reader(&mut child);
+    let mut collected: Vec<String> = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut listening = false;
+    while let Ok(line) = rx.recv_timeout(
+        deadline
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_millis(1)),
+    ) {
+        println!("hwtest| {line}");
+        collected.push(line.clone());
+        if line.contains("SSHD_LISTEN_OK") {
+            listening = true;
+            break;
+        }
+        if line.contains("FATAL") {
+            break;
+        }
+    }
+    let mut ok = false;
+    if listening {
+        // The real OpenSSH client, inside the container, through hostfwd.
+        ok = run_openssh_interop(&container, "2223");
+        // Drain a couple more seconds: the server's drop/auth reason
+        // for the attempt is printed after the client returns.
+        let tail_deadline = Instant::now() + Duration::from_secs(3);
+        while let Ok(line) = rx.recv_timeout(
+            tail_deadline
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_millis(1)),
+        ) {
+            println!("hwtest| {line}");
+            collected.push(line);
+        }
+    } else {
+        eprintln!("hwtest: the kernel never printed SSHD_LISTEN_OK");
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    rm_container(&container);
+    if ok {
+        println!("hwtest: PASS — real OpenSSH authenticated over hostfwd");
+    } else {
+        eprintln!("hwtest: FAIL — see the hwtest| server lines above");
+        for line in &collected {
+            if line.contains("sshd") || line.contains("FATAL") || line.contains("hw:") {
+                eprintln!("hwtest| {line}");
+            }
+        }
+    }
+    ok
+}
+
 fn smoke(root: &Path) -> bool {
     const MARKERS: [&str; 30] = [
         "BOOT_OK",
@@ -2002,7 +2179,7 @@ fn run_two_vm_ssh(root: &Path, iso_dir: &Path, server_disk: &Path, client_disk: 
     // that network namespace's loopback, which the host cannot reach,
     // so `docker exec` is the clean way in (no sidecar needed).
     let interop_ok = if client_ok {
-        run_openssh_interop(&container)
+        run_openssh_interop(&container, "2222")
     } else {
         eprintln!("smoke-ssh: interop skipped (the client VM's chain failed first)");
         false
@@ -2087,7 +2264,7 @@ fn run_two_vm_ssh(root: &Path, iso_dir: &Path, server_disk: &Path, client_disk: 
 /// ends the loop at once, so the exact failure the real MacBook hit
 /// is reported verbatim instead of being masked by later retries.
 /// Every attempt's output is echoed into the harness log either way.
-fn run_openssh_interop(container: &str) -> bool {
+fn run_openssh_interop(container: &str, port: &str) -> bool {
     // Belt and braces: bind-mounted files can surface with loose
     // modes on some Docker Desktop filesystems, and ssh refuses a
     // private key that is not its owner's to read only.
@@ -2104,7 +2281,7 @@ fn run_openssh_interop(container: &str) -> bool {
         "-i",
         INTEROP_KEY_CONTAINER,
         "-p",
-        "2222",
+        port,
         "-o",
         "StrictHostKeyChecking=no",
         "-o",

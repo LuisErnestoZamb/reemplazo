@@ -113,6 +113,50 @@ static mut RX: [u8; RX_CAP] = [0; RX_CAP];
 /// hardware bring-up loop counts `false` as an idle window
 /// (`hwtest::run`). Called from the boot chain only when a disk
 /// carried a server key.
+/// Last session-failure reason, replayed as an `SSH_MSG_USERAUTH_BANNER`
+/// on the *next* connection. A keyboard-less, serial-less machine has
+/// no other way to tell a remote operator why a session died — the
+/// banner is the one channel OpenSSH prints verbatim on stderr.
+/// Single core; written from the serve path, IRQ0 never touches it.
+const LAST_FAIL_CAP: usize = 160;
+static mut LAST_FAIL: [u8; LAST_FAIL_CAP] = [0; LAST_FAIL_CAP];
+static mut LAST_FAIL_LEN: usize = 0;
+
+/// Store a failure reason (truncated to the buffer) for the next
+/// connection's banner.
+fn remember_fail(reason: &str) {
+    let bytes = reason.as_bytes();
+    let n = bytes.len().min(LAST_FAIL_CAP);
+    // SAFETY: single-core serve path, the only writer/reader; the
+    // length never exceeds the buffer it indexes.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            core::ptr::addr_of_mut!(LAST_FAIL) as *mut u8,
+            n,
+        );
+        LAST_FAIL_LEN = n;
+    }
+}
+
+/// Take the stored reason (one-shot: the banner is sent once).
+fn take_fail() -> Option<&'static [u8]> {
+    // SAFETY: as `remember_fail`; cleared immediately after the read,
+    // so no aliasing outlives this call.
+    unsafe {
+        let n = LAST_FAIL_LEN;
+        LAST_FAIL_LEN = 0;
+        if n == 0 || n > LAST_FAIL_CAP {
+            None
+        } else {
+            Some(core::slice::from_raw_parts(
+                core::ptr::addr_of!(LAST_FAIL) as *const u8,
+                n,
+            ))
+        }
+    }
+}
+
 pub(crate) fn serve_once(stack: &mut Stack, cfg: &ServerConfig) -> bool {
     // The fingerprint is public material: it is what an operator
     // compares out of band. The seed behind it is never printed.
@@ -209,6 +253,7 @@ pub(crate) fn serve_once(stack: &mut Stack, cfg: &ServerConfig) -> bool {
             }
             Err(reason) => {
                 serial_println!("sshd: connection dropped: {reason}");
+                remember_fail(reason);
                 return served;
             }
         }
@@ -478,6 +523,22 @@ fn session(
                 };
                 wire.send(stack, &buf[..n])?;
                 service_accepted = true;
+                // One-shot diagnostics: replay the previous session's
+                // failure reason as a userauth banner (RFC4252 §5.4) —
+                // OpenSSH prints it on stderr, so a remote operator
+                // sees *why* the last attempt died without a screen.
+                if let Some(msg) = take_fail() {
+                    let mut bbuf = [0u8; 192];
+                    match ssh_wire::userauth_banner_payload(msg, &mut bbuf) {
+                        Some(n) => {
+                            serial_println!("sshd: replaying last failure as banner");
+                            if let Err(e) = wire.send(stack, &bbuf[..n]) {
+                                serial_println!("sshd: banner not sent: {e}");
+                            }
+                        }
+                        None => serial_println!("sshd: banner does not fit"),
+                    }
+                }
             }
             ssh_wire::SSH_MSG_USERAUTH_REQUEST => {
                 if !service_accepted {
