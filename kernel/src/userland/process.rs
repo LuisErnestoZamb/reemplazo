@@ -24,6 +24,17 @@ use core::ffi::c_void;
 /// static RAM — deliberate on a 2.9 GB DDR2 target with a 5400 rpm disk.
 pub const MAX_PROCS: usize = 8;
 
+/// 16-byte-aligned `fxsave`/`fxrstor` image, stored per PCB.
+///
+/// Merom is x86-64-v1 but still executes SSE/XMM (the ISA ceiling is SSSE3),
+/// so x87 + XMM + MXCSR must be saved/restored on every context switch.
+/// `fxsave` requires a 16-byte-aligned 512-byte destination; wrapping the
+/// array in an aligned `Copy` struct makes that property part of the type and
+/// survives the static `[Process; MAX_PROCS]` backing store.
+#[repr(align(16))]
+#[derive(Clone, Copy)]
+pub struct FpuState(pub [u8; crate::idt::FXSAVE_SIZE]);
+
 /// Per-process kernel stack, used as `TSS.RSP0` on switch-in. 16-byte
 /// aligned by `sched::KernelStack`.
 pub const KERNEL_STACK_SIZE: usize = 4096;
@@ -92,6 +103,11 @@ pub struct Process {
 
     /// PIT ticks left before RR preemption (milestone 2 only).
     pub quantum_left: u32,
+
+    /// x87/XMM/MXCSR image, saved on switch-out and restored on switch-in.
+    /// Initialized from a live `fxsave` at spawn/reset so `fxrstor` never
+    /// sees an all-zero (unmasked-exception) image.
+    pub fpu: FpuState,
 }
 
 impl Process {
@@ -112,6 +128,7 @@ impl Process {
             fds: [-1; MAX_FDS],
             owns_console: false,
             quantum_left: 0,
+            fpu: FpuState([0; crate::idt::FXSAVE_SIZE]),
         }
     }
 
@@ -139,6 +156,7 @@ impl Process {
             fds: [-1; MAX_FDS],
             owns_console: false,
             quantum_left: 0,
+            fpu: FpuState([0; crate::idt::FXSAVE_SIZE]),
         }
     }
 

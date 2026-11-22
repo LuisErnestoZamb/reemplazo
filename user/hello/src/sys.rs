@@ -36,6 +36,23 @@ pub fn write(fd: usize, buf: &[u8]) -> isize {
     ret
 }
 
+/// `Yield()` — hand the CPU to the next runnable process (hito 2).
+#[inline(always)]
+pub fn yield_now() -> isize {
+    let ret: isize;
+    // SAFETY: `int 0x80` enters through the DPL3 gate; the CPU switches to
+    // the kernel stack, so this asm touches no user stack. rax is the only
+    // output; the kernel may return a different task's register frame.
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inlateout("rax") SYS_YIELD => ret,
+            options(nostack),
+        );
+    }
+    ret
+}
+
 /// `Exit(code)` — terminates the process; never returns.
 #[inline(always)]
 pub fn exit(code: i32) -> ! {

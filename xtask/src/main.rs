@@ -1844,9 +1844,10 @@ fn netlog_probe(container: &str) -> Result<usize, String> {
     Ok(out.stdout.len())
 }
 
-/// U1 smoke: boots the dedicated ISO with the `hello` userland module
-/// and asserts the userland markers (ELF_OK, USER_RUN_OK, SYSCALL_OK,
-/// USER_RETURN_OK) after the unchanged boot chain.
+/// Userland smoke: boots the dedicated ISO with the `hello` userland module
+/// and asserts the hito-1 markers (ELF_OK, USER_RUN_OK, SYSCALL_OK,
+/// USER_RETURN_OK) plus hito 2 (SCHED_RR_OK, USER_YIELD_OK, USER_FAULT_OK)
+/// after the unchanged boot chain.
 fn smoke_user(root: &Path) -> bool {
     let markers: Vec<&str> = vec![
         "BOOT_OK",
@@ -1874,6 +1875,9 @@ fn smoke_user(root: &Path) -> bool {
         "USER_RUN_OK",
         "SYSCALL_OK",
         "USER_RETURN_OK",
+        "SCHED_RR_OK",
+        "USER_YIELD_OK",
+        "USER_FAULT_OK",
     ];
     if !iso_inner(root, false, true) {
         return false;
