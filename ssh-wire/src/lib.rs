@@ -5258,4 +5258,585 @@ mod tests {
         let n = channel_exit_status_payload(0, 127, &mut buf).expect("fits");
         assert_eq!(parse_channel_exit_status(&buf[..n]), Ok((0, 127)));
     }
+
+    // ---- adversarial hardening (milestone `ssh-hardening`) --------
+    //
+    // Gap-filling tests: every public parser must refuse an empty
+    // input, every truncation at each field boundary, a declared
+    // length that lies (u32::MAX — refused before any byte of the
+    // claimed body is waited on), non-printable bytes where text is
+    // expected, and buffers one byte short. The categories already
+    // covered above (banner bounds and bad bytes, packet padding and
+    // block size, hostile EXT_INFO counts, blob lengths and
+    // truncations) are not repeated here.
+
+    /// `SSH_MSG_SERVICE_REQUEST` had no host test at all: roundtrip
+    /// plus every rejection the server turns into a connection drop.
+    #[test]
+    fn service_request_roundtrip_and_rejections() {
+        let mut p = Vec::new();
+        p.push(SSH_MSG_SERVICE_REQUEST);
+        p.extend_from_slice(&12u32.to_be_bytes());
+        p.extend_from_slice(b"ssh-userauth");
+        assert_eq!(parse_service_request(&p), Ok(b"ssh-userauth".as_slice()));
+        // Empty input.
+        assert_eq!(parse_service_request(&[]), Err(ServiceError::Truncated));
+        // Wrong message byte.
+        let mut wrong = p.clone();
+        wrong[0] = SSH_MSG_SERVICE_ACCEPT;
+        assert_eq!(
+            parse_service_request(&wrong),
+            Err(ServiceError::WrongMessage)
+        );
+        // Every truncation, at each field boundary.
+        for cut in 0..p.len() {
+            assert!(parse_service_request(&p[..cut]).is_err(), "cut {cut}");
+        }
+        // A declared length that lies (u32::MAX): refused by the
+        // bounds check, never waited on.
+        let mut liar = Vec::new();
+        liar.push(SSH_MSG_SERVICE_REQUEST);
+        liar.extend_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(parse_service_request(&liar), Err(ServiceError::Truncated));
+        // ...and one that fits its own header but overruns the payload.
+        let mut short = p.clone();
+        short[1..5].copy_from_slice(&13u32.to_be_bytes());
+        assert_eq!(parse_service_request(&short), Err(ServiceError::Truncated));
+        // Nothing may follow the name.
+        let mut tail = p.clone();
+        tail.push(0);
+        assert_eq!(
+            parse_service_request(&tail),
+            Err(ServiceError::TrailingGarbage)
+        );
+        // Non-printable "service" bytes are surfaced as an opaque
+        // field — the *caller* must compare against the exact ASCII
+        // name (the sshd does: `name != b"ssh-userauth"` → drop).
+        let mut junk = Vec::new();
+        junk.push(SSH_MSG_SERVICE_REQUEST);
+        junk.extend_from_slice(&3u32.to_be_bytes());
+        junk.extend_from_slice(b"\x01\x02\x03");
+        assert_eq!(parse_service_request(&junk), Ok(b"\x01\x02\x03".as_slice()));
+    }
+
+    /// `SSH_MSG_KEXDH_INIT` had only spot checks: every truncation,
+    /// the empty payload, a lying u32::MAX length and trailing bytes.
+    #[test]
+    fn kexdh_init_refuses_truncation_giant_lengths_and_trailing_bytes() {
+        let mut init = [0u8; 64];
+        let n = kexdh_init_payload(&[7u8; 32], &mut init).expect("fits");
+        assert_eq!(parse_kexdh_init(&init[..n]), Ok([7u8; 32]));
+        for cut in 0..n {
+            assert!(parse_kexdh_init(&init[..cut]).is_err(), "cut {cut}");
+        }
+        assert_eq!(parse_kexdh_init(&[]), Err(KexDhError::Truncated));
+        // Declared length u32::MAX: the `== 32` check refuses it
+        // before any body byte is waited on.
+        let mut liar = vec![SSH_MSG_KEXDH_INIT];
+        liar.extend_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(parse_kexdh_init(&liar), Err(KexDhError::BadPublicKey));
+        // Bytes after the 32-byte value.
+        let mut tail = init[..n].to_vec();
+        tail.push(0);
+        assert_eq!(parse_kexdh_init(&tail), Err(KexDhError::TrailingGarbage));
+    }
+
+    /// The three *outer* string lengths of `SSH_MSG_KEXDH_REPLY`
+    /// (K_S, f, signature) lying as u32::MAX: each is refused from
+    /// the length field alone.
+    #[test]
+    fn kexdh_reply_refuses_giant_declared_lengths() {
+        let full = valid_kexdh_reply();
+        // Layout: msg(1) + string(4+51 K_S) + string(4+32 f) +
+        // string(4+83 signature) — f's length sits at 56, the
+        // signature's at 92.
+        assert_eq!(full.len(), 1 + 4 + 51 + 4 + 32 + 4 + 83);
+        let mut p = full.clone();
+        p[1..5].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(parse_kexdh_reply(&p), Err(KexDhError::Truncated));
+        let mut p = full.clone();
+        p[56..60].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(parse_kexdh_reply(&p), Err(KexDhError::BadPublicKey));
+        let mut p = full;
+        p[92..96].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(parse_kexdh_reply(&p), Err(KexDhError::Truncated));
+    }
+
+    /// Declared u32::MAX lengths in the auth answers: refused by the
+    /// bounds check (Truncated), never waited on — each payload here
+    /// is nothing but its header plus the lying length.
+    #[test]
+    fn auth_answers_refuse_giant_declared_lengths() {
+        // USERAUTH_FAILURE: methods name-list length = u32::MAX.
+        let mut f = Vec::new();
+        f.push(SSH_MSG_USERAUTH_FAILURE);
+        f.extend_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(parse_userauth_failure(&f), Err(UserAuthError::Truncated));
+        // USERAUTH_PK_OK: algorithm length = u32::MAX, then (with a
+        // well-formed algorithm) the key-blob length = u32::MAX.
+        let mut pk = Vec::new();
+        pk.push(SSH_MSG_USERAUTH_PK_OK);
+        pk.extend_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(parse_userauth_pk_ok(&pk), Err(UserAuthError::Truncated));
+        let mut pk = Vec::new();
+        pk.push(SSH_MSG_USERAUTH_PK_OK);
+        pk.extend_from_slice(&11u32.to_be_bytes());
+        pk.extend_from_slice(b"ssh-ed25519");
+        pk.extend_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(parse_userauth_pk_ok(&pk), Err(UserAuthError::Truncated));
+        // SERVICE_ACCEPT: service-name length = u32::MAX.
+        let mut sa = Vec::new();
+        sa.push(SSH_MSG_SERVICE_ACCEPT);
+        sa.extend_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(parse_service_accept(&sa), Err(ServiceError::Truncated));
+        // (USERAUTH_BANNER already has its own u32::MAX message-length
+        // test above.)
+    }
+
+    /// `SSH_MSG_USERAUTH_REQUEST` is the server's auth gate: every
+    /// truncation of the probe, the signed request and the `none`
+    /// payload must be refused, plus empty input, a lying u32::MAX
+    /// user length, an empty user name, a non-boolean flag and a
+    /// wrong message byte.
+    #[test]
+    fn userauth_request_refuses_truncation_and_giant_lengths() {
+        let blob = key_blob_for(0x55);
+        let mut sig_blob = [0u8; ED25519_SIG_BLOB_LEN];
+        ed25519_signature_blob(&[0x77; 64], &mut sig_blob).expect("fits");
+        let mut buf = [0u8; 512];
+        for signed in [false, true] {
+            let n = userauth_publickey_payload(
+                AUTH_USER,
+                &blob,
+                signed.then_some(&sig_blob[..]),
+                &mut buf,
+            )
+            .expect("fits");
+            for cut in 0..n {
+                assert!(
+                    parse_userauth_request(&buf[..cut]).is_err(),
+                    "signed {signed}: cut {cut} parsed"
+                );
+            }
+            assert!(parse_userauth_request(&buf[..n]).is_ok());
+        }
+        let n = userauth_none_payload(&mut buf).expect("fits");
+        for cut in 0..n {
+            assert!(
+                parse_userauth_request(&buf[..cut]).is_err(),
+                "none: cut {cut} parsed"
+            );
+        }
+        assert_eq!(parse_userauth_request(&[]), Err(UserAuthError::Truncated));
+        // The user length lies as u32::MAX: refused before its bytes.
+        let mut liar = Vec::new();
+        liar.push(SSH_MSG_USERAUTH_REQUEST);
+        liar.extend_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(parse_userauth_request(&liar), Err(UserAuthError::Truncated));
+        // An empty user name is refused (RFC4254 §5.1).
+        let mut empty_user = Vec::new();
+        empty_user.push(SSH_MSG_USERAUTH_REQUEST);
+        empty_user.extend_from_slice(&0u32.to_be_bytes());
+        empty_user.extend_from_slice(&14u32.to_be_bytes());
+        empty_user.extend_from_slice(AUTH_SERVICE);
+        empty_user.extend_from_slice(&4u32.to_be_bytes());
+        empty_user.extend_from_slice(b"none");
+        assert_eq!(
+            parse_userauth_request(&empty_user),
+            Err(UserAuthError::Truncated)
+        );
+        // The publickey flag is an RFC4251 boolean.
+        let n = userauth_publickey_payload(AUTH_USER, &blob, None, &mut buf).expect("fits");
+        let mut bad = buf[..n].to_vec();
+        bad[1 + 7 + 18 + 13] = 2;
+        assert_eq!(parse_userauth_request(&bad), Err(UserAuthError::BadBoolean));
+        // Wrong message byte.
+        let mut wrong = buf[..n].to_vec();
+        wrong[0] = SSH_MSG_USERAUTH_FAILURE;
+        assert_eq!(
+            parse_userauth_request(&wrong),
+            Err(UserAuthError::WrongMessage)
+        );
+    }
+
+    /// `CHANNEL_OPEN`/`CHANNEL_OPEN_CONFIRMATION`: every truncation,
+    /// empty input, a lying u32::MAX type length, a wrong message
+    /// byte — and the open parser is a field reader: it *surfaces*
+    /// any channel type for the caller to refuse (the sshd drops on
+    /// anything but `"session"` instead of replying
+    /// `CHANNEL_OPEN_FAILURE` — see docs/ssh-audit.md).
+    #[test]
+    fn channel_open_refuses_truncation_and_giant_lengths() {
+        let mut buf = [0u8; 128];
+        let n = channel_open_session_payload(3, 65536, 32768, &mut buf).expect("fits");
+        assert_eq!(n, 24);
+        for cut in 0..n {
+            assert!(parse_channel_open(&buf[..cut]).is_err(), "cut {cut}");
+        }
+        assert_eq!(parse_channel_open(&[]), Err(ChannelError::Truncated));
+        let mut liar = Vec::new();
+        liar.push(SSH_MSG_CHANNEL_OPEN);
+        liar.extend_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(parse_channel_open(&liar), Err(ChannelError::Truncated));
+        // A different message byte is refused.
+        let mut wrong = buf[..n].to_vec();
+        wrong[0] = SSH_MSG_CHANNEL_REQUEST;
+        assert_eq!(parse_channel_open(&wrong), Err(ChannelError::WrongMessage));
+        // The raw channel type is surfaced, never silently accepted:
+        // the caller compares it (sshd: `!= b"session"` → drop).
+        let mut foreign = Vec::new();
+        foreign.push(SSH_MSG_CHANNEL_OPEN);
+        foreign.extend_from_slice(&(b"direct-tcpip".len() as u32).to_be_bytes());
+        foreign.extend_from_slice(b"direct-tcpip");
+        foreign.extend_from_slice(&9u32.to_be_bytes());
+        foreign.extend_from_slice(&65536u32.to_be_bytes());
+        foreign.extend_from_slice(&32768u32.to_be_bytes());
+        let open = parse_channel_open(&foreign).expect("field reader");
+        assert_eq!(open.channel_type, b"direct-tcpip");
+        assert_eq!(open.sender_channel, 9);
+
+        // Confirmation: same treatment.
+        let n = channel_open_confirmation_payload(3, 0, 65536, 32768, &mut buf).expect("fits");
+        assert_eq!(n, 17);
+        for cut in 0..n {
+            assert!(
+                parse_channel_open_confirmation(&buf[..cut]).is_err(),
+                "cut {cut}"
+            );
+        }
+        assert_eq!(
+            parse_channel_open_confirmation(&[]),
+            Err(ChannelError::Truncated)
+        );
+        let mut wrong = buf[..n].to_vec();
+        wrong[0] = SSH_MSG_CHANNEL_OPEN;
+        assert_eq!(
+            parse_channel_open_confirmation(&wrong),
+            Err(ChannelError::WrongMessage)
+        );
+    }
+
+    /// `CHANNEL_REQUEST`: the `exec` bounds are checked *before* the
+    /// command bytes are waited on (u32::MAX and `EXEC_COMMAND_MAX+1`
+    /// both → `BadCommand`), plus truncation at every boundary, empty
+    /// input, a lying type length, a bad boolean, and the two
+    /// non-exec shapes (a bare one parses; one *with* arguments is
+    /// `TrailingGarbage` — ssh-wire has no non-exec payload grammar,
+    /// which the sshd turns into a drop: docs/ssh-audit.md).
+    #[test]
+    fn channel_request_enforces_bounds_before_waiting() {
+        fn chan_req(request_type: &[u8], want_reply: u8, command: Option<&[u8]>) -> Vec<u8> {
+            let mut v = Vec::new();
+            v.push(SSH_MSG_CHANNEL_REQUEST);
+            v.extend_from_slice(&7u32.to_be_bytes()); // recipient channel
+            v.extend_from_slice(&(request_type.len() as u32).to_be_bytes());
+            v.extend_from_slice(request_type);
+            v.push(want_reply);
+            if let Some(c) = command {
+                v.extend_from_slice(&(c.len() as u32).to_be_bytes());
+                v.extend_from_slice(c);
+            }
+            v
+        }
+
+        let full = chan_req(b"exec", 1, Some(b"echo hi"));
+        let req = parse_channel_request(&full).expect("parses");
+        assert_eq!(req.exec_command, b"echo hi");
+        for cut in 0..full.len() {
+            assert!(
+                parse_channel_request(&full[..cut]).is_err(),
+                "cut {cut} parsed"
+            );
+        }
+        assert_eq!(parse_channel_request(&[]), Err(ChannelError::Truncated));
+
+        // Wrong message byte.
+        let mut wrong = full.clone();
+        wrong[0] = SSH_MSG_CHANNEL_DATA;
+        assert_eq!(
+            parse_channel_request(&wrong),
+            Err(ChannelError::WrongMessage)
+        );
+
+        // The request-type length lies as u32::MAX.
+        let mut liar = full.clone();
+        liar[5..9].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(parse_channel_request(&liar), Err(ChannelError::Truncated));
+
+        // `want_reply` is an RFC4251 boolean.
+        let bad = chan_req(b"exec", 2, Some(b"x"));
+        assert_eq!(parse_channel_request(&bad), Err(ChannelError::BadBoolean));
+
+        // exec command bounds: empty, one over the cap and u32::MAX
+        // are all refused from the length field alone.
+        assert_eq!(
+            parse_channel_request(&chan_req(b"exec", 1, Some(b""))),
+            Err(ChannelError::BadCommand)
+        );
+        assert_eq!(
+            parse_channel_request(&chan_req(b"exec", 1, Some(&[b'x'; EXEC_COMMAND_MAX + 1]))),
+            Err(ChannelError::BadCommand)
+        );
+        let mut giant = chan_req(b"exec", 1, Some(b"x"));
+        let clen_at = giant.len() - 4 - 1; // command byte precedes its length
+        giant[clen_at..clen_at + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(parse_channel_request(&giant), Err(ChannelError::BadCommand));
+
+        // Exactly at the cap: accepted.
+        let at_cap = chan_req(b"exec", 1, Some(&[b'x'; EXEC_COMMAND_MAX]));
+        let req = parse_channel_request(&at_cap).expect("at the cap");
+        assert_eq!(req.exec_command.len(), EXEC_COMMAND_MAX);
+
+        // A non-exec request with *no* arguments parses with an empty
+        // command (the caller replies CHANNEL_FAILURE).
+        let bare = chan_req(b"break", 1, None);
+        let req = parse_channel_request(&bare).expect("bare break");
+        assert_eq!(req.request_type, b"break");
+        assert!(req.exec_command.is_empty());
+        // ...with arguments it is TrailingGarbage → sshd drops the
+        // connection instead of CHANNEL_FAILURE (docs/ssh-audit.md).
+        let with_args = chan_req(b"pty-req", 1, Some(b"term"));
+        assert_eq!(
+            parse_channel_request(&with_args),
+            Err(ChannelError::TrailingGarbage)
+        );
+    }
+
+    /// The single-field channel messages (`CHANNEL_SUCCESS`/
+    /// `FAILURE`/`EOF`/`CLOSE`, `CHANNEL_DATA`, `exit-status`):
+    /// empty input, every truncation, a wrong message byte, lying
+    /// u32::MAX lengths, a bad boolean and trailing bytes.
+    #[test]
+    fn channel_small_messages_refuse_truncation_and_trailing_bytes() {
+        let mut buf = [0u8; 64];
+
+        // One-channel messages.
+        let n = channel_number_payload(SSH_MSG_CHANNEL_EOF, 9, &mut buf).expect("fits");
+        assert_eq!(n, 5);
+        for cut in 0..n {
+            assert!(
+                parse_channel_number(&buf[..cut], SSH_MSG_CHANNEL_EOF).is_err(),
+                "cut {cut}"
+            );
+        }
+        assert_eq!(
+            parse_channel_number(&[], SSH_MSG_CHANNEL_EOF),
+            Err(ChannelError::Truncated)
+        );
+        let mut tail = buf[..n].to_vec();
+        tail.push(0);
+        assert_eq!(
+            parse_channel_number(&tail, SSH_MSG_CHANNEL_EOF),
+            Err(ChannelError::TrailingGarbage)
+        );
+        assert_eq!(
+            parse_channel_number(&[SSH_MSG_CHANNEL_DATA, 0, 0, 0, 0], SSH_MSG_CHANNEL_EOF),
+            Err(ChannelError::WrongMessage)
+        );
+
+        // CHANNEL_DATA.
+        let n = channel_data_payload(3, b"hello", &mut buf).expect("fits");
+        assert_eq!(n, 14);
+        for cut in 0..n {
+            assert!(parse_channel_data(&buf[..cut]).is_err(), "cut {cut}");
+        }
+        assert_eq!(parse_channel_data(&[]), Err(ChannelError::Truncated));
+        let mut wrong = buf[..n].to_vec();
+        wrong[0] = SSH_MSG_CHANNEL_EXTENDED_DATA;
+        assert_eq!(parse_channel_data(&wrong), Err(ChannelError::WrongMessage));
+        // Declared data length u32::MAX: refused before its bytes.
+        let mut liar = buf[..n].to_vec();
+        liar[5..9].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(parse_channel_data(&liar), Err(ChannelError::Truncated));
+        let mut tail = buf[..n].to_vec();
+        tail.push(0);
+        assert_eq!(
+            parse_channel_data(&tail),
+            Err(ChannelError::TrailingGarbage)
+        );
+
+        // exit-status.
+        let n = channel_exit_status_payload(3, 7, &mut buf).expect("fits");
+        assert_eq!(n, 25);
+        for cut in 0..n {
+            assert!(parse_channel_exit_status(&buf[..cut]).is_err(), "cut {cut}");
+        }
+        assert_eq!(parse_channel_exit_status(&[]), Err(ChannelError::Truncated));
+        let mut wrong = buf[..n].to_vec();
+        wrong[0] = SSH_MSG_CHANNEL_REQUEST + 1;
+        assert_eq!(
+            parse_channel_exit_status(&wrong),
+            Err(ChannelError::WrongMessage)
+        );
+        // The request-type length must be exactly 11 ("exit-status").
+        let mut short_name = buf[..n].to_vec();
+        short_name[5..9].copy_from_slice(&10u32.to_be_bytes());
+        assert_eq!(
+            parse_channel_exit_status(&short_name),
+            Err(ChannelError::WrongMessage)
+        );
+        // `want_reply` is a boolean.
+        let mut bad_bool = buf[..n].to_vec();
+        bad_bool[20] = 2;
+        assert_eq!(
+            parse_channel_exit_status(&bad_bool),
+            Err(ChannelError::BadBoolean)
+        );
+        let mut tail = buf[..n].to_vec();
+        tail.push(0);
+        assert_eq!(
+            parse_channel_exit_status(&tail),
+            Err(ChannelError::TrailingGarbage)
+        );
+    }
+
+    /// Every S5 encoder succeeds at its exact size and refuses one
+    /// byte short — never a panic, never a partial frame.
+    #[test]
+    fn s5_encoders_refuse_a_one_byte_short_buffer() {
+        macro_rules! exact {
+            ($name:literal, $enc:expr) => {{
+                let mut buf = [0u8; 512];
+                let n = ($enc)(&mut buf[..]).expect(concat!($name, " fits"));
+                assert_eq!(
+                    ($enc)(&mut buf[..n]),
+                    Some(n),
+                    "{name} at its exact size",
+                    name = $name
+                );
+                assert_eq!(
+                    ($enc)(&mut buf[..n - 1]),
+                    None,
+                    "{name} one byte short",
+                    name = $name
+                );
+            }};
+        }
+        let blob = key_blob_for(0x21);
+        let mut sig_blob = [0u8; ED25519_SIG_BLOB_LEN];
+        ed25519_signature_blob(&[0x33; 64], &mut sig_blob).expect("fits");
+        exact!("channel_open_session", |out: &mut [u8]| {
+            channel_open_session_payload(3, 65536, 32768, out)
+        });
+        exact!("channel_open_confirmation", |out: &mut [u8]| {
+            channel_open_confirmation_payload(3, 0, 65536, 32768, out)
+        });
+        exact!("channel_request_exec", |out: &mut [u8]| {
+            channel_request_exec_payload(7, b"echo hi", true, out)
+        });
+        exact!("channel_number", |out: &mut [u8]| {
+            channel_number_payload(SSH_MSG_CHANNEL_EOF, 0, out)
+        });
+        exact!("channel_data", |out: &mut [u8]| {
+            channel_data_payload(0, b"hello", out)
+        });
+        exact!("channel_exit_status", |out: &mut [u8]| {
+            channel_exit_status_payload(0, 7, out)
+        });
+        exact!("service_accept", |out: &mut [u8]| {
+            service_accept_payload(b"ssh-userauth", out)
+        });
+        exact!("userauth_failure", |out: &mut [u8]| {
+            userauth_failure_payload(b"publickey", false, out)
+        });
+        exact!("userauth_success", |out: &mut [u8]| {
+            userauth_success_payload(out)
+        });
+        exact!("userauth_pk_ok", |out: &mut [u8]| {
+            userauth_pk_ok_payload(&blob, out)
+        });
+        exact!("userauth_banner", |out: &mut [u8]| {
+            userauth_banner_payload(b"hi", out)
+        });
+        exact!("kexdh_reply", |out: &mut [u8]| {
+            crate::kexdh_reply_payload(&blob, &[9u8; 32], &sig_blob, out)
+        });
+    }
+
+    /// `parse_authorized_key` on hostile *file* input: empty file,
+    /// comment/blank-only file, a line with no key body, an oversized
+    /// base64 body (the fixed 96-byte scratch buffer must fail it,
+    /// never truncate it into a shorter "key"), and a valid line with
+    /// no trailing newline.
+    #[test]
+    fn authorized_key_refuses_empty_and_oversized_input() {
+        let mut out = [0u8; 32];
+        // Empty input.
+        assert_eq!(
+            parse_authorized_key(b"", &mut out),
+            Err(KeyError::Truncated)
+        );
+        // Nothing but comments and blank lines.
+        assert_eq!(
+            parse_authorized_key(b"# comment\r\n\r\n \t\n", &mut out),
+            Err(KeyError::Truncated)
+        );
+        // `ssh-ed25519` with no space and no body.
+        assert_eq!(
+            parse_authorized_key(b"ssh-ed25519\n", &mut out),
+            Err(KeyError::WrongAlgorithm)
+        );
+        // A trailing space is eaten by the line trimmer, so this
+        // degenerates to the no-space case above: WrongAlgorithm.
+        assert_eq!(
+            parse_authorized_key(b"ssh-ed25519 \n", &mut out),
+            Err(KeyError::WrongAlgorithm)
+        );
+        // ...and a body that is *only* whitespace the line trimmer
+        // does not eat (it only trims ' ' and '\t'; `trim_ascii_start`
+        // then eats a form feed) is the empty-body refusal.
+        assert_eq!(
+            parse_authorized_key(b"ssh-ed25519 \x0c\n", &mut out),
+            Err(KeyError::Truncated)
+        );
+        // A base64 body that would decode past the fixed 96-byte
+        // scratch buffer: refused as malformed, never truncated into
+        // a shorter key.
+        let mut line = Vec::from(b"ssh-ed25519 ");
+        line.extend(std::iter::repeat_n(b'A', 300));
+        assert_eq!(
+            parse_authorized_key(&line, &mut out),
+            Err(KeyError::NotBase64)
+        );
+        // A valid line parses with *no* trailing newline at all.
+        let blob = key_blob_for(0x66);
+        let mut b64 = [0u8; 200];
+        let n = base64_encode(&blob, true, &mut b64).expect("fits");
+        let mut line = Vec::from(b"ssh-ed25519 ");
+        line.extend_from_slice(&b64[..n]);
+        assert_eq!(parse_authorized_key(&line, &mut out), Ok(()));
+        assert_eq!(out, [0x66; 32]);
+        // The comment tail is opaque: non-printable bytes there are
+        // ignored (never parsed, never logged).
+        let mut commented = line.clone();
+        commented.extend_from_slice(b" \x01\x02\x7f note");
+        assert_eq!(parse_authorized_key(&commented, &mut out), Ok(()));
+        assert_eq!(out, [0x66; 32]);
+    }
+
+    /// Empty hex seed input (the whitespace-only case is covered
+    /// above; this is the raw empty slice).
+    #[test]
+    fn seed_hex_refuses_empty_input() {
+        let mut seed = [0u8; 32];
+        assert_eq!(parse_seed_hex(b"", &mut seed), Err(KeyError::BadHexLength));
+        assert_eq!(
+            parse_seed_hex(b"00", &mut seed),
+            Err(KeyError::BadHexLength)
+        );
+    }
+
+    /// RFC4648 §3.5: a decoder *MAY* reject non-canonical trailing
+    /// bits; ours accepts them — the decoded key bytes are what every
+    /// comparison uses, so there is no ambiguity to exploit. Pinned
+    /// so a future strictness change is a deliberate one.
+    #[test]
+    fn base64_decode_pins_non_canonical_trailing_bits_as_accepted() {
+        let mut canonical = [0u8; 4];
+        let mut non_canonical = [0u8; 4];
+        let a = base64_decode(b"Zg==", &mut canonical).expect("canonical");
+        let b = base64_decode(b"Zh==", &mut non_canonical).expect("non-canonical");
+        assert_eq!(&canonical[..a], &non_canonical[..b]);
+        assert_eq!(&canonical[..a], b"f");
+    }
 }
