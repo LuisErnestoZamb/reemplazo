@@ -560,11 +560,21 @@ fn read_mbi(addr: u64) -> Result<BootInformation<'static>, MbiError> {
     // The spec places the structure below 4 GiB (EBX is 32-bit); reject
     // anything the identity map or sanity bound wouldn't cover. Runs
     // *before* the first read at `addr` — untrusted pointer first.
+    // Audit H2: `check_addr` only bounds the address itself; the first
+    // read below covers `addr..addr+4`, so require the full 4 bytes to
+    // stay inside the identity map (addr == 0xFFFF_FFFF would reach
+    // 0x1_0000_0002 — PML4[1] is absent → #PF before `check_range`).
+    if addr > 0xFFFF_FFFF - 4 {
+        return Err(MbiError::Range(mbi::RangeError::CrossesMap {
+            addr,
+            total: 4,
+        }));
+    }
     mbi::check_addr(addr).map_err(MbiError::Range)?;
 
-    // SAFETY: `check_addr` proved addr ∈ (0, 4 GiB], inside the identity
-    // map built in entry.S; reading 4 bytes there cannot fault and no one
-    // mutates it concurrently.
+    // SAFETY: the guards above proved `addr..addr+4` lies inside the
+    // identity map built in entry.S (≤ 0xFFFF_FFFF); no one mutates it
+    // concurrently (single-core boot, interrupts off).
     let total = unsafe { core::ptr::read_unaligned((addr as *const u8).cast::<u32>()) } as usize;
 
     // `total_size` sanity (8..= mbi::MBI_MAX_BYTES) plus the whole
