@@ -12,6 +12,7 @@
 //! lands (documented in docs/ai-client.md §1 — deliberate, not an
 //! accident).
 
+pub mod ai;
 pub mod editor;
 pub mod screen;
 pub mod tui;

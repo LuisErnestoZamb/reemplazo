@@ -23,6 +23,13 @@ ssh-wire = { path = "../ssh-wire" }
 # adversarial suite (UTF-8 boundary refusals, gap compaction, line-index
 # oracle, undo/redo) live in the crate's docs.
 editorbuf = { path = "../editorbuf" }
+# Chat API wire types (A3 of docs/ai-client.md §2): serde/serde_json
+# request/response/SSE codecs — the reviewed JSON adoptation, official
+# no_std + `alloc` (docs.rs/serde_json), RustSec-clean, `default-features
+# = false` so no std enters ring 0. Rationale and the adversarial suite
+# (exact serialization, truncated/malformed JSON, SSE split torture)
+# live in the crate's docs; review recorded in the A3 commit.
+aiwire = { path = "../aiwire" }
 multiboot2 = { version = "0.28", default-features = false }
 net = { path = "../net" }
 pci = { path = "../pci" }

@@ -590,6 +590,87 @@ pub fn build_get(buf: &mut [u8], host: &str, path: &str) -> Option<usize> {
     build_request(buf, host, path, &[])
 }
 
+/// Assemble `POST <path> HTTP/1.1` with `Host`, `Content-Type`,
+/// `Content-Length: <body.len()>`, the extra headers (each a complete
+/// `Name: value` line), `Connection: close` and the body after the
+/// blank line — returning the total length, `None` when `buf` is too
+/// small (never a partial request). Added for the AI client (A3):
+/// [`build_get`]/[`build_request`] stay byte-identical GETs (their
+/// tests pin that).
+pub fn build_post(
+    buf: &mut [u8],
+    host: &str,
+    path: &str,
+    content_type: &str,
+    body: &[u8],
+    extra_headers: &[&str],
+) -> Option<usize> {
+    const METHOD: &[u8] = b"POST ";
+    const MIDDLE: &[u8] = b" HTTP/1.1\r\nHost: ";
+    const CT: &[u8] = b"\r\nContent-Type: ";
+    const CL: &[u8] = b"\r\nContent-Length: ";
+    const CONN: &[u8] = b"\r\nConnection: close";
+    const END: &[u8] = b"\r\n\r\n";
+    // Content-Length as decimal digits, written straight into the
+    // buffer (no alloc: this crate is `no_std` without `alloc`).
+    let mut digits = [0u8; 20]; // u64::MAX is 20 digits
+    let mut n = body.len();
+    let mut nd = 0usize;
+    loop {
+        digits[nd] = b'0' + (n % 10) as u8;
+        nd += 1;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    let mut total = METHOD
+        .len()
+        .checked_add(path.len())?
+        .checked_add(MIDDLE.len())?
+        .checked_add(host.len())?
+        .checked_add(CT.len())?
+        .checked_add(content_type.len())?
+        .checked_add(CL.len())?
+        .checked_add(nd)?
+        .checked_add(CONN.len())?
+        .checked_add(END.len())?
+        .checked_add(body.len())?;
+    for h in extra_headers {
+        total = total.checked_add(2 + h.len())?; // CRLF + line
+    }
+    let out = buf.get_mut(..total)?;
+    let mut off = 0usize;
+    for part in [
+        METHOD,
+        path.as_bytes(),
+        MIDDLE,
+        host.as_bytes(),
+        CT,
+        content_type.as_bytes(),
+        CL,
+    ] {
+        out[off..off + part.len()].copy_from_slice(part);
+        off += part.len();
+    }
+    for &digit in digits[..nd].iter().rev() {
+        out[off] = digit;
+        off += 1;
+    }
+    out[off..off + CONN.len()].copy_from_slice(CONN);
+    off += CONN.len();
+    for h in extra_headers {
+        out[off..off + 2].copy_from_slice(b"\r\n");
+        out[off + 2..off + 2 + h.len()].copy_from_slice(h.as_bytes());
+        off += 2 + h.len();
+    }
+    out[off..off + END.len()].copy_from_slice(END);
+    off += END.len();
+    out[off..off + body.len()].copy_from_slice(body);
+    off += body.len();
+    Some(off)
+}
+
 /// Value of `name` (ASCII case-insensitive) in a **complete** raw
 /// response head (status line … blank line), with surrounding OWS
 /// trimmed — `None` when absent or the head is malformed. Used to
@@ -622,7 +703,14 @@ pub fn headers_complete(head: &[u8]) -> bool {
 mod tests {
     use super::*;
     use std::format;
+    use std::vec;
     use std::vec::Vec;
+
+    /// Byte-substring search (`slice::contains` is per-element — this
+    /// is the whole-needle form the request assertions need).
+    fn has(hay: &[u8], needle: &[u8]) -> bool {
+        hay.windows(needle.len()).any(|window| window == needle)
+    }
 
     const HEAD: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
 
@@ -975,6 +1063,93 @@ mod tests {
         let progress = parser.feed(b"HTTP/1.1 204\r\n\r\n", &mut out[..]).unwrap();
         assert_eq!(parser.status(), Some(204));
         assert!(progress.complete);
+    }
+
+    #[test]
+    fn build_post_assembles_head_and_body() {
+        let mut buf = [0u8; 512];
+        let body = br#"{"model":"m","messages":[]}"#;
+        let n = build_post(
+            &mut buf,
+            "10.0.2.2:8099",
+            "/v1/chat/completions",
+            "application/json",
+            body,
+            &[],
+        )
+        .expect("fits");
+        let req = &buf[..n];
+        assert!(req.starts_with(b"POST /v1/chat/completions HTTP/1.1\r\nHost: 10.0.2.2:8099\r\n"));
+        assert!(has(req, b"\r\nContent-Type: application/json\r\n"));
+        assert!(has(req, b"\r\nContent-Length: 27\r\n"));
+        assert!(req.ends_with(b"Connection: close\r\n\r\n{\"model\":\"m\",\"messages\":[]}"));
+        // The body sits exactly after the head terminator.
+        let head_end = req
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("terminator")
+            + 4;
+        assert_eq!(&req[head_end..], body);
+        assert!(headers_complete(&req[..head_end]));
+    }
+
+    #[test]
+    fn build_post_content_length_matches_body_exactly() {
+        for len in [0usize, 1, 9, 10, 99, 100, 1234] {
+            let mut buf = [0u8; 4096];
+            let body = vec![b'x'; len];
+            let n = build_post(&mut buf, "h", "/", "text/plain", &body, &[]).expect("4096 fits");
+            let req = &buf[..n];
+            let expected = format!("\r\nContent-Length: {len}\r\n");
+            assert!(
+                has(req, expected.as_bytes()),
+                "len {len}: missing {expected:?}"
+            );
+            assert_eq!(&req[n - len..], &body[..]);
+        }
+    }
+
+    #[test]
+    fn build_post_extra_headers_and_overflow() {
+        let mut buf = [0u8; 512];
+        let n = build_post(
+            &mut buf,
+            "example.com",
+            "/x",
+            "application/json",
+            b"{}",
+            &["User-Agent: reemplazo-ai/0.1"],
+        )
+        .expect("fits");
+        let req = &buf[..n];
+        assert!(has(req, b"\r\nUser-Agent: reemplazo-ai/0.1\r\n"));
+        assert!(req.ends_with(b"User-Agent: reemplazo-ai/0.1\r\n\r\n{}"));
+        // Too-small buffer: `None`, never a partial request.
+        let mut tiny = [0u8; 32];
+        assert_eq!(
+            build_post(
+                &mut tiny,
+                "example.com",
+                "/",
+                "application/json",
+                b"{}",
+                &[]
+            ),
+            None
+        );
+        // A body that cannot fit after a valid head: `None`.
+        let mut small = [0u8; 64];
+        assert_eq!(
+            build_post(
+                &mut small,
+                "example.com",
+                "/long/path",
+                "application/json",
+                &[b'y'; 128],
+                &[]
+            ),
+            None
+        );
     }
 
     #[test]

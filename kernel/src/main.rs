@@ -136,6 +136,17 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
     // then another clean text screen for the shell.
     apps::editor::boot_proof();
 
+    // A3 AI chat: one plain-HTTP POST exchange against xtask's mock
+    // (10.0.2.2:8099 via slirp), JSON parsed with aiwire, the reply
+    // rendered in the chat pane and read back from 0xb8000
+    // (AI_CHAT_OK — between EDITOR_OK and SHELL_OK), then another
+    // clean text screen for the shell. Like the TLS/git/SSH phases it
+    // needs the network stack; without one it is skipped (and the
+    // smoke, which always has a NIC, fails on the missing marker).
+    if let Some(stack) = stack.as_mut() {
+        apps::ai::boot_proof(stack);
+    }
+
     // The shell is the kernel's idle state until a scheduler exists;
     // without a NIC there is nothing to drive, so just park.
     match stack.as_mut() {

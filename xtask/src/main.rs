@@ -14,7 +14,7 @@
 //! (no native macOS build). QEMU prefers a host `qemu-system-x86_64` and
 //! falls back to the same container (Homebrew can't build QEMU on macOS 13).
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio, exit};
@@ -66,6 +66,13 @@ fn monitor_port(root: &Path) -> u16 {
 fn main() {
     let cmd = std::env::args().nth(1).unwrap_or_default();
     let root = repo_root();
+    if cmd == "chat-mock" {
+        // Internal subcommand: the host-backend mock server (spawned
+        // by qemu_invocation, see spawn_chat_mock). Never fails the
+        // caller's argument check.
+        serve_chat_mock(&root);
+        return;
+    }
     let ok = match cmd.as_str() {
         "check" => check(&root),
         "build" => build_kernel(&root),
@@ -118,6 +125,8 @@ fn check(root: &Path) -> bool {
                 "-p",
                 "xtask",
                 "-p",
+                "aiwire",
+                "-p",
                 "git-pktline",
                 "-p",
                 "ssh-wire",
@@ -161,6 +170,8 @@ fn check(root: &Path) -> bool {
                 "test",
                 "-p",
                 "xtask",
+                "-p",
+                "aiwire",
                 "-p",
                 "git-pktline",
                 "-p",
@@ -286,11 +297,170 @@ fn host_qemu() -> bool {
     )
 }
 
-/// `(program, args, container_name)` to boot `iso_path`; `disk`, when
-/// set, is attached as a raw IDE drive (`smoke-install`'s blank image —
-/// it lives beside `os.iso`, so the container sees it at `/iso/<name>`).
-/// Host QEMU first; otherwise build the toolchain image and run in Docker.
-/// `container` is the fixed name used for force-cleanup of stale VMs.
+// ---------------------------------------------------------------------------
+// A3 chat mock (docs/ai-client.md §7, row A3): the guest posts to
+// 10.0.2.2:8099; libslirp maps that onto QEMU's *host* loopback
+// (`sotranslate_out4` in libslirp: guest→gateway connects connect to
+// 127.0.0.1 of the machine QEMU runs on). QEMU runs inside the
+// `reemplazo-tools` container during the smoke, so the mock must be a
+// process in that container — see [`MOCK_LOOP`]. The host-QEMU
+// backend (no host QEMU exists today) gets the same mock as a child
+// process ([`spawn_chat_mock`]) so both paths stay consistent.
+// ---------------------------------------------------------------------------
+
+/// Canned mock chat completion: a complete `HTTP/1.1 200` with
+/// `application/json` and a **computed** `Content-Length` (never
+/// hand-counted), carrying a realistic OpenAI-style completion. The
+/// reply text is byte-identical to `CANNED_REPLY` in
+/// `kernel/src/apps/ai.rs` — duplicated like `DISK_MAGIC`, because
+/// xtask cannot depend on the `no_std` kernel crate.
+fn chat_mock_response() -> Vec<u8> {
+    const BODY: &str = concat!(
+        r#"{"id":"chatcmpl-reemplazo-mock","object":"chat.completion","#,
+        r#""created":1763712000,"model":"reemplazo-mock","#,
+        r#""choices":[{"index":0,"message":{"role":"assistant","#,
+        r#""content":"reemplazo: mock reply ok"},"finish_reason":"stop"}],"#,
+        r#""usage":{"prompt_tokens":12,"completion_tokens":8,"total_tokens":20}}"#
+    );
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n",
+        BODY.len()
+    );
+    let mut response = head.into_bytes();
+    response.extend_from_slice(BODY.as_bytes());
+    response
+}
+
+/// Write `chat-mock-response.txt` into the ISO dir (bind-mounted at
+/// `/iso` in the container, plain file for the host backend). Called
+/// from [`qemu_invocation`], i.e. after `iso()` has wiped the dir (the
+/// `disk.img` precedent) and before the VM starts — so it is never
+/// inside the ISO itself, just beside it.
+fn write_chat_mock(iso_dir: &Path) -> std::io::Result<()> {
+    std::fs::write(iso_dir.join("chat-mock-response.txt"), chat_mock_response())
+}
+
+/// The in-container mock: a **bounded** loop of `nc` one-shot servers
+/// on the container's loopback :8099, backgrounded, then QEMU is
+/// `exec`'d — so QEMU becomes the container's main process and, when
+/// the container stops (`--rm` / `docker rm -f`), every process in it
+/// dies with it: no host-side orphans, which this repo checks with
+/// `ps` after every run. `nc` serves the canned response the moment a
+/// connection is accepted (HTTP lets the server write first; the
+/// guest sends-then-reads), exits per connection when the peer
+/// closes, and `|| true` keeps the loop running through a refused
+/// bind. stdout/stderr → `/dev/null` so the request bytes the guest
+/// sends can never pollute the serial log the markers are read from.
+/// Verified end-to-end (`nc -l -s 127.0.0.1 -p 8099` + delayed and
+/// sequential clients) in the A3 commit.
+const MOCK_LOOP: &str = "for i in 1 2 3 4 5; do \
+     nc -l -s 127.0.0.1 -p 8099 < /iso/chat-mock-response.txt > /dev/null 2>&1 || true; \
+     done & exec qemu-system-x86_64 \"$@\"";
+
+/// The `xtask chat-mock` subcommand (host-QEMU backend): serve
+/// [`chat_mock_response`] on 127.0.0.1:8099 for a bounded number of
+/// connections and a bounded lifetime, so a wedged guest can never
+/// leave this process running on its own. Spawned as a child by
+/// [`qemu_invocation`] and killed in `stop_vm`; also reachable
+/// manually for debugging the kernel's `ai` builtin against a host
+/// VM.
+fn serve_chat_mock(root: &Path) {
+    let file = root.join("target/iso-root/chat-mock-response.txt");
+    let response = match std::fs::read(&file) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("xtask chat-mock: cannot read {}: {e}", file.display());
+            exit(1);
+        }
+    };
+    let listener = match std::net::TcpListener::bind(("127.0.0.1", 8099)) {
+        Ok(listener) => listener,
+        Err(e) => {
+            eprintln!("xtask chat-mock: cannot bind 127.0.0.1:8099: {e}");
+            exit(1);
+        }
+    };
+    if listener.set_nonblocking(true).is_err() {
+        exit(1);
+    }
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut served = 0usize;
+    while served < 5 && Instant::now() < deadline {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                let _ = stream.set_nonblocking(true); // no client can wedge us
+                let _ = stream.write_all(&response);
+                // Drain the request before closing: closing with
+                // unread inbound data sends RST, which can discard the
+                // response on the client side. Bounded either way.
+                let mut buf = [0u8; 512];
+                let drain_deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) => break, // peer finished — clean close
+                        Ok(_) => {}
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            if Instant::now() >= drain_deadline {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                        Err(_) => break,
+                    }
+                }
+                served += 1;
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => {
+                eprintln!("xtask chat-mock: accept failed: {e}");
+                break;
+            }
+        }
+    }
+}
+
+/// Spawn [`serve_chat_mock`] as this xtask's child (host-QEMU
+/// backend). `stderr` inherits so a bind failure is visible; stdout
+/// is silent. Killed in `stop_vm` — the orphan discipline applies to
+/// it as much as to QEMU.
+fn spawn_chat_mock(root: &Path) -> Option<Child> {
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => {
+            eprintln!("xtask: cannot locate self for chat-mock: {e}");
+            return None;
+        }
+    };
+    match Command::new(exe)
+        .arg("chat-mock")
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => Some(child),
+        Err(e) => {
+            eprintln!("xtask: cannot spawn chat-mock: {e}");
+            None
+        }
+    }
+}
+
+/// What to launch: `(program, args, container_name, mock_child)` —
+/// see [`qemu_invocation`].
+type Invocation = (String, Vec<String>, Option<String>, Option<Child>);
+
+/// `(program, args, container_name, mock_child)` to boot `iso_path`;
+/// `disk`, when set, is attached as a raw IDE drive (`smoke-install`'s
+/// blank image — it lives beside `os.iso`, so the container sees it at
+/// `/iso/<name>`). Host QEMU first; otherwise build the toolchain image
+/// and run in Docker. `container` is the fixed name used for
+/// force-cleanup of stale VMs. `mock_child` is the A3 chat mock on the
+/// host backend only (the container backend runs [`MOCK_LOOP`] inside
+/// itself) — every caller must kill it, which `stop_vm` does.
 /// Both backends get an HMP monitor on this checkout's [`monitor_port`]:
 /// host QEMU binds `127.0.0.1` itself, the container publishes its
 /// `0.0.0.0` listener with `-p 127.0.0.1:PORT:PORT`.
@@ -299,7 +469,17 @@ fn qemu_invocation(
     iso_path: &Path,
     container: &str,
     disk: Option<&Path>,
-) -> Option<(String, Vec<String>, Option<String>)> {
+) -> Option<Invocation> {
+    // The A3 mock response must exist before the VM starts: written
+    // after `iso()` wiped the dir (the `disk.img` precedent).
+    let iso_dir = iso_path.parent()?;
+    if let Err(e) = write_chat_mock(iso_dir) {
+        eprintln!(
+            "xtask: cannot write {}: {e}",
+            iso_dir.join("chat-mock-response.txt").display()
+        );
+        return None;
+    }
     let port = monitor_port(root);
     if host_qemu() {
         let iso = iso_path.display().to_string();
@@ -309,12 +489,12 @@ fn qemu_invocation(
             args.push("-drive".into());
             args.push(format!("file={},if=ide,format=raw", d.display()));
         }
-        return Some(("qemu-system-x86_64".into(), args, None));
+        let mock = spawn_chat_mock(root);
+        return Some(("qemu-system-x86_64".into(), args, None, mock));
     }
     if !sh(root, "docker", &["build", "-t", TOOLS_IMAGE, "tools"]) {
         return None;
     }
-    let iso_dir = iso_path.parent()?.display().to_string();
     let mut args: Vec<String> = vec![
         "run".into(),
         "--rm".into(),
@@ -322,12 +502,20 @@ fn qemu_invocation(
         "--name".into(),
         container.into(),
         "-v".into(),
-        format!("{iso_dir}:/iso"),
+        format!("{}:/iso", iso_dir.display()),
         // Publish the monitor to the host loopback (see `qemu_std_args`:
         // QEMU binds the container's 0.0.0.0, `-p` forwards to eth0).
         "-p".into(),
         format!("127.0.0.1:{port}:{port}"),
         TOOLS_IMAGE.into(),
+        // A3 chat mock + QEMU as one container command: `sh -c` runs
+        // the bounded nc loop in the background (it must live in this
+        // container — slirp sends guest→10.0.2.2:8099 to *QEMU's
+        // host* loopback) and `exec`s QEMU with the args below as
+        // "$@" ($0 carries the binary name).
+        "sh".into(),
+        "-c".into(),
+        MOCK_LOOP.into(),
         "qemu-system-x86_64".into(),
     ];
     let monitor = format!("tcp:0.0.0.0:{port},server,nowait");
@@ -339,7 +527,7 @@ fn qemu_invocation(
         args.push("-drive".into());
         args.push(format!("file=/iso/{name},if=ide,format=raw"));
     }
-    Some(("docker".into(), args, Some(container.into())))
+    Some(("docker".into(), args, Some(container.into()), None))
 }
 
 /// Remove a container by name if present (stale VM from a killed session).
@@ -351,11 +539,17 @@ fn rm_container(name: &str) {
         .status();
 }
 
-fn stop_vm(child: &mut Child, container: Option<&str>) {
+fn stop_vm(child: &mut Child, container: Option<&str>, mock: &mut Option<Child>) {
     let _ = child.kill();
     let _ = child.wait();
     if let Some(name) = container {
         rm_container(name);
+    }
+    // The host-backend chat mock (the container backend's mock dies
+    // with its container) — killed on every exit path, no orphans.
+    if let Some(mock) = mock {
+        let _ = mock.kill();
+        let _ = mock.wait();
     }
 }
 
@@ -364,7 +558,7 @@ fn run(root: &Path) -> bool {
         return false;
     }
     let iso_path = root.join("target/iso-root/os.iso");
-    let Some((prog, args, container)) =
+    let Some((prog, args, container, mut mock)) =
         qemu_invocation(root, &iso_path, &vm_container(root, "run"), None)
     else {
         return false;
@@ -383,6 +577,10 @@ fn run(root: &Path) -> bool {
     let status = Command::new(&prog).args(&args).current_dir(root).status();
     if let Some(name) = &container {
         rm_container(name);
+    }
+    if let Some(mock) = mock.as_mut() {
+        let _ = mock.kill();
+        let _ = mock.wait();
     }
     match status {
         Ok(s) if s.success() => true,
@@ -411,7 +609,9 @@ fn run(root: &Path) -> bool {
 /// the VGA text buffer and read back from `0xb8000`), `EDITOR_OK` (A2
 /// editor: scripted insert/newline/delete/undo/redo edits rendered
 /// with the line-number gutter and status bar, read back from
-/// `0xb8000`) — within
+/// `0xb8000`), `AI_CHAT_OK` (A3 chat client: OpenAI-style POST against
+/// the in-container mock, serde_json reply parsed, the conversation
+/// pane read back from `0xb8000`) — within
 /// [`SMOKE_TIMEOUT`]. Then the keyboard milestone:
 /// once `SHELL_OK` matches, connect to QEMU's HMP monitor
 /// ([`monitor_port`]) and type `echo KEYBOARD_OK` key by key with
@@ -428,7 +628,8 @@ fn run(root: &Path) -> bool {
 /// stubs, EOI, timer), the A1 screen layer (cell diff flush into the
 /// text buffer, ratatui backend, full-screen frame readback), the A2
 /// editor (gap buffer + line index edits with undo/redo, viewport frame
-/// readback), the serial
+/// readback), the A3 chat client (serde_json request/response over
+/// `net::http` POST against the mock + chat-pane readback), the serial
 /// shell coming up, or the keyboard path (i8042 bring-up, scancode
 /// decode, input multiplexing) — so it gates every milestone in the
 /// chain.
@@ -436,7 +637,7 @@ fn run(root: &Path) -> bool {
 /// It runs **without a disk**, so the `ata::probe` that sits between
 /// `PCI_OK` and `E1000_OK` stays silent here.
 fn smoke(root: &Path) -> bool {
-    const MARKERS: [&str; 21] = [
+    const MARKERS: [&str; 22] = [
         "BOOT_OK",
         "VGA_OK",
         "MEM_OK",
@@ -456,6 +657,7 @@ fn smoke(root: &Path) -> bool {
         "INT_OK",
         "TUI_OK",
         "EDITOR_OK",
+        "AI_CHAT_OK",
         "SHELL_OK",
         "KEYBOARD_OK",
     ];
@@ -527,7 +729,7 @@ fn boot_assert(
     keyboard: bool,
 ) -> bool {
     let iso_path = root.join("target/iso-root/os.iso");
-    let Some((prog, args, container)) =
+    let Some((prog, args, container, mut mock)) =
         qemu_invocation(root, &iso_path, &vm_container(root, label), disk)
     else {
         return false;
@@ -546,6 +748,12 @@ fn boot_assert(
         Ok(c) => c,
         Err(e) => {
             eprintln!("xtask: cannot start {prog}: {e}");
+            // The host-backend mock was already spawned — kill it on
+            // this exit path too (no orphans).
+            if let Some(mock) = mock.as_mut() {
+                let _ = mock.kill();
+                let _ = mock.wait();
+            }
             return false;
         }
     };
@@ -608,7 +816,7 @@ fn boot_assert(
     }
 
     let passed = next_marker == markers.len();
-    stop_vm(&mut child, container.as_deref());
+    stop_vm(&mut child, container.as_deref(), &mut mock);
 
     if passed {
         println!("{label}: PASS — kernel reached {}", markers.join(" + "));

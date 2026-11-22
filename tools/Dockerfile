@@ -15,4 +15,5 @@ RUN apt-get update \
         mtools \
         dosfstools \
         qemu-system-x86 \
+        netcat-openbsd \
     && rm -rf /var/lib/apt/lists/*

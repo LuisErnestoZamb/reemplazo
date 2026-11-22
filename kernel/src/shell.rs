@@ -176,6 +176,7 @@ fn execute(stack: &mut Stack, line: &str) {
              \x20 resolve <host>    DNS A lookup\n\
              \x20 tui               full-screen TUI demo (Esc quits)\n\
              \x20 edit              in-memory text editor (Esc quits)\n\
+             \x20 ai <message>      chat completion via the mock endpoint\n\
              \x20 halt              park the CPU"
         ),
         "echo" => serial_println!("{rest}"),
@@ -243,6 +244,7 @@ fn execute(stack: &mut Stack, line: &str) {
         }
         "tui" => crate::apps::tui::run(),
         "edit" => crate::apps::editor::run(),
+        "ai" => crate::apps::ai::chat_cmd(stack, rest),
         "halt" => {
             serial_println!("halting.");
             crate::halt();
