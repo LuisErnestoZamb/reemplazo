@@ -78,7 +78,7 @@ All in Rust, all in this workspace:
 ```sh
 cargo xtask check   # fmt + clippy (host and kernel target) + tests + cross-build
 cargo xtask smoke   # build ISO, boot headless, assert serial markers in order
-cargo xtask smoke-install  # same + blank IDE disk attached; assert BLK_OK
+cargo xtask smoke-install  # same + FAT16 IDE disk; assert BLK_OK + FAT_OK
 cargo xtask run     # interactive boot in QEMU (Ctrl-C quits)
 cargo test -p mbi <name>   # single test
 ```
@@ -96,8 +96,9 @@ BOOT_OK → VGA_OK → MEM_OK → ALLOC_OK → RTC_OK → PCI_OK → E1000_OK �
 shell's `echo` builtin printed (an exact match — the keystroke echo
 alone does not count), proving i8042 → scancode decode → line
 discipline → builtin.
-`cargo xtask smoke-install` boots the same ISO with a blank 64 MiB IDE
-disk attached and asserts `BLK_OK` (the ATA PIO probe) instead.
+`cargo xtask smoke-install` boots the same ISO with a 64 MiB FAT16 IDE
+disk attached and asserts `BLK_OK` (the ATA PIO probe) then `FAT_OK` —
+the read-only FAT mount plus a byte-exact `/README.TXT` read — instead.
 
 **Notes:**
 
@@ -151,6 +152,7 @@ Milestones landed so far (see `git log` for details):
 - [ ] git, ssh, browser, AI client + editor
 - [ ] ISO installer + network installer
   - [x] Block layer: ATA PIO driver on the legacy IDE primary channel (`cargo xtask smoke-install` asserts `BLK_OK`)
+  - [x] Filesystem: read-only FAT16 reader, `no_std` + `forbid(unsafe_code)` + zero deps (`smoke-install` asserts `FAT_OK`; `fat/` crate, 47 adversarial host tests)
 
 ## License
 

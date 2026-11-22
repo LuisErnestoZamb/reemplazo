@@ -24,6 +24,13 @@ ssh-wire = { path = "../ssh-wire" }
 # oracle, undo/redo) live in the crate's docs.
 editorbuf = { path = "../editorbuf" }
 multiboot2 = { version = "0.28", default-features = false }
+# Read-only FAT16 (FS1, `FAT_OK`): workspace crate, `no_std` +
+# `forbid(unsafe_code)`, zero dependencies, adversarially host-tested in
+# `fat/tests/hostile.rs`. Adopted as a from-scratch reader under
+# dependency-policy exception (a) — the `fatfs` no_std probe failed
+# (its `core_io` backend's build script rejects modern rustc); the
+# recorded evaluation is `docs/installer.md` §5/§9.1 plus the FS1 commit.
+fat = { path = "../fat" }
 net = { path = "../net" }
 pci = { path = "../pci" }
 rtc = { path = "../rtc" }

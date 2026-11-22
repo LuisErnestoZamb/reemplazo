@@ -6,7 +6,7 @@
 //!   iso     package target image as bootable ISO (GRUB i386-pc)
 //!   smoke   boot the ISO headless; assert serial markers in order,
 //!           then type a command through QEMU's monitor (KEYBOARD_OK)
-//!   smoke-install  boot with a blank IDE disk; assert BLK_OK (installer m1)
+//!   smoke-install  boot with a FAT16 IDE disk; assert BLK_OK + FAT_OK
 //!   run     build + iso + boot interactively (serial on stdio; keys
 //!           can also be injected via the printed monitor address)
 //!
@@ -133,6 +133,8 @@ fn check(root: &Path) -> bool {
                 "pci",
                 "-p",
                 "rtc",
+                "-p",
+                "fat",
                 "--all-targets",
                 "--",
                 "-D",
@@ -177,6 +179,8 @@ fn check(root: &Path) -> bool {
                 "pci",
                 "-p",
                 "rtc",
+                "-p",
+                "fat",
             ],
         )
         && build_kernel(root)
@@ -262,6 +266,17 @@ fn qemu_std_args(iso: &str, monitor: &str) -> Vec<String> {
         "256M".into(),
         "-cdrom".into(),
         iso.into(),
+        // Boot the ISO *first*, then the disk (`d` = first CD-ROM,
+        // `c` = first hard disk in QEMU's legacy order letters). Since
+        // FS1, an attached smoke disk carries a genuine FAT boot sector
+        // at LBA0 (0x55 AA + a valid jump), which SeaBIOS is happy to
+        // execute — verified in the FS1 milestone: with QEMU's default
+        // order the guest hangs in the volume's bootstrap and the ISO
+        // never boots. Pinning the ISO first keeps both smokes on GRUB
+        // while leaving the disk bootable once a smoke reboots from it
+        // without a CD (installer milestone GRUB_OK can pass `order=c`).
+        "-boot".into(),
+        "order=dc".into(),
         "-serial".into(),
         "stdio".into(),
         "-monitor".into(),
@@ -465,11 +480,13 @@ fn smoke(root: &Path) -> bool {
     boot_assert(root, "smoke", &MARKERS, None, true)
 }
 
-/// Installer milestone 1 (`BLK_OK`): build the ISO, create a blank
-/// 64 MiB `target/iso-root/disk.img` carrying the magic pattern at
-/// LBA0 (see `write_disk_image`), boot with the image attached as an
-/// IDE drive, and require the kernel's `BLK_OK` marker — printed only
-/// when `ata::probe` IDENTIFYs a drive *and* LBA0 validates.
+/// Installer milestones 1 + FS1 (`BLK_OK`, `FAT_OK`): build the ISO,
+/// write a 64 MiB `target/iso-root/disk.img` that is a **valid FAT16
+/// volume** carrying the `ata` magic in its boot sector's bootstrap
+/// area (see [`write_disk_image`]), boot with the image attached as an
+/// IDE drive, and require the kernel's `BLK_OK` (the ATA probe accepted
+/// LBA0) *and* `FAT_OK` (the kernel mounted that volume and read
+/// `/README.TXT` back byte for byte) in that order.
 ///
 /// Note the image is created **after** `iso()` (which wipes
 /// `target/iso-root`) and lives inside it, so the container's `/iso`
@@ -483,7 +500,13 @@ fn smoke_install(root: &Path) -> bool {
         eprintln!("xtask: cannot create {}: {e}", disk.display());
         return false;
     }
-    boot_assert(root, "smoke-install", &["BLK_OK"], Some(&disk), false)
+    boot_assert(
+        root,
+        "smoke-install",
+        &["BLK_OK", "FAT_OK"],
+        Some(&disk),
+        false,
+    )
 }
 
 /// Fixed installer-smoke disk size: 64 MiB is plenty for the installer
@@ -495,17 +518,114 @@ const DISK_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
 /// `no_std` kernel crate, so the bytes are duplicated here).
 const DISK_MAGIC: &[u8] = b"reemplazo-disk-v1";
 
-/// Create a zero-filled raw disk image whose LBA0 starts with
-/// [`DISK_MAGIC`] followed by its wrapping-sum checksum byte — exactly
-/// the pattern `ata::probe` validates. The rest of the image is a
-/// sparse hole (reads back as zeros, which is what "blank" means here).
+/// Byte offset of [`DISK_MAGIC`] inside LBA0 — byte-identical to
+/// `MAGIC_OFFSET` in `kernel/src/ata.rs`. LBA0 is a real FAT boot
+/// sector (0..3 jump, 3..10 OEM, 11..62 BPB, 510..512 `55 AA`), so the
+/// magic lives in the bootstrap area FAT never parses.
+const DISK_MAGIC_OFFSET: usize = 62;
+
+/// Wrapping-sum checksum byte that follows [`DISK_MAGIC`] — duplicated
+/// from `kernel/src/ata.rs`'s `magic_checksum`.
+fn magic_checksum() -> u8 {
+    DISK_MAGIC.iter().fold(0u8, |acc, &b| acc.wrapping_add(b))
+}
+
+// --- FAT16 geometry of the smoke disk ------------------------------------
+//
+// Fixed on purpose: `write_disk_image` writes these regions
+// back-to-back (boot, FAT0, FAT1, root, data), and the kernel's
+// `fs::prove` re-derives every offset from the BPB it reads back — so
+// the two sides are a contract, not a coincidence. `FAT_CLUSTERS` is
+// never written to the disk (FAT16 has no cluster-count field); the
+// const asserts below pin the invariants the reader enforces.
+const SECTOR_SIZE: usize = 512;
+const FAT_RESERVED: u32 = 1;
+const FAT_COUNT: u32 = 2;
+const FAT_SECTORS: u32 = 64;
+const FAT_ROOT_ENTRIES: u32 = 512;
+const FAT_ROOT_SECTORS: u32 = FAT_ROOT_ENTRIES * 32 / SECTOR_SIZE as u32;
+const FAT_SPC: u32 = 8; // sectors/cluster → 4 KiB clusters
+const FAT_TOTAL_SECTORS: u32 = (DISK_IMAGE_BYTES / SECTOR_SIZE as u64) as u32;
+const FAT_DATA_START: u32 = FAT_RESERVED + FAT_COUNT * FAT_SECTORS + FAT_ROOT_SECTORS;
+const FAT_CLUSTERS: u32 = (FAT_TOTAL_SECTORS - FAT_DATA_START) / FAT_SPC;
+
+/// The reader refuses volumes outside the FAT16 cluster window, and the
+/// FAT must physically fit its reserved sectors — a geometry change
+/// that breaks either fails the *build*, not a 40 s QEMU run.
+const _: () = assert!(FAT_CLUSTERS >= 4085 && FAT_CLUSTERS <= 65524);
+const _: () = assert!(FAT_CLUSTERS + 2 <= FAT_SECTORS * (SECTOR_SIZE as u32 / 2));
+
+/// Cluster `/README.TXT` starts in (first data cluster).
+const README_CLUSTER: u32 = 2;
+
+/// `/README.TXT`'s content — byte-identical to `README_EXPECTED` in
+/// `kernel/src/fs/mod.rs` (host crates cannot depend on the kernel).
+const README_CONTENT: &[u8] = b"reemplazo filesystem ok\n";
+
+/// Create a 64 MiB raw disk image that is a valid **FAT16 volume**
+/// (superfloppy layout: no partition table, the whole disk is the
+/// volume) containing `/README.TXT`, with [`DISK_MAGIC`] + its checksum
+/// at [`DISK_MAGIC_OFFSET`] in the boot sector — exactly the two-sided
+/// contract `ata::probe` and `kernel/src/fs::prove` validate.
+///
+/// Formatter choice (FS1): written here in xtask rather than shelling
+/// out to `mkfs.fat`, so the image needs no toolchain addition, is
+/// byte-reproducible on any host, and is host-verified by the
+/// `disk_image_is_a_readable_fat16_volume` test below before any VM
+/// runs. Everything not explicitly written stays a sparse zero hole.
 fn write_disk_image(path: &Path) -> std::io::Result<()> {
     let mut f = std::fs::File::create(path)?;
-    let mut sector = [0u8; 512];
-    sector[..DISK_MAGIC.len()].copy_from_slice(DISK_MAGIC);
-    sector[DISK_MAGIC.len()] = DISK_MAGIC.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
-    f.write_all(&sector)?;
-    f.set_len(DISK_IMAGE_BYTES)?;
+    f.set_len(DISK_IMAGE_BYTES)?; // sparse zeros first; the prefix is written below
+
+    // Boot sector: a spec-shaped BPB (every field `fat::Fat16::mount`
+    // validates is set here), magic in the bootstrap area.
+    let mut boot = [0u8; SECTOR_SIZE];
+    boot[0..3].copy_from_slice(&[0xEB, 0x3C, 0x90]); // jump over the BPB
+    boot[3..11].copy_from_slice(b"MSDOS5.0"); // OEM name
+    boot[11..13].copy_from_slice(&(SECTOR_SIZE as u16).to_le_bytes());
+    boot[13] = FAT_SPC as u8;
+    boot[14..16].copy_from_slice(&(FAT_RESERVED as u16).to_le_bytes());
+    boot[16] = FAT_COUNT as u8;
+    boot[17..19].copy_from_slice(&(FAT_ROOT_ENTRIES as u16).to_le_bytes());
+    // total16 (19..21) stays 0: 131072 sectors needs the 32-bit field.
+    boot[21] = 0xF8; // media descriptor (fixed disk)
+    boot[22..24].copy_from_slice(&(FAT_SECTORS as u16).to_le_bytes());
+    boot[24..26].copy_from_slice(&63u16.to_le_bytes()); // sectors/track
+    boot[26..28].copy_from_slice(&255u16.to_le_bytes()); // heads
+    // hidden (28..32) stays 0: the volume starts at LBA0.
+    boot[32..36].copy_from_slice(&FAT_TOTAL_SECTORS.to_le_bytes());
+    boot[36] = 0x80; // drive number
+    boot[38] = 0x29; // extended boot signature → next three fields valid
+    boot[39..43].copy_from_slice(&0x2026_1121u32.to_le_bytes()); // volume id
+    boot[43..54].copy_from_slice(b"REEMPLAZO  ");
+    boot[54..62].copy_from_slice(b"FAT16   ");
+    boot[DISK_MAGIC_OFFSET..DISK_MAGIC_OFFSET + DISK_MAGIC.len()].copy_from_slice(DISK_MAGIC);
+    boot[DISK_MAGIC_OFFSET + DISK_MAGIC.len()] = magic_checksum();
+    boot[510] = 0x55; // signature: the last thing `mount` checks
+    boot[511] = 0xAA;
+    f.write_all(&boot)?;
+
+    // Two identical FATs: media/end-of-chain bookkeeping plus the one
+    // cluster `/README.TXT` occupies, closed with end-of-chain.
+    let mut fat = vec![0u8; FAT_SECTORS as usize * SECTOR_SIZE];
+    fat[0..2].copy_from_slice(&0xFFF8u16.to_le_bytes()); // cluster 0: media
+    fat[2..4].copy_from_slice(&0xFFFFu16.to_le_bytes()); // cluster 1: reserved
+    fat[4..6].copy_from_slice(&0xFFFFu16.to_le_bytes()); // cluster 2: EOC
+    f.write_all(&fat)?;
+    f.write_all(&fat)?;
+
+    // Fixed root directory: `/README.TXT` as a classic 8.3 entry.
+    let mut root = vec![0u8; FAT_ROOT_SECTORS as usize * SECTOR_SIZE];
+    root[0..8].copy_from_slice(b"README  ");
+    root[8..11].copy_from_slice(b"TXT");
+    root[11] = 0x20; // archive
+    root[26..28].copy_from_slice(&(README_CLUSTER as u16).to_le_bytes());
+    root[28..32].copy_from_slice(&(README_CONTENT.len() as u32).to_le_bytes());
+    f.write_all(&root)?;
+
+    // Data region: cluster 2 begins here; only the file's bytes are
+    // written, the rest of the 4 KiB cluster stays sparse zero.
+    f.write_all(README_CONTENT)?;
     f.sync_all()?;
     Ok(())
 }
@@ -715,4 +835,61 @@ fn type_echo_command(root: &Path, deadline: Instant) -> bool {
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Host-side proof of the formatter↔reader contract, before any VM
+    /// runs: the image `write_disk_image` emits must mount through the
+    /// same `fat` crate the kernel uses and yield `/README.TXT`
+    /// byte-for-byte, with the probe magic inside the boot-code area
+    /// and the FAT signature where `mount` looks for it.
+    #[test]
+    fn disk_image_is_a_readable_fat16_volume() {
+        let path = std::env::temp_dir().join(format!(
+            "reemplazo-fs1-{:016x}.img",
+            checkout_hash(&repo_root())
+        ));
+        write_disk_image(&path).expect("disk image written");
+        let data = std::fs::read(&path).expect("disk image readable");
+        assert_eq!(data.len() as u64, DISK_IMAGE_BYTES);
+
+        struct Slice<'a>(&'a [u8]);
+        impl fat::BlockDevice for Slice<'_> {
+            fn size_bytes(&self) -> u64 {
+                self.0.len() as u64
+            }
+            fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), fat::Error> {
+                if !offset.is_multiple_of(512) || buf.is_empty() || !buf.len().is_multiple_of(512) {
+                    return Err(fat::Error::OutOfRange);
+                }
+                let end = offset
+                    .checked_add(buf.len() as u64)
+                    .ok_or(fat::Error::OutOfRange)?;
+                if end > self.0.len() as u64 {
+                    return Err(fat::Error::OutOfRange);
+                }
+                let start = offset as usize;
+                buf.copy_from_slice(&self.0[start..start + buf.len()]);
+                Ok(())
+            }
+        }
+
+        let dev = Slice(&data);
+        let fs = fat::Fat16::mount(&dev).expect("image mounts as FAT16");
+        let mut buf = [0u8; 64];
+        let n = fs.read_file("/README.TXT", &mut buf).expect("README.TXT");
+        assert_eq!(&buf[..n], README_CONTENT);
+
+        // The probe contract: magic + checksum in the bootstrap area,
+        // BPB untouched, signature at the end of the sector.
+        let end = DISK_MAGIC_OFFSET + DISK_MAGIC.len();
+        assert_eq!(&data[DISK_MAGIC_OFFSET..end], DISK_MAGIC);
+        assert_eq!(data[end], magic_checksum());
+        assert_eq!(&data[0..11], b"\xEB<\x90MSDOS5.0");
+        assert_eq!(data[510], 0x55);
+        assert_eq!(data[511], 0xAA);
+    }
 }

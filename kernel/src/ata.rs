@@ -66,12 +66,29 @@ const POLL_LIMIT: u32 = 10_000_000;
 /// Must stay byte-identical to `DISK_MAGIC` in `xtask/src/main.rs`.
 const MAGIC: &[u8] = b"reemplazo-disk-v1";
 
+/// Byte offset of [`MAGIC`] inside LBA0 — the FAT boot sector's
+/// **bootstrap area** (62..510, the region after the BPB that FAT never
+/// parses). Must stay byte-identical to `DISK_MAGIC_OFFSET` in xtask.
+///
+/// Why the probe no longer starts at offset 0: since FS1, LBA0 is a real
+/// FAT boot sector — bytes 0..2 are the jump instruction, 3..10 the OEM
+/// name and 11..62 the BPB, and an arbitrary string there would break
+/// the FAT spec (our own reader refuses a boot sector without a valid
+/// jump and a well-formed BPB). The signature `55 AA` still closes the
+/// sector at 510..512. Relocating the magic keeps probe's semantics
+/// *identical* — same 17 bytes, same wrapping-sum checksum byte right
+/// after them — only the documented offset moved, and both sides of the
+/// contract live in this repo.
+const MAGIC_OFFSET: usize = 62;
+
 /// One drive that answered `IDENTIFY` on the primary channel.
-struct Drive {
+/// `pub(crate)` so `crate::fs` can mount a filesystem over its reads.
+pub(crate) struct Drive {
     /// 0 = master, 1 = slave (drive-select bit in 0x1F6).
     unit: u8,
-    /// Total addressable sectors, LBA28 (IDENTIFY words 60–61).
-    sectors: u32,
+    /// Total addressable sectors, LBA28 (IDENTIFY words 60–61) — the
+    /// capacity the filesystem layer bounds every read against.
+    pub(crate) sectors: u32,
     /// Model name (IDENTIFY words 27–46), ATA byte order decoded.
     model: [u8; 40],
 }
@@ -81,7 +98,7 @@ impl Drive {
     /// into `buf`, which must hold a whole number of sectors.
     /// Returns `false` on any error or poll-timeout — never blocks
     /// forever.
-    fn read_sectors(&self, lba: u32, buf: &mut [u8]) -> bool {
+    pub(crate) fn read_sectors(&self, lba: u32, buf: &mut [u8]) -> bool {
         let count = buf.len() / 512;
         if buf.is_empty() || !buf.len().is_multiple_of(512) || count > 256 {
             return false;
@@ -138,13 +155,14 @@ impl Drive {
 }
 
 /// Probe the primary channel for a drive whose LBA0 starts with the
-/// installer's [`MAGIC`]; on success print the drive line and `BLK_OK`
-/// (machine-checked by `cargo xtask smoke-install`).
+/// installer's [`MAGIC`] (at [`MAGIC_OFFSET`]); on success print the
+/// drive line and `BLK_OK` (machine-checked by `cargo xtask
+/// smoke-install`) and hand the drive back for `crate::fs::prove`.
 ///
-/// Prints **nothing** when no drive answers or the magic is absent:
-/// the main boot smoke has no disk, and its marker chain must stay
-/// untouched (AGENTS.md).
-pub fn probe() {
+/// Prints **nothing** and returns `None` when no drive answers or the
+/// magic is absent: the main boot smoke has no disk, and its marker
+/// chain must stay untouched (AGENTS.md).
+pub(crate) fn probe() -> Option<Drive> {
     for unit in [0u8, 1] {
         let Some(drive) = identify(unit) else {
             continue;
@@ -166,9 +184,10 @@ pub fn probe() {
                 sectors / 2048
             );
             serial_println!("BLK_OK"); // machine-checked by `cargo xtask smoke-install`
-            return;
+            return Some(drive);
         }
     }
+    None
 }
 
 /// `IDENTIFY DEVICE` on `unit` (0 = master, 1 = slave); `None` when no
@@ -289,7 +308,10 @@ fn magic_checksum() -> u8 {
     MAGIC.iter().fold(0u8, |acc, &b| acc.wrapping_add(b))
 }
 
-/// LBA0 must start with [`MAGIC`] followed by its checksum byte.
+/// LBA0 must carry [`MAGIC`] at [`MAGIC_OFFSET`] followed by its
+/// checksum byte. Slice access only (never raw indexing): the offset is
+/// a constant, but the bytes are disk data.
 fn has_magic(sector: &[u8; 512]) -> bool {
-    sector.starts_with(MAGIC) && sector[MAGIC.len()] == magic_checksum()
+    let end = MAGIC_OFFSET + MAGIC.len();
+    sector.get(MAGIC_OFFSET..end) == Some(MAGIC) && sector.get(end) == Some(&magic_checksum())
 }

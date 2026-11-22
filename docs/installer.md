@@ -1,6 +1,7 @@
 # Installer design — bootable ISO + network installer
 
-Status: design (research complete, no code). Scope: the two installer deliverables from
+Status: design (research complete) + **FS1 landed** — read-only FAT16 and its `FAT_OK`
+smoke marker (§8.1). Scope: the two installer deliverables from
 AGENTS.md — *a bootable ISO* and *a network installer that fetches the system over the
 network with the OS's own stack*. Target: 2007 MacBook2,1, GRUB i386-pc boot chain
 (32-bit Apple EFI in BIOS emulation — **no UEFI, no ESP**, see AGENTS.md).
@@ -515,6 +516,44 @@ QEMU-verifiable on this Mac.
 Milestones 1–3 are strictly sequential; 5 and 6 are independent of each other;
 7 depends on 6; 8 depends on 4+5; 9 depends on 6+8.
 
+### 8.1 FS1 landed — read-only FAT16 (`FAT_OK`)
+
+The read-only first slice of milestone 3 is in (branch `m-fs`).
+
+- **Marker.** `cargo xtask smoke-install` asserts `["BLK_OK", "FAT_OK"]`: the kernel mounts the
+  smoke disk's FAT16 volume and reads `/README.TXT` back byte-for-byte (`kernel/src/fs/`, over the
+  new `fat` crate). The main `smoke` runs diskless — `ata::probe` returns `None`, `fs::prove` is
+  never reached, nothing is printed, and its marker chain is untouched.
+- **`fatfs` probe — failed** (the §9.1 spike, run first as ordered). `fatfs` 0.3.6's `no_std` mode
+  is wired through `core_io`, whose `build.rs` maps the *exact rustc commit hash* to a config table
+  and panics with `Unknown compiler version, upgrade core_io?` on Rust 1.98.1 — the crate cannot
+  build for `x86_64-unknown-none` at all. The reader is therefore **from scratch** under
+  dependency-policy exception (a): `fat/` — `#![no_std]`, `#![forbid(unsafe_code)]`, zero
+  dependencies, 47 adversarial host tests (truncated/bogus BPB, missing `55 AA`, non-power-of-two
+  sectors/cluster, FAT12/FAT32 refusals, FAT cycles, cluster beyond the data region, size lying
+  beyond the chain, root-region overrun, LFN checksum/sequence/cluster-field rejection, `..`
+  traversal, non-existent path). MIT, maintained crates.io presence, and `hadris-fat` (an active
+  `no_std` FAT library that appeared after §5 was written) were noted but **not adopted**: the
+  milestone's dependency policy admits no crate besides `fatfs`.
+- **Formatter.** A ~100-line FAT16 formatter inside `xtask` itself (fixed 64 MiB geometry: 1
+  reserved sector, 2 × 64-sector FATs, 512 root entries, 8 sectors/cluster → 16363 clusters, inside
+  the FAT16 window). Chosen over `mkfs.fat` in the tools image because it is byte-reproducible on
+  any host and adds no toolchain step; `xtask`'s own host test mounts the image it just wrote
+  through the same `fat` crate *before* any VM runs. (`dosfstools` and `mtools` are already in
+  `tools/Dockerfile`, so `mkfs.fat` remains the drop-in fallback for a different geometry.)
+- **LBA0 magic relocation.** The probe magic moved from offset 0 to **62** — the boot sector's
+  bootstrap area — in *both* `kernel/src/ata.rs` (`MAGIC_OFFSET`) and `xtask`
+  (`DISK_MAGIC_OFFSET`). Offsets 0..62 are the jump, OEM name and BPB a real FAT boot sector must
+  carry, so a magic string there would break the spec (and our own reader refuses it). Probe
+  semantics are unchanged: same 17 bytes, same wrapping-sum checksum byte immediately after.
+- **Boot order.** A valid `55 AA` at LBA0 makes the disk genuinely bootable, and with QEMU's
+  default order SeaBIOS executes the volume's bootstrap so the ISO never boots *(verified in this
+  milestone: a `jmp $` at offset 62 hangs the guest)*. The smokes now pin `-boot order=dc`
+  (CD-ROM first, disk second).
+
+Still open for milestone 3 proper: the FAT32 write path and the GPT wrapper from milestone 2, both
+blocked on the ATA write milestone.
+
 ---
 
 ## 9. Open questions / risks
@@ -522,7 +561,9 @@ Milestones 1–3 are strictly sequential; 5 and 6 are independent of each other;
 1. **`fatfs` without `alloc` on `x86_64-unknown-none`** — highest technical risk;
    spike first (milestone 3). Fallback: enable the kernel's first bump allocator for
    FAT caches, or drop to a minimal FAT16 writer of our own (small, but then `fatfs`
-   tooling parity is lost).
+   tooling parity is lost). ***Resolved by the FS1 probe: the spike failed — `core_io`'s
+   build script rejects modern rustc — so the fallback (a from-scratch reader) is what
+   landed, see §8.1.***
 2. **Second TLS root** (only if we move to GitHub Releases) — fork-vs-local-verifier
    decision (§6.2); both bounded, neither urgent for v1.
 3. **`guestfwd` vs slirp's `10.0.2.2`-is-host special case** — confirm in milestone 6
