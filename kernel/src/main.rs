@@ -145,7 +145,7 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
         stack.plain_get_smoke(github_ip, "github.com"); // TCP_OK
         tls::https_smoke(stack, github_ip, "github.com"); // TLS_OK + HTTP_OK
         git::ls_remote(stack, github_ip); // GIT_LSREMOTE_OK
-        ssh::kexinit_smoke(stack, github_ip); // SSH_KEXINIT_OK
+        ssh::kex_smoke(stack, github_ip); // SSH_KEXINIT_OK + SSH_KEX_OK
     }
 
     test_interrupts();
