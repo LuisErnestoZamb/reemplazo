@@ -274,10 +274,10 @@ pub struct LeaseInfo {
 /// Everything the stack lives in, `const`-constructible for a
 /// `static mut` (the same idiom as the TLS record buffers; measured
 /// sizes in docs/smoltcp-eval.md §1.6 — ~11 KiB, plus the second,
-/// third, fourth and fifth TCP pairs the sequential smoke connections
-/// need ≈ +30 KiB).
+/// third, fourth, fifth, sixth and seventh TCP pairs the sequential
+/// smoke connections need ≈ +46 KiB).
 pub struct Storage {
-    pub slots: [SocketStorage<'static>; 8],
+    pub slots: [SocketStorage<'static>; 10],
     /// First connection (the plain-HTTP proof).
     pub tcp_rx: [u8; 4096],
     pub tcp_tx: [u8; 4096],
@@ -297,6 +297,15 @@ pub struct Storage {
     /// same TIME-WAIT reason — each sequential connection needs its own.
     pub tcp5_rx: [u8; 4096],
     pub tcp5_tx: [u8; 4096],
+    /// Sixth connection (browser fetch, milestone B1): the plain-HTTP
+    /// redirect hop (local port 49164) — intermediate hops `abort()`
+    /// (RST, no TIME-WAIT) so this socket recycles across plain hops.
+    pub tcp6_rx: [u8; 4096],
+    pub tcp6_tx: [u8; 4096],
+    /// Seventh connection (browser fetch, milestone B1): the TLS hop
+    /// (local port 49165), recycled the same way between redirect hops.
+    pub tcp7_rx: [u8; 4096],
+    pub tcp7_tx: [u8; 4096],
     pub icmp_rx_pkts: [icmp::PacketMetadata; 1],
     pub icmp_rx: [u8; 256],
     pub icmp_tx_pkts: [icmp::PacketMetadata; 1],
@@ -308,7 +317,7 @@ pub struct Storage {
 impl Storage {
     pub const fn new() -> Self {
         Storage {
-            slots: [SocketStorage::EMPTY; 8],
+            slots: [SocketStorage::EMPTY; 10],
             tcp_rx: [0; 4096],
             tcp_tx: [0; 4096],
             tcp2_rx: [0; 4096],
@@ -319,6 +328,10 @@ impl Storage {
             tcp4_tx: [0; 4096],
             tcp5_rx: [0; 4096],
             tcp5_tx: [0; 4096],
+            tcp6_rx: [0; 4096],
+            tcp6_tx: [0; 4096],
+            tcp7_rx: [0; 4096],
+            tcp7_tx: [0; 4096],
             icmp_rx_pkts: [icmp::PacketMetadata::EMPTY; 1],
             icmp_rx: [0; 256],
             icmp_tx_pkts: [icmp::PacketMetadata::EMPTY; 1],
@@ -346,6 +359,10 @@ pub struct Stack {
     pub tcp4_handle: SocketHandle,
     /// AI chat POST against the mock (A3).
     pub tcp5_handle: SocketHandle,
+    /// Browser fetch (B1): plain-HTTP redirect hop, local port 49164.
+    pub tcp6_handle: SocketHandle,
+    /// Browser fetch (B1): TLS hop, local port 49165.
+    pub tcp7_handle: SocketHandle,
     pub icmp_handle: SocketHandle,
     pub dns_handle: SocketHandle,
     /// Added only after PING_OK (R7 — see module docs).
@@ -377,6 +394,10 @@ impl Stack {
             tcp4_tx,
             tcp5_rx,
             tcp5_tx,
+            tcp6_rx,
+            tcp6_tx,
+            tcp7_rx,
+            tcp7_tx,
             icmp_rx_pkts,
             icmp_rx,
             icmp_tx_pkts,
@@ -417,6 +438,14 @@ impl Stack {
             tcp::SocketBuffer::new(&mut tcp5_rx[..]),
             tcp::SocketBuffer::new(&mut tcp5_tx[..]),
         ));
+        let tcp6_handle = sockets.add(tcp::Socket::new(
+            tcp::SocketBuffer::new(&mut tcp6_rx[..]),
+            tcp::SocketBuffer::new(&mut tcp6_tx[..]),
+        ));
+        let tcp7_handle = sockets.add(tcp::Socket::new(
+            tcp::SocketBuffer::new(&mut tcp7_rx[..]),
+            tcp::SocketBuffer::new(&mut tcp7_tx[..]),
+        ));
         let icmp_handle = sockets.add(icmp::Socket::new(
             icmp::PacketBuffer::new(&mut icmp_rx_pkts[..], &mut icmp_rx[..]),
             icmp::PacketBuffer::new(&mut icmp_tx_pkts[..], &mut icmp_tx[..]),
@@ -428,6 +457,8 @@ impl Stack {
             tcp3_handle,
             tcp4_handle,
             tcp5_handle,
+            tcp6_handle,
+            tcp7_handle,
         ] {
             // With `socket-tcp-reno` enabled Reno is already the
             // default; setting it documents the choice (cubic is f64
@@ -449,6 +480,8 @@ impl Stack {
             tcp3_handle,
             tcp4_handle,
             tcp5_handle,
+            tcp6_handle,
+            tcp7_handle,
             icmp_handle,
             dns_handle,
             dhcp_handle: None,
