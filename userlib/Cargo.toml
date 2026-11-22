@@ -1,0 +1,10 @@
+[package]
+name = "userlib"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+# no_std, no libc, no dependencies beyond core. The ELF of the first user
+# process links this crate; every syscall goes through `int 0x80` (DPL3 gate
+# at vector 128, see docs/syscall-abi.md).
+[dependencies]

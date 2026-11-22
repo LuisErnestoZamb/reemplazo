@@ -49,6 +49,7 @@ mod ssh;
 mod sshd;
 mod tls;
 mod usb;
+mod userland;
 mod vga;
 
 // The network chain runs on smoltcp (docs/smoltcp-eval.md — M2):
