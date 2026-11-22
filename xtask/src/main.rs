@@ -184,6 +184,8 @@ fn check(root: &Path) -> bool {
                 "-p",
                 "xtask",
                 "-p",
+                "ahci-wire",
+                "-p",
                 "aiwire",
                 "-p",
                 "git-pktline",
@@ -245,6 +247,8 @@ fn check(root: &Path) -> bool {
                 "test",
                 "-p",
                 "xtask",
+                "-p",
+                "ahci-wire",
                 "-p",
                 "aiwire",
                 "-p",
@@ -782,6 +786,7 @@ fn qemu_invocation(
     iso_path: &Path,
     container: &str,
     disks: &[&Path],
+    ahci_disks: &[&Path],
 ) -> Option<Invocation> {
     // The A3 mock response and the I2 payload response must exist
     // before the VM starts: written after `iso()` wiped the dir (the
@@ -806,6 +811,21 @@ fn qemu_invocation(
         for d in disks {
             args.push("-drive".into());
             args.push(format!("file={},if=ide,format=raw", d.display()));
+        }
+        // AHCI disks: one `ich9-ahci` controller, each disk on its own
+        // port (bus 1..) — the MacBook's real transport.
+        if !ahci_disks.is_empty() {
+            args.push("-device".into());
+            args.push("ich9-ahci,id=sata".into());
+        }
+        for (i, d) in ahci_disks.iter().enumerate() {
+            args.push("-drive".into());
+            args.push(format!(
+                "file={},if=none,id=ahci{i},format=raw",
+                d.display()
+            ));
+            args.push("-device".into());
+            args.push(format!("ide-hd,drive=ahci{i},bus=sata.{}", i + 1));
         }
         let mock = spawn_chat_mock(root);
         return Some(("qemu-system-x86_64".into(), args, None, mock));
@@ -845,6 +865,17 @@ fn qemu_invocation(
         let name = d.file_name()?.to_str()?;
         args.push("-drive".into());
         args.push(format!("file=/iso/{name},if=ide,format=raw"));
+    }
+    if !ahci_disks.is_empty() {
+        args.push("-device".into());
+        args.push("ich9-ahci,id=sata".into());
+    }
+    for (i, d) in ahci_disks.iter().enumerate() {
+        let name = d.file_name()?.to_str()?;
+        args.push("-drive".into());
+        args.push(format!("file=/iso/{name},if=none,id=ahci{i},format=raw"));
+        args.push("-device".into());
+        args.push(format!("ide-hd,drive=ahci{i},bus=sata.{}", i + 1));
     }
     Some(("docker".into(), args, Some(container.into()), None))
 }
@@ -941,7 +972,7 @@ fn run(root: &Path) -> bool {
     }
     let iso_path = root.join("target/iso-root/os.iso");
     let Some((prog, args, container, mut mock)) =
-        qemu_invocation(root, &iso_path, &vm_container(root, "run"), &[])
+        qemu_invocation(root, &iso_path, &vm_container(root, "run"), &[], &[])
     else {
         return false;
     };
@@ -1094,18 +1125,28 @@ fn smoke(root: &Path) -> bool {
     if !iso(root) {
         return false;
     }
-    boot_assert(root, "smoke", &MARKERS, SMOKE_TIMEOUT, &[], true)
+    boot_assert(root, "smoke", &MARKERS, SMOKE_TIMEOUT, &[], &[], true)
 }
 
 /// Installer milestones 1 + FS1 + FS2 + **I1** + **I2** (`BLK_OK`,
-/// `FAT_OK`, `FS_WRITE_OK`, `INST_OK`, `NETINST_OK`): build the ISO, then write **two** 64 MiB
-/// images into `target/iso-root` (after `iso()` wiped it): `disk.img`,
-/// a valid FAT16 *source* volume ([`write_disk_image`]), and
-/// `target.img`, a blank disk carrying only the wipe-marker magic
-/// ([`write_target_image`]). Boot with both attached as IDE drives —
-/// source first (master, unit 0), target second (slave, unit 1), the
-/// order `ata::probe`/`ata::probe_target` enumerate — and require the
-/// kernel's `BLK_OK` (ATA probe accepted LBA0), `FAT_OK` (mounted the
+/// `FAT_OK`, `FS_WRITE_OK`, `INST_OK`, `NETINST_OK`) plus the AHCI
+/// probe (`AHCI_OK`): build the ISO, then write **two** 64 MiB images
+/// into `target/iso-root` (after `iso()` wiped it): `disk.img`, a valid
+/// FAT16 *source* volume ([`write_disk_image`]), and `target.img`, a
+/// blank disk carrying only the wipe-marker magic
+/// ([`write_target_image`]). A **third** image, `disk-ahci.img`, is a
+/// byte copy of the source volume and is attached through QEMU's AHCI
+/// controller (`-device ich9-ahci,id=sata` + `-drive if=none` +
+/// `-device ide-hd,bus=sata.1`) — the MacBook's ICH7 transport, which
+/// the legacy PIO driver cannot reach; it is the additive `AHCI_OK`
+/// proof (IDENTIFY + LBA0 read + magic) and does not change which disk
+/// the FS/GPT/install proofs use.
+///
+/// Boot with the two IDE disks — source first (master, unit 0), target
+/// second (slave, unit 1), the order `ata::probe`/`ata::probe_target`
+/// enumerate — and require the kernel's `BLK_OK` (ATA probe accepted
+/// LBA0), `AHCI_OK` (the AHCI controller found the same volume's copy
+/// through IDENTIFY + LBA0), `FAT_OK` (mounted the
 /// source volume, `/README.TXT` byte-exact), `FS_WRITE_OK` (wrote
 /// `/RESULT.TXT`, re-mounted from scratch, read back with README
 /// re-checked) and `INST_OK` (the full install flow on the *target*:
@@ -1136,6 +1177,7 @@ fn smoke_install(root: &Path) -> bool {
     }
     let disk = root.join("target/iso-root/disk.img");
     let target = root.join("target/iso-root/target.img");
+    let ahci_disk = root.join("target/iso-root/disk-ahci.img");
     if let Err(e) = write_disk_image(&disk) {
         eprintln!("xtask: cannot create {}: {e}", disk.display());
         return false;
@@ -1144,12 +1186,25 @@ fn smoke_install(root: &Path) -> bool {
         eprintln!("xtask: cannot create {}: {e}", target.display());
         return false;
     }
+    // The same FAT16 source volume, byte for byte, attached through the
+    // AHCI controller: the driver's IDENTIFY + LBA0 read must find the
+    // magic the IDE disk carries (the additive `AHCI_OK` proof).
+    if let Err(e) = std::fs::copy(&disk, &ahci_disk) {
+        eprintln!(
+            "xtask: cannot create {} from {}: {e}",
+            ahci_disk.display(),
+            disk.display()
+        );
+        return false;
+    }
     let disks: [&Path; 2] = [&disk, &target];
+    let ahci_disks: [&Path; 1] = [&ahci_disk];
     if !boot_assert(
         root,
         "smoke-install",
         &[
             "BLK_OK",
+            "AHCI_OK",
             "FAT_OK",
             "FS_WRITE_OK",
             "FS_TREE_OK",
@@ -1160,6 +1215,7 @@ fn smoke_install(root: &Path) -> bool {
         ],
         INSTALL_TIMEOUT,
         &disks,
+        &ahci_disks,
         false,
     ) {
         return false;
@@ -2077,11 +2133,17 @@ fn boot_assert(
     markers: &[&str],
     timeout: Duration,
     disks: &[&Path],
+    ahci_disks: &[&Path],
     keyboard: bool,
 ) -> bool {
     let iso_path = root.join("target/iso-root/os.iso");
-    let Some(invocation) = qemu_invocation(root, &iso_path, &vm_container(root, label), disks)
-    else {
+    let Some(invocation) = qemu_invocation(
+        root,
+        &iso_path,
+        &vm_container(root, label),
+        disks,
+        ahci_disks,
+    ) else {
         return false;
     };
     drive_vm(root, label, markers, timeout, keyboard, invocation)

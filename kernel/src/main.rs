@@ -19,6 +19,7 @@ extern crate alloc;
 #[macro_use]
 mod serial;
 
+mod ahci;
 mod apps;
 mod ata;
 mod browser;
@@ -125,43 +126,66 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
     // re-mounts from scratch and reads it back (plus a README re-check).
     // No drive → `prove` never runs and nothing at all is printed (the
     // diskless neutrality the main smoke requires).
-    // The source disk (FS1/FS2's `disk.img`): probed once, kept for
-    // the offline proof *and* the network installer at the end of the
-    // boot chain (I2 needs the NIC, which is not up yet here).
-    let source_drive = crate::ata::probe();
+    // The source disk (FS1/FS2's `disk.img`): probed once per transport,
+    // kept for the offline proof *and* the network installer at the end
+    // of the boot chain (I2 needs the NIC, which is not up yet here).
+    let ide_drive = crate::ata::probe(); // BLK_OK — legacy primary channel
+    // AHCI milestone: the same probe on the SATA controller (PCI class
+    // 01h/06h/01h). Prints `AHCI_OK` only when an AHCI-attached disk
+    // carries the installer magic; silent with no controller (the main
+    // smoke) or no marked disk. On the real MacBook this is the *only*
+    // disk path, so it also serves as the fallback source below.
+    let ahci_drive = crate::ahci::probe(&scan); // AHCI_OK — SATA/AHCI port
+    // The block layer both drivers sit behind (`ata::Disk`): IDE first,
+    // byte-identical to the pre-AHCI history; AHCI only when the legacy
+    // channel found nothing (the smoke-install VM has both, so its
+    // FS/GPT/install proofs keep running on the IDE disk as before).
+    // S5's key files are read **here**, before the IDE drive is moved
+    // into that enum: a disk carrying a host key seed + authorized_keys
+    // turns this boot into an sshd, one carrying only a client seed
+    // makes it run the two-VM probe client. Both reads are silent when
+    // the files are absent — the installer smoke's disk (README only)
+    // and the diskless `smoke` are completely neutral. The keys live on
+    // the **IDE** volume (`smoke-ssh` attaches no AHCI disk), so this
+    // read stays on the IDE driver.
+    let mut sshd_config = None;
+    let mut probe_seed = None;
+    if let Some(drive) = ide_drive.as_ref() {
+        sshd_config = crate::keyfile::server_config(drive);
+        if sshd_config.is_none() {
+            probe_seed = crate::keyfile::client_seed(drive);
+        }
+    }
+    let source_disk = ide_drive
+        .map(ata::Disk::Ide)
+        .or_else(|| ahci_drive.map(ata::Disk::ahci));
     // The install target is probed **once, here** — before either
     // proof runs: the first install rewrites LBA0 (the protective
     // MBR), which is where the `reemplazo-target-v1` wipe marker
     // lives, so re-probing after `INST_OK` could never find it again.
     // No source → never probed; no marked target → `None`, zero
     // output (the diskless/single-disk neutrality both proofs keep).
-    let target_drive = source_drive
-        .as_ref()
-        .and_then(|drive| crate::ata::probe_target(drive.unit()));
-    if let Some(drive) = source_drive.as_ref() {
-        crate::fs::prove(drive); // FAT_OK + FS_WRITE_OK — or `FATAL: fs:` + halt
+    // The target is looked for on the *same* transport as the source:
+    // a marked disk on the other controller is not silently picked up.
+    let target_disk = match source_disk.as_ref() {
+        Some(ata::Disk::Ide(drive)) => crate::ata::probe_target(drive.unit()).map(ata::Disk::Ide),
+        Some(ata::Disk::Ahci(disk)) => {
+            crate::ahci::probe_target(&scan, Some(disk.port())).map(ata::Disk::ahci)
+        }
+        None => None,
+    };
+    if let Some(disk) = source_disk.as_ref() {
+        crate::fs::prove(disk); // FAT_OK + FS_WRITE_OK — or `FATAL: fs:` + halt
         // Installer I1 (docs/installer.md §8.3): GPT + format p2 +
         // payload copy + byte-exact re-read → INST_OK. Silent when no
         // *marked* target disk is attached (single-disk and diskless
         // boots print nothing extra); with one, every failure is
         // `FATAL: install:` + halt.
-        crate::install::prove(drive, target_drive.as_ref(), &payloads);
+        crate::install::prove(disk, target_disk.as_ref(), &payloads);
     }
 
-    // S5 (docs/git-ssh-deps.md §B.4 row S5): a disk carrying a host key
-    // seed + authorized_keys turns this boot into an sshd; a disk
-    // carrying only a client seed makes it run the two-VM probe client.
-    // Both reads are silent when the files are absent — the installer
-    // smoke's disk (README only) and the diskless `smoke` are
-    // completely neutral (no listener, no probe, no line).
-    let mut sshd_config = None;
-    let mut probe_seed = None;
-    if let Some(drive) = source_drive.as_ref() {
-        sshd_config = crate::keyfile::server_config(drive);
-        if sshd_config.is_none() {
-            probe_seed = crate::keyfile::client_seed(drive);
-        }
-    }
+    // S5 (docs/git-ssh-deps.md §B.4 row S5): the two key-file reads ran
+    // above, before the IDE drive entered the block enum.
 
     // QEMU's e1000 first (byte-identical history: on a machine with
     // an e1000 the sky2 probe never even runs), then the MacBook's
@@ -203,7 +227,7 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
         // want/deepen=1/done → raw pack → `git-pack` decode + tree
         // walk (GIT_FETCH_OK), then — only with a disk attached — the
         // FAT16 checkout + re-mount read-back (GIT_CHECKOUT_OK).
-        git_fetch::fetch(stack, github_ip, head, source_drive.as_ref());
+        git_fetch::fetch(stack, github_ip, head, source_disk.as_ref());
         ssh::kex_smoke(stack, github_ip); // SSH_KEXINIT_OK + SSH_KEX_OK
         // S5: the client VM's half of the two-VM proof — connect to the
         // peer sshd through slirp → hostfwd, authenticate, exec.
@@ -297,7 +321,7 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
     // NETINST_OK. Gated on the target found above (probed only when
     // the source disk exists) — silently skipped otherwise, so the
     // diskless main smoke's marker chain stays untouched.
-    if let (Some(stack), Some(target)) = (stack.as_mut(), target_drive.as_ref()) {
+    if let (Some(stack), Some(target)) = (stack.as_mut(), target_disk.as_ref()) {
         crate::install::netprove(stack, Some(target), &payloads);
     }
 

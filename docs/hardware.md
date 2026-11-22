@@ -906,6 +906,136 @@ progress), no serial port. If our OS is running on the MacBook, the only way
 back is the **physical power button**. Only run `grub-reboot` when someone is
 physically near the machine, or after sky2+sshd land (then our OS is reachable
 over the network).
+---
+
+## Section 4 — AHCI (SATA): the MacBook ICH7 disk path (landed)
+
+Milestone `AHCI_OK`. Driver: `kernel/src/ahci.rs` (MMIO + DMA glue) over
+the `ahci-wire` crate (registers, FIS, command/PRDT layouts, geometry,
+IDENTIFY decode — `no_std`, `forbid(unsafe_code)`, 27 adversarial host
+tests). Every offset/bit below is cited from the AHCI 1.3.1 spec and
+cross-checked against QEMU 10.0.13's `hw/ide/ahci.c`
+(`ahci-internal.h`); nothing here is remembered.
+
+### 4.1 Where the controller is, and what QEMU models
+
+- **Binding rule**: PCI class `01h` (mass storage), sub-class `06h`
+  (SATA), programming interface `01h` (AHCI) — the PCI Local Bus Spec
+  class-code table. The driver binds by *function*, not by vendor/device
+  ID: the ICH7's SATA device ID varies with configuration, and firmware
+  (SeaBIOS on QEMU, Apple EFI/BIOS emulation on the MacBook) assigns the
+  BARs.
+- **ABAR = BAR5** (config offset `0x24`), a **32-bit memory** BAR
+  (AHCI 1.3.1 §2.1.8; Linux `libahci` maps PCI BAR 5 as
+  `AHCI_PCI_BAR`). The driver reads the BAR — it never hardcodes an
+  address — masks its flag bits (`pci::mem_bar_address`), and refuses
+  one above 4 GiB (outside `entry.S`'s identity map) rather than
+  faulting.
+- **QEMU model**: the smokes run QEMU's `ich9-ahci` on the default
+  i440fx machine:
+
+  ```
+  -device ich9-ahci,id=sata
+  -drive file=...,if=none,id=ahci0,format=raw
+  -device ide-hd,drive=ahci0,bus=sata.1
+  ```
+
+  Port `sata.1` is AHCI port index 1, which exercises non-zero port
+  arithmetic. Measured on the smoke (QEMU 10.0.13, `reemplazo-tools`):
+  ABAR `0xfebf1000`, `CAP 0xc0141f05` (32 command slots,
+  S64A/NCQ/AHCI bits set), `PI 0x0000003f` (6 implemented ports),
+  `VS 0x10000` (AHCI 1.0), disk `QEMU HARDDISK` 131072 sectors
+  (64 MiB) at port 1.
+- **The real machine**: the MacBook2,1's 120 GB SATA disk hangs off the
+  ICH7 south bridge in **AHCI** mode, which is exactly why the legacy
+  IDE driver (`ata.rs`, ports 0x1F0/0x3F6) cannot see it. Real-hardware
+  validation of the sequence below (PxSIG/PxSSTS values, COMRESET
+  timing, the ICH7's CAP.NCS/PI) is **pending**; QEMU is the only
+  executed test bed so far.
+
+### 4.2 Register summary used (AHCI 1.3.1 §3)
+
+| Register | Offset | Use here |
+|---|---|---|
+| `CAP` | `0x00` | `CAP.NCS[12:8]` = command slots − 1; `CAP.S64A[31]` (informational) |
+| `GHC` | `0x04` | `GHC.AE[31]` = 1 (AHCI enable); read back as a write-path check |
+| `IS` | `0x08` | not used (interrupts stay masked; polling only) |
+| `PI` | `0x0C` | one bit per implemented port |
+| `VS` | `0x10` | printed (version) |
+| Port *n* window | `0x100 + 0x80·n` | (§3.3) |
+| `PxCLB/PxCLBU` | `+0x00/+0x04` | command-list physical address (1 KiB aligned) |
+| `PxFB/PxFBU` | `+0x08/+0x0C` | received-FIS physical address (256 B aligned) |
+| `PxIS` | `+0x10` | write-1-to-clear status; `TFES[30]`, `HBFS[29]`, `HBDS[28]`, `IFS[27]`, `INFS[26]`, `OFS[24]`, `IPMS[23]` = failure |
+| `PxCMD` | `+0x18` | `ST[0]`, `SUD[1]`, `POD[2]`, `FRE[4]`, `CCS[12:8]`, `FR[14]`, `CR[15]` |
+| `PxTFD` | `+0x20` | status `[7:0]` (`ERR[0]`, `DRQ[3]`, `BSY[7]`), error `[15:8]` |
+| `PxSIG` | `+0x24` | `0x00000101` = ATA drive (ATAPI `0xEB140101` is skipped) |
+| `PxSSTS` | `+0x28` | `DET[3:0]` = 3 ⇒ device present, PHY up |
+| `PxSCTL` | `+0x2C` | `DET=1` ⇒ COMRESET, then `DET=0` |
+| `PxSERR` | `+0x30` | write-1-to-clear at bring-up |
+| `PxCI` | `+0x38` | one bit per command slot — the command doorbell |
+
+Port command sequence (AHCI 1.3.1 §10.5.1 COMRESET, §10.6.1 start):
+if `DET ≠ 3`, assert `PxSCTL.DET = 1` for ≥ 1 ms (one PIT tick,
+10 ms, since interrupts are armed before the PCI scan), clear it, wait
+for `DET = 3`; then clear `ST` and wait `CR = 0`, clear `FRE` and wait
+`FR = 0` (both bounded), program `PxCLB/PxFB`, clear `PxIS/PxSERR`, set
+`SUD|POD`, set `FRE` and wait `FR`, set `ST` and wait `CR`. Every wait
+is a bounded spin (20 M iterations), so a wedged port fails the probe
+instead of hanging boot.
+
+### 4.3 Commands, DMA and coherency
+
+- **Command list**: one 4 KiB frame, 32 headers of 32 bytes
+  (AHCI 1.3.1 §4.2.1). Only slot 0 is used (one command in flight);
+  header dword 0 = `CFL[4:0]` (5 for a 20-byte H2D FIS) + `W[6]` +
+  `PRDTL[31:16]`, dwords 2/3 = command-table address.
+- **Command table**: `CFIS` at `+0x00` (the 20-byte Register Host to
+  Device FIS, SATA 3.2 §10.3.1), `PRDT` at `+0x80` with one 16-byte
+  entry per 4 KiB data frame (§4.3): `DBA/DBAU` (low/high 32 bits),
+  reserved, `DBC[21:0] = bytes − 1`, `I[31]` on the last entry.
+  Scatter/gather is per-frame, so **no physical contiguity is assumed**
+  — the frame allocator's runs need not be adjacent.
+- **Commands**: `IDENTIFY DEVICE` `0xEC` (ATA8-ACS2 §7.16; a
+  PIO-protocol command whose 512 bytes the HBA still moves through the
+  PRDT — QEMU `ahci_pio_transfer()`, and how libahci issues it), then
+  LBA48 `READ DMA EXT` `0x25` / `WRITE DMA EXT` `0x35` (§7.20/§7.62).
+  The caller's 1..=256-sector contract (the IDE driver's) is split into
+  two 128-sector (64 KiB, 16-frame) commands by host-tested arithmetic
+  (`ahci-wire::geometry::split_request`); PRDTL is therefore ≤ 16.
+- **Completion**: poll `PxCI` bit 0; failure first if any `PxIS` error
+  bit is set (the device's `PxTFD.ERR` word names the ATA error), else
+  success when `PxCI` clears and `PxTFD` has neither `BSY` nor `ERR`.
+  Stale `PxIS` bits are cleared before each command and after each
+  completion.
+- **Coherency**: `memory::alloc()` frames are identity-mapped
+  (`entry.S`, first 4 GiB, default WB type), so the physical addresses
+  handed to the HBA are the same bytes the CPU writes. x86 PCI
+  bus-master DMA is cache-coherent (no IOMMU here, no non-coherent
+  memory type), so no explicit flush/invalidate is needed; ordering *is*:
+  a `fence(SeqCst)` sits between the descriptor/FIS/PRDT writes and the
+  `PxCI` write, the same discipline `e1000::transmit` uses for TDT.
+  The frames are freed on `Drop` after the port's engines are stopped.
+
+### 4.4 FAT16 stays on the IDE disk; what is still open
+
+The smoke's `AHCI_OK` is **additive and read-only**: the installer's
+source volume is copied to `disk-ahci.img`, attached through
+`ich9-ahci`, and the driver proves PCI probe → port bring-up →
+`IDENTIFY DEVICE` → LBA0 read → the installer magic. The FS/GPT/install
+proofs keep running on the IDE disks, so `BLK_OK → FAT_OK → … →
+NETINST_OK` and the installed disk's boot phase are byte-identical.
+When **no** IDE disk answers (the MacBook), the AHCI disk becomes the
+block *source* automatically (`ata::Disk::Ahci`) and the same
+filesystem/install code runs on it.
+
+Open items: IRQ-driven completion (PIC IRQ10/11 is still masked — the
+driver polls), NCQ (`READ/WRITE FPDMA QUEUED`, one command in flight
+today), port multipliers, hot-plug, `SET FEATURES`/`FLUSH CACHE`
+(`fat::write`'s crash-consistency note applies unchanged), an
+AHCI write-round-trip marker in the smoke (the write path runs only
+when AHCI is the source), and real ICH7 validation (CAP/PI, reset
+timing, `PxSIG`).
+
 
 ## Sources
 
@@ -916,6 +1046,26 @@ over the network).
   https://raw.githubusercontent.com/torvalds/linux/master/drivers/net/ethernet/marvell/sky2.h
 - Linux i8042 driver (controller init/commands):
   https://github.com/torvalds/linux/blob/master/drivers/input/serio/i8042.c
+
+**AHCI / SATA documentation and QEMU model:**
+- *Serial ATA Advanced Host Controller Interface (AHCI) 1.3.1*, Intel, 2011 —
+  https://www.intel.com/content/dam/www/public/us/en/documents/technical-specifications/serial-ata-ahci-spec-rev1-3-1.pdf
+  (§2.1.8 ABAR/class code, §3.1 generic host control, §3.3 port registers,
+  §4.2 command list/header/table, §4.3 PRDT, §10.5 COMRESET, §10.6 start).
+- *Serial ATA 3.2* §10.3 — Register Host to Device / Device to Host / PIO Setup /
+  Set Device Bits FIS layouts (https://sata-io.org/).
+- *ATA8-ACS2* §7.1/§7.16/§7.20/§7.62 — Error register, IDENTIFY DEVICE,
+  READ DMA EXT, WRITE DMA EXT (INCITS 482-2012).
+- QEMU `hw/ide/ahci.c` — https://raw.githubusercontent.com/qemu/qemu/master/hw/ide/ahci.c
+  and `hw/ide/ahci-internal.h` —
+  https://raw.githubusercontent.com/qemu/qemu/master/hw/ide/ahci-internal.h
+  (register enum, `PORT_CMD_*`, `PORT_IRQ_*`, `AHCICmdHdr`, `AHCI_SG`,
+  `handle_reg_h2d_fis`, `ahci_populate_sglist`, `ahci_pio_transfer`).
+- Linux `drivers/ata/libahci.c` + `include/linux/libata.h` —
+  https://github.com/torvalds/linux/tree/master/drivers/ata (AHCI_PCI_BAR = 5,
+  IDENTIFY over the PRDT, bounded waiting in libata-core).
+- PCI Local Bus Spec 3.0 §6.2.5.1 (BAR layout) and the class-code table
+  (01h/06h/01h) — https://pcisig.com/specifications.
 
 **QEMU (behaviour of the emulated i8042 / PS/2 keyboard):**
 - `hw/input/pckbd.c` — https://raw.githubusercontent.com/qemu/qemu/master/hw/input/pckbd.c

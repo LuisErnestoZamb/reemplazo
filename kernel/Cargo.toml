@@ -42,6 +42,14 @@ editorbuf = { path = "../editorbuf" }
 # (exact serialization, truncated/malformed JSON, SSE split torture)
 # live in the crate's docs; review recorded in the A3 commit.
 aiwire = { path = "../aiwire" }
+# AHCI (SATA) wire logic (docs/hardware.md "AHCI"): HBA/port register
+# map, PxIS/PxTFD decode, Register H2D FIS, command-header/table/PRDT
+# layouts and IDENTIFY decoding — the MacBook's ICH7 disk path. Written
+# from scratch under dependency-policy exception (a): no maintained
+# no_std AHCI crate exists, the AHCI 1.3.1 spec is the register-level
+# truth (cross-checked against QEMU's hw/ide/ahci.c), zero deps,
+# forbid(unsafe_code), adversarially host-tested (ahci-wire/tests).
+ahci-wire = { path = "../ahci-wire" }
 # sky2 wire logic (Marvell 88E8053 — the MacBook's NIC): descriptor
 # and status-ring layouts, SMI/MDIO encoding, PHY/MAC validation and
 # the bring-up register-value composition. From-scratch under

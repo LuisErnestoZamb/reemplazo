@@ -4,13 +4,16 @@
 //!
 //! Four pieces:
 //!
-//! - [`AtaDisk`], the block adapter: the ATA driver's sector reads
-//!   *and writes* behind `fat::BlockDevice`'s byte-range interface.
-//!   Only whole, 512-byte-aligned sectors are accepted (what PIO
-//!   `READ SECTORS`/`WRITE SECTORS` can move) and every range is
-//!   checked against the drive's IDENTIFY-reported capacity with
-//!   `fat::checked_end` before a port is touched — the same contract
-//!   the crate's host tests enforce through their `Strict` adapter.
+//! - [`BlockDisk`], the block adapter: the block layer's sector reads
+//!   *and writes* behind `fat::BlockDevice`'s byte-range interface —
+//!   `ata::Disk`, which is either the legacy-IDE PIO drive or an
+//!   AHCI/SATA disk (`crate::ahci`), with one identical contract. Only
+//!   whole, 512-byte-aligned sectors are accepted (what
+//!   `READ SECTORS`/`WRITE SECTORS` and AHCI `READ/WRITE DMA EXT` can
+//!   move) and every range is checked against the device's
+//!   IDENTIFY-reported capacity with `fat::checked_end` before a
+//!   command is issued — the same contract the crate's host tests
+//!   enforce through their `Strict` adapter.
 //! - [`prove`], the boot proof: mount the volume, open
 //!   `/README.TXT`, compare it byte-for-byte with the constant the
 //!   image was written from, print `FAT_OK`; then (FS2) *write*
@@ -26,10 +29,10 @@
 //!
 //! ## Fail-closed, silent-when-absent
 //!
-//! With no drive (the main smoke — it runs diskless), `ata::probe`
-//! returns `None` and `prove` is never called: **zero output**, so the
-//! main smoke's marker chain stays untouched (AGENTS.md). With a drive
-//! present every failure — unparseable BPB, missing file, wrong bytes,
+//! With no drive (the main smoke — it runs diskless), `ata::probe` and
+//! `ahci::probe` return `None` and `prove` is never called: **zero
+//! output**, so the main smoke's marker chain stays untouched
+//! (AGENTS.md). With a drive present every failure — unparseable BPB, missing file, wrong bytes,
 //! short chain, refused write, stale read-back — is a `FATAL: fs: …`
 //! line plus `halt()`: `cargo xtask smoke-install` must never pass on a
 //! broken filesystem.
@@ -38,7 +41,7 @@
 //!
 //! [`write_proof`] runs only *after* `FAT_OK` and only with a drive:
 //! write a known payload, then **re-mount from scratch** — a fresh
-//! `AtaDisk` + fresh `fat::Fat16`, so the read-back can only be served
+//! `BlockDisk` + fresh `fat::Fat16`, so the read-back can only be served
 //! from the device, not from any state this function holds (the adapter
 //! itself is stateless by design: no cache, write-through — see
 //! `fat::write` for the ordering and the explicit *no crash
@@ -98,11 +101,11 @@ const TREE_PATH_CAP: usize = 512;
 /// meaningful read-back in [`write_proof`]. `pub(crate)` so
 /// `crate::install` mounts the *source* volume through the same
 /// adapter when copying the payload.
-pub(crate) struct AtaDisk<'a>(pub(crate) &'a ata::Drive);
+pub(crate) struct BlockDisk<'a>(pub(crate) &'a ata::Disk);
 
-impl fat::BlockDevice for AtaDisk<'_> {
+impl fat::BlockDevice for BlockDisk<'_> {
     fn size_bytes(&self) -> u64 {
-        u64::from(self.0.sectors) * 512
+        u64::from(self.0.sectors()) * 512
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), fat::Error> {
@@ -142,11 +145,11 @@ impl fat::BlockDevice for AtaDisk<'_> {
 /// byte-for-byte; print `FAT_OK` on success — then (FS2) run
 /// [`write_proof`] for `FS_WRITE_OK`.
 ///
-/// Only ever called when `ata::probe` actually found a drive — with no
-/// disk attached this function is never reached and boot prints
-/// nothing extra.
-pub(crate) fn prove(dev: &ata::Drive) {
-    let disk = AtaDisk(dev);
+/// Only ever called when `ata::probe` (or the AHCI fallback) actually
+/// found a marked drive — with no disk attached this function is never
+/// reached and boot prints nothing extra.
+pub(crate) fn prove(dev: &ata::Disk) {
+    let disk = BlockDisk(dev);
     let fs = match fat::Fat16::mount(&disk) {
         Ok(fs) => fs,
         Err(e) => fatal(e),
@@ -205,12 +208,12 @@ pub(crate) fn stamp() -> fat::Stamp {
 ///    FAT sectors (both mirrors), data sectors and directory entry
 ///    land on the device inside `write_file`, in `fat::write`'s
 ///    documented order.
-/// 2. **Re-mount from scratch**: a fresh `AtaDisk` over the same drive
+/// 2. **Re-mount from scratch**: a fresh `BlockDisk` over the same drive
 ///    and a fresh `fat::Fat16` — no state from step 1 survives, so the
 ///    read-back can only be served from the device.
 /// 3. Assert `/RESULT.TXT` byte-exact, then re-read `/README.TXT` and
 ///    assert it too — a writer that clobbers its neighbour fails here.
-fn write_proof(dev: &ata::Drive) {
+fn write_proof(dev: &ata::Disk) {
     // Timestamps come from the CMOS RTC; a dead clock falls back to
     // the crate's documented fixed value (1980-01-01), never a guess.
     let stamp = stamp();
@@ -218,7 +221,7 @@ fn write_proof(dev: &ata::Drive) {
     // Step 1: the write (fresh mount — `/RESULT.TXT` may exist from a
     // previous run of the same image; `write_file` overwrites it).
     {
-        let disk = AtaDisk(dev);
+        let disk = BlockDisk(dev);
         let fs = match fat::Fat16::mount(&disk) {
             Ok(fs) => fs,
             Err(e) => fatal(e),
@@ -229,7 +232,7 @@ fn write_proof(dev: &ata::Drive) {
     }
 
     // Steps 2+3: re-mount and read back, byte for byte.
-    let disk = AtaDisk(dev);
+    let disk = BlockDisk(dev);
     let fs = match fat::Fat16::mount(&disk) {
         Ok(fs) => fs,
         Err(e) => fatal(e),
@@ -275,13 +278,13 @@ fn write_proof(dev: &ata::Drive) {
 ///    to need an LFN chain) and `/SUB/DIR/PLAIN.TXT` (a plain 8.3 name
 ///    reached through case-insensitive lookups of the same three
 ///    directories).
-/// 2. A **fresh** mount (new `AtaDisk`, new `fat::Fat16`) reads both
+/// 2. A **fresh** mount (new `BlockDisk`, new `fat::Fat16`) reads both
 ///    back byte-exact and re-checks the FS2 payloads — so the bytes can
 ///    only come from the device.
-fn tree_proof(dev: &ata::Drive) {
+fn tree_proof(dev: &ata::Disk) {
     let stamp = stamp();
     {
-        let disk = AtaDisk(dev);
+        let disk = BlockDisk(dev);
         let fs = mount_or_fatal(&disk);
         if let Err(e) = fs.write_file_all(TREE_LONG_PATH, TREE_LONG_CONTENT, stamp) {
             fatal(e);
@@ -291,7 +294,7 @@ fn tree_proof(dev: &ata::Drive) {
         }
     }
 
-    let disk = AtaDisk(dev);
+    let disk = BlockDisk(dev);
     let fs = mount_or_fatal(&disk);
     read_check(&fs, TREE_LONG_PATH, TREE_LONG_CONTENT);
     read_check(&fs, TREE_83_PATH, TREE_83_CONTENT);
@@ -315,7 +318,7 @@ fn tree_proof(dev: &ata::Drive) {
 }
 
 /// Mount a fresh volume over `disk`, or `FATAL: fs:` + halt.
-fn mount_or_fatal<'a>(disk: &'a AtaDisk<'a>) -> fat::Fat16<'a, AtaDisk<'a>> {
+fn mount_or_fatal<'a>(disk: &'a BlockDisk<'a>) -> fat::Fat16<'a, BlockDisk<'a>> {
     match fat::Fat16::mount(disk) {
         Ok(fs) => fs,
         Err(e) => fatal(e),
@@ -358,9 +361,9 @@ fn read_check<D: fat::BlockDevice + ?Sized>(fs: &fat::Fat16<'_, D>, path: &str, 
 /// bytes), or a `fat::Error::Path`/`InvalidName`/`NameConflict` refusal.
 /// Every other failure (mount, I/O, disk full) is `FATAL: fs:` — a
 /// checkout that silently drops a write would be a lying checkout.
-pub(crate) fn checkout_tree(dev: &ata::Drive, files: &[(Vec<u8>, &[u8])]) -> (usize, usize) {
+pub(crate) fn checkout_tree(dev: &ata::Disk, files: &[(Vec<u8>, &[u8])]) -> (usize, usize) {
     let stamp = stamp();
-    let disk = AtaDisk(dev);
+    let disk = BlockDisk(dev);
     let fs = mount_or_fatal(&disk);
     let (mut written, mut skipped) = (0usize, 0usize);
     let mut path = [0u8; TREE_PATH_CAP];
@@ -400,8 +403,8 @@ pub(crate) fn checkout_tree(dev: &ata::Drive, files: &[(Vec<u8>, &[u8])]) -> (us
 /// Re-mount from scratch and read `path` back into `out` (the G3
 /// checkout proof). A fresh mount means the bytes can only come from
 /// the device; any failure is `FATAL: fs:`.
-pub(crate) fn read_back(dev: &ata::Drive, path: &str, out: &mut [u8]) -> usize {
-    let disk = AtaDisk(dev);
+pub(crate) fn read_back(dev: &ata::Disk, path: &str, out: &mut [u8]) -> usize {
+    let disk = BlockDisk(dev);
     let fs = match fat::Fat16::mount(&disk) {
         Ok(fs) => fs,
         Err(e) => fatal(e),
