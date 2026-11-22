@@ -82,6 +82,13 @@ fn fatal(msg: &str) -> ! {
     crate::halt()
 }
 
+/// [`fatal`] with the caller's prefix: the legacy paths pass `"tls"`
+/// (byte-identical messages), B1's browser fetch passes `"browser"`.
+fn fatal_as(who: &str, msg: &str) -> ! {
+    serial_println!("FATAL: {who}: {msg}");
+    crate::halt()
+}
+
 /// Certificate-date checking through the CMOS clock: `None` when the
 /// clock is unavailable (UIP stuck, implausible year) makes
 /// embedded-tls skip date validation — the documented degradation,
@@ -241,6 +248,35 @@ pub(crate) fn tls_open<'a>(
     tls
 }
 
+/// Validation policy for one exchange through [`exchange`] — the
+/// legacy strict mode ([`tls_fetch`]: status must be 200 at head-parse
+/// time, optional `Content-Type` assertion, [`READ_CAP`] bound) vs the
+/// browser's redirect mode ([`tls_fetch_any`]: the status goes back to
+/// the caller, which follows 3xx or asserts 200 itself).
+struct Policy<'a> {
+    /// Refuse any status ≠ 200 as soon as the head parses.
+    require_200: bool,
+    /// Assert `Content-Type` starts with these bytes (legacy only).
+    expect_ct: Option<&'a [u8]>,
+    /// Total-body bound: bytes past it are fatal, never truncated.
+    cap: usize,
+    /// `FATAL: {who}: …` prefix for failures inside the exchange
+    /// (the legacy paths pass `"tls"`, the browser passes `"browser"`).
+    who: &'a str,
+}
+
+/// Caller bounds for [`tls_fetch_any`] (the B1 redirect fetch): a
+/// total-body cap and the `FATAL:` prefix its failures carry. The
+/// buffers stay with the caller so the browser's plain and TLS hops
+/// share one set of statics.
+pub(crate) struct FetchCfg<'a> {
+    /// Total-body bound for the hop (a hostile server cannot exhaust
+    /// the heap — bytes past the caller's head sample are counted).
+    pub cap: usize,
+    /// `FATAL: {who}: …` — the browser passes `"browser"`.
+    pub who: &'a str,
+}
+
 /// One full HTTPS exchange over an open connection: send the GET
 /// (with `headers` inserted before the terminating blank line), frame
 /// the whole response into `body` — bytes past `body.len()` are
@@ -257,19 +293,75 @@ pub(crate) fn tls_fetch(
     expect_ct: Option<&[u8]>,
     body: &mut [u8],
 ) -> (u16, usize) {
+    let policy = Policy {
+        require_200: true,
+        expect_ct,
+        cap: READ_CAP,
+        who: "tls",
+    };
+    let (status, body_total, _loc_len) = exchange(tls, host, path, headers, policy, body, &mut []);
+    (status, body_total)
+}
+
+/// B1's redirect-aware exchange (docs/browser.md §7): like
+/// [`tls_fetch`] but the **status is returned, not asserted** — the
+/// caller follows a 3xx or accepts the 200 — the raw `Location`
+/// header value is copied into `loc` (the returned `usize` is the
+/// value's full length: `0` = absent, and a value longer than `loc`
+/// is the caller's to refuse before using it), the body bound and the
+/// `FATAL:` prefix come from `cfg`, and the close is
+/// redirect-aware: a **3xx aborts** (close_notify best-effort, then
+/// RST — no TIME-WAIT, so the socket and its local port recycle for
+/// the next hop immediately), everything else closes gracefully
+/// (close_notify + FIN + wait for TimeWait/Closed, the historical
+/// clean close of the final hop). Returns
+/// `(status, total_body_bytes, location_len)`.
+pub(crate) fn tls_fetch_any(
+    tls: TlsConnection<'_, Stream<'_>, Aes128GcmSha256>,
+    host: &str,
+    path: &str,
+    headers: &[&str],
+    body: &mut [u8],
+    loc: &mut [u8],
+    cfg: FetchCfg<'_>,
+) -> (u16, usize, usize) {
+    let policy = Policy {
+        require_200: false,
+        expect_ct: None,
+        cap: cfg.cap,
+        who: cfg.who,
+    };
+    exchange(tls, host, path, headers, policy, body, loc)
+}
+
+/// The exchange both entry points share: send the GET, frame the
+/// response through the module's `PARSER` static (reset first — one
+/// parser runs every sequential exchange), bound the body, extract
+/// `Location`, then close per [`Policy`] + status. Every failure is
+/// `FATAL: {policy.who}: …` + [`crate::halt`] — a partial result is
+/// never returned.
+fn exchange(
+    tls: TlsConnection<'_, Stream<'_>, Aes128GcmSha256>,
+    host: &str,
+    path: &str,
+    headers: &[&str],
+    policy: Policy<'_>,
+    body: &mut [u8],
+    loc: &mut [u8],
+) -> (u16, usize, usize) {
     let mut tls = tls;
     // HTTP/1.1 GET over the established channel; `Connection: close`
     // makes the server finish with close_notify + FIN.
     let mut req = [0u8; 512];
     let Some(req_len) = http::build_request(&mut req, host, path, headers) else {
-        fatal("GET request does not fit the buffer");
+        fatal_as(policy.who, "GET request does not fit the buffer");
     };
     if let Err(e) = tls.write_all(&req[..req_len]) {
-        serial_println!("FATAL: tls: write failed: {e:?}");
+        serial_println!("FATAL: {}: write failed: {:?}", policy.who, e);
         crate::halt();
     }
     if let Err(e) = tls.flush() {
-        serial_println!("FATAL: tls: flush failed: {e:?}");
+        serial_println!("FATAL: {}: flush failed: {:?}", policy.who, e);
         crate::halt();
     }
 
@@ -285,18 +377,22 @@ pub(crate) fn tls_fetch(
     let staging = unsafe { &mut *addr_of_mut!(STAGING) };
     let mut status = 0u16;
     let mut status_checked = false;
-    let mut ct_checked = expect_ct.is_none();
+    let mut ct_checked = policy.expect_ct.is_none();
     let mut body_total = 0usize;
     let mut body_stored = 0usize;
+    let mut loc_len = 0usize;
     let mut scratch = [0u8; SCRATCH];
     loop {
         match tls.read(&mut scratch) {
-            Ok(0) => fatal("transport EOF without close_notify (truncated response)"),
+            Ok(0) => fatal_as(
+                policy.who,
+                "transport EOF without close_notify (truncated response)",
+            ),
             Ok(n) => {
                 let progress = match parser.feed(&scratch[..n], staging) {
                     Ok(progress) => progress,
                     Err(e) => {
-                        serial_println!("FATAL: tls: HTTP response refused: {e:?}");
+                        serial_println!("FATAL: {}: HTTP response refused: {:?}", policy.who, e);
                         crate::halt();
                     }
                 };
@@ -306,18 +402,27 @@ pub(crate) fn tls_fetch(
                     // A parsed u16 — inherently safe to log (no
                     // log-injection surface like raw text lines).
                     serial_println!("http: status {s}");
-                    if s != 200 {
-                        fatal("unexpected HTTP status (expected 200)");
+                    if policy.require_200 && s != 200 {
+                        fatal_as(policy.who, "unexpected HTTP status (expected 200)");
                     }
-                    if let Some(expected) = expect_ct {
+                    if let Some(expected) = policy.expect_ct {
                         // Header values come off the wire: compared,
                         // never logged.
                         match http::header_value(parser.head(), b"content-type") {
                             Some(value) if ct_matches(value, expected) => {}
-                            Some(_) => fatal("unexpected Content-Type"),
-                            None => fatal("response has no Content-Type"),
+                            Some(_) => fatal_as(policy.who, "unexpected Content-Type"),
+                            None => fatal_as(policy.who, "response has no Content-Type"),
                         }
                         ct_checked = true;
+                    }
+                    // Redirect resolution input (B1): copy the raw
+                    // `Location` value out of the head while it is
+                    // still current. Wire bytes — the caller sanitizes
+                    // before printing and refuses an over-long value.
+                    if let Some(value) = http::header_value(parser.head(), b"location") {
+                        loc_len = value.len();
+                        let take = min(loc.len(), value.len());
+                        loc[..take].copy_from_slice(&value[..take]);
                     }
                 }
                 if progress.body > 0 {
@@ -325,8 +430,8 @@ pub(crate) fn tls_fetch(
                     body[body_stored..body_stored + take].copy_from_slice(&staging[..take]);
                     body_stored += take;
                     body_total += progress.body;
-                    if body_total > READ_CAP {
-                        fatal("response body exceeds the byte bound");
+                    if body_total > policy.cap {
+                        fatal_as(policy.who, "response body exceeds the byte bound");
                     }
                 }
                 if progress.complete {
@@ -338,42 +443,62 @@ pub(crate) fn tls_fetch(
                 // close-delimited bodies; a framed body ending here
                 // was truncated and must fail, not "finish".
                 if let Err(e) = parser.eof() {
-                    serial_println!("FATAL: tls: response truncated: {e:?}");
+                    serial_println!("FATAL: {}: response truncated: {:?}", policy.who, e);
                     crate::halt();
                 }
                 break;
             }
             Err(e) => {
-                serial_println!("FATAL: tls: read failed: {e:?}");
+                serial_println!("FATAL: {}: read failed: {:?}", policy.who, e);
                 crate::halt();
             }
         }
     }
     if !ct_checked {
-        fatal("response head never parsed (Content-Type unchecked)");
+        fatal_as(
+            policy.who,
+            "response head never parsed (Content-Type unchecked)",
+        );
     }
 
-    // Orderly shutdown: close_notify (best-effort — the server's own
-    // close_notify already authenticated everything we read; a failure
-    // here cannot retroactively corrupt it), then the TCP close.
+    // Orderly TLS shutdown: close_notify (best-effort — the server's
+    // own close_notify already authenticated everything we read; a
+    // failure here cannot retroactively corrupt it), then the TCP
+    // close per the hop's role in a redirect chain.
     let mut stream = match tls.close() {
         Ok(stream) => stream,
         Err((stream, e)) => {
-            serial_println!("tls: close_notify not sent: {e:?}");
+            serial_println!("{}: close_notify not sent: {:?}", policy.who, e);
             stream
         }
     };
+    if (300..400).contains(&status) {
+        // Intermediate hop: RST instead of FIN. smoltcp sends the RST
+        // on the very next poll (an aborted socket with a tuple
+        // reports `PollAt::Now`, then forgets the tuple) and never
+        // enters TIME-WAIT, so the socket recycles for the next
+        // redirect hop immediately — the 30 s smoke has no budget for
+        // a 10 s TIME-WAIT. The response was fully framed before we
+        // got here; nothing in flight is lost.
+        stream.tcp().abort();
+        stream.pump();
+        serial_println!("{}: connection aborted (RST, no TIME-WAIT)", policy.who);
+        return (status, body_total, loc_len);
+    }
     stream.tcp().close();
     let deadline = clock::now_ms() + OP_DEADLINE_MS;
     loop {
         stream.pump();
         let state = stream.tcp().state();
         if state == tcp::State::TimeWait || state == tcp::State::Closed {
-            serial_println!("tls: connection closed cleanly ({state})");
-            return (status, body_total);
+            serial_println!("{}: connection closed cleanly ({state})", policy.who);
+            return (status, body_total, loc_len);
         }
         if clock::now_ms() > deadline {
-            fatal("timeout closing connection (never reached TimeWait/Closed)");
+            fatal_as(
+                policy.who,
+                "timeout closing connection (never reached TimeWait/Closed)",
+            );
         }
     }
 }

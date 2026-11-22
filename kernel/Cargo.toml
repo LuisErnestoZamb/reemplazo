@@ -80,6 +80,19 @@ embedded-io = { version = "0.7", default-features = false }
 rand_chacha = { version = "0.9", default-features = false }
 rand_core = { version = "0.9", default-features = false }
 
+# URL parsing/resolution (B1 of docs/browser.md §3): ADOPTED after the
+# build probe (cross-builds clean for x86_64-unknown-none). The config
+# docs/browser.md §3 guessed — `default-features = false, features =
+# ["alloc"]` — does not resolve: url 2.5.9 has no `alloc` feature (its
+# own lib.rs still advertises one; stale docs). `alloc` support is
+# unconditional (`#![no_std]` + `extern crate alloc` at the top of
+# lib.rs) and `std` is the only feature gate, so `default-features =
+# false` IS the no_std configuration. Dependencies ship pre-configured
+# the same way (idna/percent-encoding/form_urlencoded with
+# `default-features = false, features = ["alloc"]`). MIT OR Apache-2.0,
+# RustSec-clean (cargo audit), review in the B1 commit.
+url = { version = "2", default-features = false }
+
 # TCP/IP stack (evaluated in docs/smoltcp-eval.md: ADOPT with
 # conditions — 0BSD, zero RustSec advisories, no_std/no-alloc verified
 # for x86_64-unknown-none, and a disassembly sweep of its 147812

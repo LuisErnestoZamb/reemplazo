@@ -21,6 +21,7 @@ mod serial;
 
 mod apps;
 mod ata;
+mod browser;
 mod e1000;
 mod entropy;
 mod git;
@@ -145,6 +146,16 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
     // smoke, which always has a NIC, fails on the missing marker).
     if let Some(stack) = stack.as_mut() {
         apps::ai::boot_proof(stack);
+        // B1 browser fetch (docs/browser.md §7): parse the start URL,
+        // plain GET → 301 → resolve `Location` → TLS GET → 200, body
+        // bounded, up to 5 redirects — BROWSER_FETCH_OK lands between
+        // AI_CHAT_OK and SHELL_OK (the smoke asserts markers in
+        // order). Like the TLS/git/SSH/AI phases it needs the network
+        // stack; without one this block is skipped and the smoke fails
+        // on the missing marker. Its serial lines mirror to the text
+        // buffer, so fetch_smoke clears the screen at the end — the
+        // shell still starts clean.
+        browser::fetch_smoke(stack); // BROWSER_FETCH_OK
     }
 
     // The shell is the kernel's idle state until a scheduler exists;
