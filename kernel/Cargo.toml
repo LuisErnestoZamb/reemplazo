@@ -16,6 +16,13 @@ git-pktline = { path = "../git-pktline" }
 # format review and adversarial suite live in the crate's docs. G3's
 # `git fetch` decodes the upload-pack reply with it.
 git-pack = { path = "../git-pack" }
+# Local object store formats (G4/G5 of docs/git-ssh-deps.md §A.4):
+# loose-object encode/decode (sha1 + miniz_oxide, both reviewed in G3a),
+# tree/commit/index/refs writers — `no_std`, forbid(unsafe_code), no
+# dependency beyond those two crates. The kernel writes the fetched
+# repo's `.git` and one local commit with it; adversarial suite in
+# `git-store/tests/hostile.rs`.
+git-store = { path = "../git-store" }
 # SSH wire codec (S1/S2 of docs/git-ssh-deps.md §B): from-scratch
 # under dependency-policy exception (a) — `russh` is std-only with an
 # advisory history, `ssh-protocol` is a WIP facade; rationale and the

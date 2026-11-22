@@ -8,7 +8,7 @@
 //!           then type a command through QEMU's monitor (KEYBOARD_OK)
 //!   smoke-install  boot with a FAT16 source disk + a blank target disk;
 //!           assert BLK_OK + FAT_OK + FS_WRITE_OK + FS_TREE_OK + INST_OK
-//!           + GIT_CHECKOUT_OK + NETINST_OK, then re-verify target.img
+//!           + GIT_CHECKOUT_OK + GIT_STORE_OK + NETINST_OK, then re-verify target.img
 //!           on the host
 //!   smoke-ssh  boot TWO VMs in one container: the first runs the sshd
 //!           from its disk, the second authenticates and execs through
@@ -215,6 +215,8 @@ fn check(root: &Path) -> bool {
                 "git-pack",
                 "-p",
                 "gptwire",
+                "-p",
+                "git-store",
                 "--all-targets",
                 "--",
                 "-D",
@@ -275,6 +277,8 @@ fn check(root: &Path) -> bool {
                 "git-pack",
                 "-p",
                 "gptwire",
+                "-p",
+                "git-store",
             ],
         )
         && build_kernel(root)
@@ -1151,6 +1155,7 @@ fn smoke_install(root: &Path) -> bool {
             "FS_TREE_OK",
             "INST_OK",
             "GIT_CHECKOUT_OK",
+            "GIT_STORE_OK",
             "NETINST_OK",
         ],
         INSTALL_TIMEOUT,

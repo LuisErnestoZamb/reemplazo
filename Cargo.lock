@@ -516,6 +516,14 @@ name = "git-pktline"
 version = "0.1.0"
 
 [[package]]
+name = "git-store"
+version = "0.1.0"
+dependencies = [
+ "miniz_oxide",
+ "sha1",
+]
+
+[[package]]
 name = "gptwire"
 version = "0.1.0"
 
@@ -789,6 +797,7 @@ dependencies = [
  "fat",
  "git-pack",
  "git-pktline",
+ "git-store",
  "gptwire",
  "hmac",
  "linked_list_allocator",

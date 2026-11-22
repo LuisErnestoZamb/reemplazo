@@ -66,6 +66,8 @@ All in Rust, all in this workspace:
 | `kernel/` | The OS kernel — `no_std`, built only for `x86_64-unknown-none` |
 | `mbi/` | Multiboot2 handoff range contract + hostile-input host tests |
 | `net/` | HTTP/1.1 responses (`httparse` + RFC 9112 framing), SLIRP smoke constants, `parse_ipv4` — host-tested (the TCP/IP stack itself is smoltcp, see `docs/smoltcp-eval.md`) |
+| `git-pack/` | Packfile v2 reader: header, zlib streams, OFS/REF deltas, trailer + in-memory index, tree/commit parsing — host-tested |
+| `git-store/` | Local git object store formats: loose objects (SHA-1 + zlib), tree/commit writers, the v2 index and refs/HEAD — `no_std`, `forbid(unsafe_code)`, 44 adversarial host tests |
 | `rtc/` | CMOS clock decoding (BCD, 12/24 h, leap years, century plausibility) — host-tested |
 | `pci/` | PCI enumeration and device IDs (e1000, sky2, …) |
 | `xtask/` | Build/test orchestration (`cargo xtask …`) |
@@ -78,8 +80,7 @@ All in Rust, all in this workspace:
 ```sh
 cargo xtask check   # fmt + clippy (host and kernel target) + tests + cross-build
 cargo xtask smoke   # build ISO, boot headless, assert serial markers in order
-cargo xtask smoke-install  # two IDE disks (FAT16 source + blank target); assert BLK_OK + FAT_OK + FS_WRITE_OK + FS_TREE_OK + INST_OK + GIT_CHECKOUT_OK + NETINST_OK, then boot target.img alone and assert BOOT_OK … SHELL_OK
-cargo xtask smoke-ssh  # two VMs: our sshd (one disk) ↔ our client (other disk) — SSHD_OK + SSHD_EXEC_OK
+cargo xtask smoke-install  # two IDE disks (FAT16 source + blank target); assert BLK_OK + FAT_OK + FS_WRITE_OK + FS_TREE_OK + INST_OK + GIT_CHECKOUT_OK + GIT_STORE_OK + NETINST_OK
 cargo xtask run     # interactive boot in QEMU (Ctrl-C quits)
 cargo test -p mbi <name>   # single test
 ```
@@ -110,7 +111,10 @@ it back after a fresh re-mount, and `INST_OK`: the install flow on the target �
 the payload copied from the source volume and read back byte-exact
 after a fresh re-mount, `GIT_CHECKOUT_OK`: G3's fetch checks the
 whole depth-1 tree out into the source volume (112 files / 53 dirs,
-byte-exact re-reads), and `NETINST_OK`: after the boot network
+byte-exact re-reads), `GIT_STORE_OK`: G4's local store writes `.git` (loose zlib objects streamed one
+at a time, the checksummed v2 index, the rebuilt trees compared byte-exact, one
+local commit on the fetched head, `.git/shallow`) and a fresh re-mount re-reads
+and re-hashes it all, and `NETINST_OK`: after the boot network
 chain, the kernel fetches `payload.tar` (the built kernel + README)
 from an in-container responder on `10.0.2.2:8080` **with its own
 stack**, walks the ustar headers, reinstalls onto the target and reads
@@ -204,7 +208,7 @@ Milestones landed so far (see `git log` for details):
 - [x] TCP/IP stack migrated to **smoltcp** — hand-rolled frame/DHCP/DNS/TCP code replaced, ~2300 lines removed (docs/smoltcp-eval.md)
 - [x] TLS 1.3 client — HTTPS against github.com:443, pinned root certificate
 - [x] HTTP/1.1 client — `httparse` head + RFC 9112 body framing (HTTP_OK)
-- [x] git over HTTPS — smart-HTTP `ls-remote` advertisement (GIT_LSREMOTE_OK), depth-1 `fetch` via v0 `want`/`deepen 1`/`done` → `git-pack` decode → iterative tree walk (GIT_FETCH_OK), and a **full-tree** checkout into FAT16 — directories, long names, every blob — with a re-mount read-back (GIT_CHECKOUT_OK, `smoke-install`)
+- [x] git over HTTPS — smart-HTTP `ls-remote` advertisement (GIT_LSREMOTE_OK), depth-1 `fetch` via v0 `want`/`deepen 1`/`done` → `git-pack` decode → iterative tree walk (GIT_FETCH_OK), a **full-tree** checkout into FAT16 — directories, long names, every blob — with a re-mount read-back (GIT_CHECKOUT_OK, `smoke-install`), and the **local object store**: loose objects for every fetched commit/tree/blob, refs/HEAD, the v2 index, rebuilt trees checked byte-exact, and one local commit on top of the fetched head, all proved from a fresh mount (GIT_STORE_OK, `smoke-install`)
 - [x] Shell — serial-console REPL with minimal builtins (ping, resolve, netinfo, …)
 - [x] Keyboard — polled i8042 + set-1 decode feeding the shell's line discipline (QEMU `sendkey` → `KEYBOARD_OK`; MacBook needs UHCI/HID)
 - [x] SSH server (S5) — ed25519 host key + `authorized_keys` read from a FAT16 volume, listener on `:2222`, KEX as responder, encrypted `publickey` auth, one `session` channel with `exec`; `cargo xtask smoke-ssh` proves our client → our server across two QEMUs (`SSHD_OK` + `SSHD_EXEC_OK`). One connection per boot; TOFU only for the harness peer. S4 (git-over-ssh's `git-upload-pack`) and multi-connection accept are still open.

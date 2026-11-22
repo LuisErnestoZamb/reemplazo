@@ -274,6 +274,10 @@ pub fn fetch(
     //    probe, so `BLK_OK` is never printed a second time.
     if let Some(drive) = drive {
         checkout(drive, &files, &walk);
+        // G4/G5: the local object store (`.git` objects/refs/index) and
+        // one local commit on top of the fetched head, proved from a
+        // fresh mount (GIT_STORE_OK). Disk-only, like the checkout.
+        crate::git_store::realize(drive, &head, &tree_oid, &objects, &by_oid, &files);
     }
 }
 
