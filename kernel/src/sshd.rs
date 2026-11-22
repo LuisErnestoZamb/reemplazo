@@ -113,7 +113,13 @@ const AUTH_ATTEMPTS_MAX: u32 = 3;
 /// The channel window we advertise (bytes) and the largest data packet
 /// we promise to receive. The toy `exec` output is a few dozen bytes.
 const CHANNEL_WINDOW: u32 = 64 * 1024;
-const MAX_PACKET: u32 = 32 * 1024;
+/// Largest channel packet we accept, advertised in
+/// `CHANNEL_OPEN_CONFIRMATION` (RFC4254 §5.1) — it must **agree with
+/// the receive path** (audit F3): announcing 32 KiB promised more than
+/// [`PAYLOAD_CAP`] could copy, so any legitimate >1 KiB packet ended
+/// the session instead of being refused by the peer (which is what
+/// `max_packet` exists for).
+const MAX_PACKET: u32 = PAYLOAD_CAP as u32;
 /// Server-side channel id for the one session channel.
 const SERVER_CHANNEL: u32 = 0;
 

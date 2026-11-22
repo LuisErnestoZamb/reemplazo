@@ -98,7 +98,7 @@ closed, and `service`/`method`/`algorithm` are all checked before the decision.
 - **Suggested fix:** in the `Err` arm, `sock.close()` + bounded wait for
   `Closed|TimeWait` (reuse the `:269-279` block), *then* `return served`.
 
-## F3 — Advertised `MAX_PACKET`/`CHANNEL_WINDOW` exceed what the receive path can hold (**medio**)
+## F3 — Advertised `MAX_PACKET`/`CHANNEL_WINDOW` exceed what the receive path can hold (**medio**, **FIXED** for `MAX_PACKET` — now `PAYLOAD_CAP`; `CHANNEL_WINDOW` is flow-control credit, not a per-packet promise, and stays as advertised credit — it only gates how much the peer may pipeline, which our receive loop drains).
 
 - **Where:** `kernel/src/sshd.rs:101-102` (`CHANNEL_WINDOW = 64 KiB`,
   `MAX_PACKET = 32 KiB`, advertised in `CHANNEL_OPEN_CONFIRMATION` at
