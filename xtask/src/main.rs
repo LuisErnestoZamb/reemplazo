@@ -363,6 +363,75 @@ fn iso(root: &Path) -> bool {
     iso_inner(root, false)
 }
 
+/// Hard cap on the `hello` module: the kernel's capture buffer is 4 MiB
+/// (`kernel/src/userland/module.rs::HELLO_MODULE_CAP`). Keep both in sync.
+const HELLO_MODULE_CAP: u64 = 4 * 1024 * 1024;
+
+/// Where the userland agent's build puts the first user ELF. The first hit
+/// wins; `target/iso-root/hello.elf` lets a caller pre-stage the binary
+/// without owning `user/hello/`.
+const HELLO_SOURCES: &[&str] = &[
+    "user/hello/target/x86_64-unknown-none/release/hello",
+    "user/hello/target/x86_64-unknown-none/release/hello.elf",
+    "user/hello/hello.elf",
+    "target/iso-root/hello.elf",
+];
+
+/// First existing path for the userland `hello` build, if any.
+fn hello_source(root: &Path) -> Option<std::path::PathBuf> {
+    HELLO_SOURCES
+        .iter()
+        .map(|src| root.join(src))
+        .find(|path| path.is_file())
+}
+
+/// Copy the `hello` ELF into the ISO and add `module2 /boot/hello.elf hello`
+/// to GRUB's config (the name is the module's command line, matched by the
+/// kernel before its frame allocator exists). Missing binary → silent
+/// no-op; present but too large → loud ISO-build failure.
+fn stage_hello_module(root: &Path, iso_root: &Path, cfg_path: &Path) {
+    let Some(relative) = hello_source(root) else {
+        eprintln!("xtask: no user hello ELF found; skipping ELF_OK module");
+        return;
+    };
+    let bytes = match std::fs::read(&relative) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("xtask: cannot read {}: {e}", relative.display());
+            return;
+        }
+    };
+    if bytes.len() as u64 > HELLO_MODULE_CAP {
+        eprintln!(
+            "xtask: user hello ELF is {} B, above the {HELLO_MODULE_CAP} B module cap",
+            bytes.len()
+        );
+        return;
+    }
+    if let Err(e) = std::fs::write(iso_root.join("boot/hello.elf"), bytes) {
+        eprintln!("xtask: cannot write boot/hello.elf: {e}");
+        return;
+    }
+    let cfg = match std::fs::read_to_string(cfg_path) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("xtask: cannot read {}: {e}", cfg_path.display());
+            return;
+        }
+    };
+    if cfg.contains("module2 /boot/hello.elf hello") {
+        return;
+    }
+    let cfg = cfg.replacen(
+        "    boot\n",
+        "    module2 /boot/hello.elf hello\n    boot\n",
+        1,
+    );
+    if let Err(e) = std::fs::write(cfg_path, cfg) {
+        eprintln!("xtask: cannot write {}: {e}", cfg_path.display());
+    }
+}
+
 /// [`iso`] with the hardware bring-up module: when `hwtest` is set,
 /// the ISO carries `boot/sshd.bin` (one keypair: host seed ‖ the
 /// authorized client's raw public key) and the GRUB config loads it
@@ -450,6 +519,12 @@ fn iso_inner(root: &Path, hwtest: bool) -> bool {
             return false;
         }
     }
+    // U1: stage the first userland ELF as multiboot2 module `hello`.
+    // `m-userland-elf` owns `user/hello/`; until that binary lands this is
+    // a silent no-op, so diskless/installed-system boots keep their marker
+    // chains. With the ELF present the kernel's ELF_OK proof runs after
+    // SHELL_OK (the module is captured before `memory::init`).
+    stage_hello_module(root, &iso_root, &boot_dir.join("grub.cfg"));
     // I1b: the config embedded in the installed disk's core.img.
     if let Err(e) = std::fs::write(iso_root.join("boot/early.cfg"), GRUB_EARLY_CFG) {
         eprintln!("xtask: cannot write early.cfg: {e}");
@@ -1423,7 +1498,11 @@ fn run(root: &Path) -> bool {
 /// interactive browser's own state driven through the keyboard path —
 /// two kernel-owned fixture pages followed/back/forward with history
 /// depths asserted, and an unreachable endpoint rendering the error
-/// page instead of halting; offline, no internet needed) — within
+/// page instead of halting; offline, no internet needed), `SHELL_OK`
+/// (the shell's prompt loop) and — only when `user/hello/` produced the
+/// module staged by [`stage_hello_module`] — `ELF_OK` (U1: the `hello`
+/// multiboot2 module parsed as ET_EXEC with all `PT_LOAD` pages mapped
+/// user-accessible in a private PML4, plus user/kernel stacks) — within
 /// [`SMOKE_TIMEOUT`]. Then the keyboard milestone:
 /// once `SHELL_OK` matches, connect to QEMU's HMP monitor
 /// ([`monitor_port`]) and type `echo KEYBOARD_OK` key by key with
@@ -1680,7 +1759,7 @@ fn netlog_probe(container: &str) -> Result<usize, String> {
 }
 
 fn smoke(root: &Path) -> bool {
-    const MARKERS: [&str; 30] = [
+    const BASE_MARKERS: [&str; 30] = [
         "BOOT_OK",
         "VGA_OK",
         "MEM_OK",
@@ -1712,10 +1791,19 @@ fn smoke(root: &Path) -> bool {
         "SHELL_OK",
         "KEYBOARD_OK",
     ];
+    // The U1 marker is only meaningful when the ISO actually carries the
+    // `hello` module. Before `user/hello/` lands (or on a boot without it)
+    // the chain stays exactly the original 30 markers.
+    let mut markers: Vec<&str> = BASE_MARKERS.to_vec();
+    if hello_source(root).is_some()
+        && let Some(pos) = markers.iter().position(|m| *m == "SHELL_OK")
+    {
+        markers.insert(pos + 1, "ELF_OK");
+    }
     if !iso(root) {
         return false;
     }
-    boot_assert(root, "smoke", &MARKERS, SMOKE_TIMEOUT, &[], &[], true)
+    boot_assert(root, "smoke", &markers, SMOKE_TIMEOUT, &[], &[], true)
 }
 
 /// Installer milestones 1 + FS1 + FS2 + **I1** + **I2** (`BLK_OK`,
