@@ -179,6 +179,12 @@ milestone.
 - `cargo xtask run` boots into the serial shell (`reemplazo>` prompt — type
   `help`). For live echo, run `stty raw -echo` first: the local terminal
   otherwise line-buffers input and echoes it in addition to the shell.
+- **AI client:** `ai <message>` posts to the in-container mock (or, once
+  `ai endpoint <https-url>` is set, over TLS to that endpoint with `stream:
+  true` and a live SSE pane); `ai model <name>`, `ai key <token>` (RAM only —
+  never printed, though the shell echoes the typed line), `ai config`,
+  `ai stream <message>` (keyless SSE demo against the mock) and `ai apply`
+  (editor integration).
 - **Keyboard input:** besides the serial console, the shell also reads QEMU's
   PS/2 keyboard (polled i8042 → set-1 decode → same line discipline — the
   MacBook's built-in keyboard is USB HID and needs the UHCI milestone).

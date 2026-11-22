@@ -360,6 +360,282 @@ pub(crate) fn tls_post(
     (status, body_total)
 }
 
+/// One event from a **fallible** POST (A4's user-driven chat): the
+/// response head as soon as it parses, then each decoded body chunk in
+/// arrival order. Wire bytes (`content_type`, `Body`) are valid only
+/// for the duration of the callback — callers copy what they keep and
+/// never log them raw (the `ct_matches`/`sanitize` rule).
+pub(crate) enum PostEvent<'a> {
+    /// The head parsed: status code and the raw `Content-Type` value.
+    Head {
+        status: u16,
+        content_type: Option<&'a [u8]>,
+    },
+    /// One decoded body chunk (`Content-Length`, chunked and
+    /// close-delimited framing all arrive through here).
+    Body(&'a [u8]),
+}
+
+/// What a [`PostEvent`] callback wants next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReadFlow {
+    /// Keep reading.
+    Continue,
+    /// The caller has everything it needs (a stream's `[DONE]`): stop
+    /// reading now and recycle the connection.
+    Stop,
+}
+
+/// Request buffer for [`tls_post_soft`]: path + headers + the chat JSON
+/// body. A static (not a stack local) because this runs on the shell's
+/// stack alongside the TLS session; the bound is generous for a
+/// chat request (a 512-byte message can double under JSON escaping).
+const SOFT_REQ_CAP: usize = 8192;
+static mut SOFT_REQ: [u8; SOFT_REQ_CAP] = [0; SOFT_REQ_CAP];
+
+/// Fallible [`tls_open`] for **user-driven** work (A4's chat).
+///
+/// Why a second entry exists: [`tls_open`] (and [`tls_fetch`] /
+/// [`tls_post`]) are **fail-closed by design** — they `FATAL:` + halt,
+/// which is right for every boot proof (a broken TLS chain must stop
+/// the smoke loudly) but wrong for a shell builtin, where the contract
+/// is "print/render one error and return to the prompt"
+/// (`shell.rs`). This entry therefore duplicates the connect +
+/// handshake sequence and returns every failure as `Err`, aborting the
+/// TCP socket on the way out so the next attempt finds a connectable
+/// socket. The boot paths are untouched and byte-identical.
+///
+/// Trust is unchanged: the same pinned USERTrust ECC root, the same
+/// hostname/chain/EKU checks. An endpoint whose chain does not
+/// terminate there (Let's Encrypt, Amazon, …) therefore fails closed
+/// with an error, not a fallback — the documented single-root caveat
+/// until the multi-root store lands.
+pub(crate) fn tls_open_soft<'a>(
+    stack: &'a mut Stack,
+    handle: SocketHandle,
+    ip: Ipv4Address,
+    host: &str,
+    local_port: u16,
+) -> Result<TlsConnection<'a, Stream<'a>, Aes128GcmSha256>, &'static str> {
+    // A previous user attempt may have died mid-handshake: reset the
+    // socket so `connect` can own it (`connect` refuses an open socket).
+    if stack.sockets.get::<tcp::Socket>(handle).is_open() {
+        stack.sockets.get_mut::<tcp::Socket>(handle).abort();
+        stack.poll();
+    }
+    {
+        let sock = stack.sockets.get_mut::<tcp::Socket>(handle);
+        if sock
+            .connect(stack.iface.context(), (ip, 443u16), local_port)
+            .is_err()
+        {
+            return Err("tcp connect rejected");
+        }
+    }
+    let deadline = clock::now_ms() + OP_DEADLINE_MS;
+    loop {
+        stack.poll();
+        match stack.sockets.get::<tcp::Socket>(handle).state() {
+            tcp::State::Established => break,
+            tcp::State::Closed => return Err("connection refused or reset"),
+            _ => {}
+        }
+        if clock::now_ms() > deadline {
+            stack.sockets.get_mut::<tcp::Socket>(handle).abort();
+            stack.poll();
+            return Err("tcp connect timeout");
+        }
+    }
+
+    let Stack {
+        iface,
+        dev,
+        sockets,
+        ..
+    } = stack;
+    let stream = Stream {
+        iface,
+        dev,
+        socks: sockets,
+        handle,
+    };
+    // SAFETY: the same single-use record buffers as `tls_open` —
+    // sequential TLS sessions on the single core, IRQ0 never touches
+    // them (module SAFETY note above `READ_STORAGE`).
+    let read_buf = unsafe { &mut *addr_of_mut!(READ_STORAGE) };
+    let write_buf = unsafe { &mut *addr_of_mut!(WRITE_STORAGE) };
+    let mut tls: TlsConnection<'a, Stream<'a>, Aes128GcmSha256> =
+        TlsConnection::new(stream, read_buf, write_buf);
+
+    let verifier: CertVerifier<'_, Aes128GcmSha256, RtcClock, CERT_SIZE> =
+        CertVerifier::new(Certificate::X509(ROOT_CA));
+    let config = TlsConfig::new().with_server_name(host);
+    if let Err(e) = tls.open(TlsContext::new(&config, verifier)) {
+        // Never a halt on the user path. Recycle the transport: close
+        // is best-effort (a failed handshake has nothing to notify),
+        // then RST so no TIME-WAIT holds the port.
+        serial_println!("tls: soft handshake failed: {e:?}");
+        let mut stream = match tls.close() {
+            Ok(stream) => stream,
+            Err((stream, _)) => stream,
+        };
+        stream.tcp().abort();
+        stream.pump();
+        return Err("TLS handshake failed (endpoint chain vs pinned USERTrust root)");
+    }
+    serial_println!("tls: handshake ok (TLS 1.3, pinned USERTrust ECC root)");
+    Ok(tls)
+}
+
+/// Fallible POST for **user-driven** work (A4): identical framing and
+/// validation to [`tls_post`], but every failure is an `Err` instead of
+/// `FATAL:` + halt, the status is returned rather than required to be
+/// 200 (the caller renders it), and the decoded body streams into
+/// `on` as it arrives — that is what makes SSE rendering incremental
+/// (`ResponseParser::feed` already emits body bytes per transport
+/// read; close-delimited, chunked and `Content-Length` responses all
+/// work).
+///
+/// `cap` bounds the **total** body; bytes past it are refused, never
+/// truncated. A callback returning [`ReadFlow::Stop`] (SSE `[DONE]`)
+/// ends the read immediately; the connection is then closed with
+/// close_notify best-effort plus an RST, so a user session can open the
+/// next one without a 10-second TIME-WAIT. Returns
+/// `(status, total_body_bytes)`.
+pub(crate) fn tls_post_soft<F>(
+    tls: TlsConnection<'_, Stream<'_>, Aes128GcmSha256>,
+    host: &str,
+    post: Post<'_>,
+    extra_headers: &[&str],
+    cap: usize,
+    mut on: F,
+) -> Result<(u16, usize), &'static str>
+where
+    F: FnMut(PostEvent<'_>) -> Result<ReadFlow, &'static str>,
+{
+    // SAFETY: single-use static request buffer (module SAFETY note).
+    let req = unsafe { &mut *addr_of_mut!(SOFT_REQ) };
+    let Some(req_len) = http::build_post(
+        req,
+        host,
+        post.path,
+        post.content_type,
+        post.body,
+        extra_headers,
+    ) else {
+        soft_shutdown(tls);
+        return Err("POST request does not fit the buffer");
+    };
+
+    let mut tls = tls;
+    if tls.write_all(&req[..req_len]).is_err() || tls.flush().is_err() {
+        soft_shutdown(tls);
+        return Err("TLS write failed");
+    }
+
+    // SAFETY: single-use statics (module SAFETY note). Reset first: the
+    // parser serves every sequential exchange in this module.
+    let parser = unsafe { &mut *addr_of_mut!(PARSER) };
+    parser.reset();
+    let staging = unsafe { &mut *addr_of_mut!(STAGING) };
+    let mut status = 0u16;
+    let mut head_sent = false;
+    let mut body_total = 0usize;
+    let mut scratch = [0u8; SCRATCH];
+    loop {
+        match tls.read(&mut scratch) {
+            Ok(0) => {
+                soft_shutdown(tls);
+                return Err("transport EOF without close_notify (truncated response)");
+            }
+            Ok(n) => {
+                let progress = match parser.feed(&scratch[..n], staging) {
+                    Ok(progress) => progress,
+                    Err(_) => {
+                        soft_shutdown(tls);
+                        return Err("HTTP response refused");
+                    }
+                };
+                if !head_sent && let Some(s) = parser.status() {
+                    head_sent = true;
+                    status = s;
+                    // A parsed u16 — safe to log (no log-injection
+                    // surface, the same line the boot paths print).
+                    serial_println!("http: status {s}");
+                    let content_type = http::header_value(parser.head(), b"content-type");
+                    match on(PostEvent::Head {
+                        status: s,
+                        content_type,
+                    }) {
+                        Ok(ReadFlow::Continue) => {}
+                        Ok(ReadFlow::Stop) => break,
+                        Err(e) => {
+                            soft_shutdown(tls);
+                            return Err(e);
+                        }
+                    }
+                }
+                if progress.body > 0 {
+                    // Disjoint borrows of two statics are fine, but the
+                    // framer wrote `progress.body` bytes into `staging`.
+                    let chunk = &staging[..progress.body];
+                    body_total = body_total.saturating_add(progress.body);
+                    if body_total > cap {
+                        soft_shutdown(tls);
+                        return Err("response body exceeds the byte bound");
+                    }
+                    match on(PostEvent::Body(chunk)) {
+                        Ok(ReadFlow::Continue) => {}
+                        Ok(ReadFlow::Stop) => break,
+                        Err(e) => {
+                            soft_shutdown(tls);
+                            return Err(e);
+                        }
+                    }
+                }
+                if progress.complete {
+                    break;
+                }
+            }
+            Err(TlsError::ConnectionClosed) => {
+                // Authenticated shutdown: EOF for close-delimited
+                // bodies; a short framed body is truncated, never
+                // "close enough".
+                if parser.eof().is_err() {
+                    soft_shutdown(tls);
+                    return Err("response truncated");
+                }
+                break;
+            }
+            Err(_) => {
+                soft_shutdown(tls);
+                return Err("TLS read failed");
+            }
+        }
+    }
+    if !head_sent {
+        soft_shutdown(tls);
+        return Err("response head never parsed");
+    }
+    soft_shutdown(tls);
+    Ok((status, body_total))
+}
+
+/// Best-effort close for the fallible path: `close_notify`, then an RST.
+/// The response is already fully framed when this is called on success
+/// (or deliberately abandoned on an error); the RST skips TIME-WAIT so
+/// the next user-driven connection is immediate — the same reasoning as
+/// the browser's intermediate-hop close.
+fn soft_shutdown(tls: TlsConnection<'_, Stream<'_>, Aes128GcmSha256>) {
+    let mut stream = match tls.close() {
+        Ok(stream) => stream,
+        Err((stream, _)) => stream,
+    };
+    stream.tcp().abort();
+    stream.pump();
+    serial_println!("tls: soft connection closed (RST, no TIME-WAIT)");
+}
+
 /// B1's redirect-aware exchange (docs/browser.md §7): like
 /// [`tls_fetch`] but the **status is returned, not asserted** — the
 /// caller follows a 3xx or accepts the 200 — the raw `Location`

@@ -126,7 +126,7 @@ too). Persistence of config waits for the filesystem milestone (installer/fatfs)
 | A1 | Screen layer: cell API + diff flush into `vga.rs`, ratatui no_std **build probe**, `VgaBackend`, first full-screen frame (status bar + list) driven by raw keyboard | **`TUI_OK`** (frame rendered + navigable in QEMU) | ratatui probe |
 | A2 | Editor: `editorbuf` gap-buffer crate (host tests) + viewport/cursor/editing keys/line numbers/in-memory buffers; save/open deferred to the FS milestone | **`EDITOR_OK`** (edit a buffer, undo/redo proof, on-screen) | A1 |
 | A3 | AI chat over the **mock**: `aiwire` crate (serde_json request/response/SSE, host tests) + `net::http` POST + xtask `chat-mock` on 127.0.0.1, guest reaches it at `10.0.2.2:<port>` (slirp, no DNS, no secrets) → render the reply in a chat pane | **`AI_CHAT_OK`** (request built → mock 200 → JSON parsed → reply rendered) | A1, serde_json, POST, SSE |
-| A4 | Real endpoint over TLS 1.3 + streaming SSE + key entry (RAM) — **manual verification** with the user's key/endpoint; smoke keeps the mock | manual run (documented in the doc + AGENTS note); not a smoke marker (no secrets in CI) | A3, TLS |
+| A4 | Real endpoint over TLS 1.3 + streaming SSE + key entry (RAM) — **landed 2026-11-22 (manual + `AI_CHAT_OK`, no new marker)**: `ai endpoint <https-url>` / `ai model <name>` / `ai key <token>` / `ai config` store bounded config in RAM (URL ≤ 256 B, model ≤ 64 B, key ≤ 512 B; the key is never printed); the transport is the **additive fallible** `tls::tls_open_soft` + `tls::tls_post_soft` (the boot TLS entries stay fail-closed, a shell builtin must fail soft); requests send `stream: true`, `text/event-stream` is parsed incrementally (`aiwire::Sse` → `StreamText`) and every `delta.content` is drawn into the pane as it arrives, with `application/json` still handled by the non-streaming parser; the mock's SSE responder (`10.0.2.2:8098`) is exercised inside the existing `AI_CHAT_OK` proof. Verified keylessly: TLS POST transport against `github.com` (status 404, rendered as an error), the pinned-root refusal of a Let's Encrypt endpoint (`httpbin.org` → `InvalidCertificate`) documented as the caveat, and the mock SSE render. A real-provider run still needs a key | manual run (documented in this doc + the appendix); not a smoke marker (no secrets in CI) | A3, TLS |
 | A5 | Editor ↔ chat integration: `ai` pane can quote the buffer, apply a completion into the editor (the "opencode-like" workflow) | **`AI_EDIT_OK`** — **landed 2026-11-21**: mock completion applied into the retained editor buffer (undo/redo round-trip asserted on the buffer, frame read back from `0xb8000`) + interactive `ai apply` | A2, A3 |
 | A6 | Future: graphical GUI on the VBE framebuffer (font atlas, retained widgets) and/or userland relocation of `apps/` behind syscalls | separate research | A1–A5 |
 
@@ -150,6 +150,31 @@ the mock makes the whole chain smoke-testable **without credentials**, keeping t
   ASCII/CRLF policy decided per pane; UTF-8 display is a later refinement).
 - **No FS yet**: editor cannot save; chat cannot persist history. Both are listed
   as explicitly deferred, not forgotten (they land with the installer's FS work).
+- **A4 config / transport caveats (2026-11-22):**
+  - Config is **RAM only** — nothing survives a reboot, by design (the FS
+    milestone is its persistence point).
+  - The key is never printed, rendered or logged; `ai config` reports only
+    `set (N bytes)`. **Caveat (the S3 `keyfile.rs` precedent):** the shell's
+    line discipline echoes what is typed, so an `ai key <token>` line is
+    visible on the console and stays in the shell's line buffer until the next
+    command overwrites it. There is no no-echo input mode yet; `LINE_CAP` was
+    raised 128 → 512 so one typed line can carry a key up to the 512-byte
+    config bound.
+  - **Trust is still the single pinned `USERTrust ECC Certification
+    Authority` root.** Endpoints whose chain terminates elsewhere (Let's
+    Encrypt — `httpbin.org`, `postman-echo.com`; most non-Sectigo CDNs) fail
+    the handshake **closed**, rendered as an error in the pane. Multi-root
+    trust (and the browser's `https` navigation) is the same open item
+    (docs/browser.md §8 B4).
+  - The transport is HTTP/1.1 with `Connection: close`; an endpoint that only
+    speaks HTTP/2 (ALPN) is not reachable. Responses must be
+    `application/json` or `text/event-stream`; anything else is refused.
+    Streamed totals are capped at 64 KiB (`STREAM_CAP`), SSE lines/events by
+    `aiwire` (8/16 KiB), and rendered reply text at 4 KiB (`StreamText`).
+- **Real-provider run is still pending** (no key in the repo or CI): one
+  manual run with an OpenAI-compatible endpoint over a USERTrust-chained host
+  (or after the multi-root store lands) is the remaining A4 acceptance step.
+  Everything up to the wire is proved keylessly — see the appendix.
 
 ## Appendix: verification log
 
@@ -168,24 +193,54 @@ the mock makes the whole chain smoke-testable **without credentials**, keeping t
   crates). Adopted: `VgaBackend` + widgets are the A1 rendering path.
 - 2026-11-21 — no_std SSE crate search: only futures/std-based options found
   (`eventsource-stream`, `reqwest-eventsource`).
-- 2026-11-21 — **A5 landed (`AI_EDIT_OK`, markers 22 → 23):** the editor's
-  buffer became a **retained document** — one `static mut Option<Doc>`
-  (buffer + caret) in `apps/editor.rs` under the repo's single-consumer idiom
-  (boot proof before `shell::run`, `edit`/`ai apply` served sequentially, IRQ0
-  never touches it). `edit` mounts it (`Esc` saves back instead of dropping;
-  the in-memory sample on first use), `ai apply` quotes its cursor line → one
-  sanitized mock exchange shared by all three callers
-  (`apps::ai::one_shot`: `ai <message>`, `ai apply`, the boot proof) →
-  `apply_completion` inserts at the cursor through the same `insert_at`
-  primitive typing uses, so the completion is **one undo entry** (Tab removes
-  it, Delete restores it). Boot proof: seed → quote → exchange → apply →
-  undo/redo round-trip asserted byte-exact on the buffer → editor frame read
-  back from `0xb8000`. Verified: `cargo xtask check` exit 0; `cargo xtask
-  smoke` PASS 23/23 with `AI_EDIT_OK` between `AI_CHAT_OK` and `SHELL_OK` (all
-  22 pre-existing markers intact); manual HMP session against `cargo xtask
-  run` — first `edit` showed the proof's document (`… // TODO: ask AI
-  reemplazo: mock reply ok`, `Ln 3,Col 61 [+]`), caret moved to line 4 +
-  Esc, `ai apply` printed `ai: applied \`reemplazo: mock reply ok\` at the
-  editor cursor`, reopening `edit` showed `} reemplazo: mock reply ok`
-  (`Ln 4,Col 27 [+]`), Tab removed it, Delete restored it; `ai hello` still
-  prints the mock reply (A3 path unchanged).
+- 2026-11-21 — **A3 landed (`AI_CHAT_OK`, markers 22):** the AI chat client —
+  `aiwire` (serde_json request/response + from-scratch SSE, adversarial host
+  suite) and the plain-HTTP POST to xtask's mock. Reply parsed, pane rendered,
+  read back from `0xb8000`. Verified with `cargo xtask check` (exit 0), `cargo
+  xtask smoke` PASS, and a manual `find`-style session against `cargo xtask
+  run` (`ai hello` → mock reply).
+
+- 2026-11-22 — **A4 landed (no new marker; `AI_CHAT_OK` internals extended):**
+  - `aiwire` gained `StreamText` (bounded delta accumulation, `[DONE]`,
+    code-point-safe cap) — 7 new host tests (36 total in the crate), including
+    byte-at-a-time end-to-end SSE → text over every split point.
+  - `tls.rs` gained **additive** `tls_open_soft` / `tls_post_soft`: same pinned
+    root and framing, but every failure is `Err` (a shell builtin must not
+    halt), the body streams to a callback, and the close is close_notify +
+    RST (no TIME-WAIT, so a user session can retry immediately). The boot
+    entries (`tls_open`/`tls_fetch`/`tls_post`) are byte-identical.
+  - `apps::ai`: RAM-only `Config` (URL 256 B / model 64 B / key 512 B; the key
+    never printed), `ai endpoint|model|key|config`, `ai stream <message>`
+    (keyless mock SSE demo), the TLS/streaming `ai <message>` pane with a
+    JSON fallback, and a **second half of the `AI_CHAT_OK` proof**: a
+    `stream: true` exchange against the mock's new `:8098` responder
+    (three deltas + `[DONE]`), rendered per delta, text and status read back
+    from `0xb8000`.
+  - Verified: `cargo xtask check` exit 0; `cargo xtask smoke` **PASS 30/30**
+    (markers unchanged, in order); `cargo xtask smoke-install` PASS.
+  - Manual, keyless, in QEMU (`cargo xtask run`, commands over the serial
+    console, panes captured with QEMU `screendump`):
+    - `ai config` → endpoint/model none, key none, the trust line.
+    - `ai endpoint https://github.com/` + `ai model reemplazo` + `ai hi` →
+      `tls: handshake ok (TLS 1.3, pinned USERTrust ECC root)`,
+      `http: status 404`, `tls: soft connection closed (RST, no TIME-WAIT)`;
+      the pane showed `error: endpoint answered HTTP 404 (Content-Type or
+      status refused)`. This is the **TLS POST transport proof** (github.com
+      chains to USERTrust; the 404 is GitHub's answer to POST /).
+    - `ai endpoint https://httpbin.org/post` + `ai hi` → `tls: soft handshake
+      failed: InvalidCertificate`; the pane showed `error: TLS handshake
+      failed (endpoint chain vs pinned USERTrust root)`. This is the
+      **pinning caveat** (httpbin/postman-echo chain to Let's Encrypt),
+      demonstrated fail-soft, not `FATAL`.
+    - `ai key sk-test-not-a-real-key` (a dummy) → `key stored in RAM (never
+      printed…)`; `ai config` → `key (set, 22 B, never printed)`; `ai key` →
+      the same. The value never appeared in serial output.
+    - `ai stream hello streaming` → `ai: 3 deltas streamed (mock)`; the pane
+      showed `user: hello streaming` / `assistant: reemplazo: streamed reply
+      ok` with `Esc quit · 3 deltas` (screendump checked).
+  - **Not verified (honest gap):** a real provider's chat/SSE reply needs a
+    key; the TLS **JSON-fallback buffering branch** (endpoint ignores
+    `stream: true`) was not exercised keylessly because no reachable
+    pinned-root endpoint answers JSON — the parser half is the A3 proof
+    (`ChatResponse`), the buffering half is code-reviewed only. The smoke's
+    SSE proof covers the streamed path end-to-end without credentials.
