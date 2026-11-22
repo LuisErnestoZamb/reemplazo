@@ -224,7 +224,7 @@ fn idle() {
 /// Split one input line into a command and its argument text and run
 /// the builtin. Never panics: unknown commands and bad arguments only
 /// print a hint.
-fn execute(stack: &mut Stack, payloads: &Payloads, line: &str) {
+pub(crate) fn execute(stack: &mut Stack, payloads: &Payloads, line: &str) {
     let line = line.trim();
     if line.is_empty() {
         return;
@@ -248,6 +248,7 @@ fn execute(stack: &mut Stack, payloads: &Payloads, line: &str) {
              \x20 disks             list disks: id, model, size, wipe-marker state\n\
              \x20 install <dev> yes guided install onto a wipe-marked disk\n\
              \x20 netinstall <dev> yes  same, payload fetched over the network\n\
+             \x20 apps              application launcher (top bar)\n\
              \x20 tui               full-screen TUI demo (Esc quits)\n\
              \x20 edit              in-memory text editor (Esc quits)\n\
              \x20 ai <message>      chat: mock, or the configured endpoint over TLS\n\
@@ -352,6 +353,7 @@ fn execute(stack: &mut Stack, payloads: &Payloads, line: &str) {
         "disks" => list_disks(),
         "install" => guided_cmd(stack, payloads, "install", rest),
         "netinstall" => guided_cmd(stack, payloads, "netinstall", rest),
+        "apps" => crate::apps::launcher::run(stack, payloads),
         "tui" => crate::apps::tui::run(),
         "edit" => crate::apps::editor::run(),
         // B4: the interactive browser. Its navigation errors are pages,
