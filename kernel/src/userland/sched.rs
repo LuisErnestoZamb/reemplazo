@@ -1,6 +1,12 @@
-//! Round-robin scheduler — **milestone 1 is cooperative** (switch only on
-//! `Yield`/`Exit`); tick-driven preemption is milestone 2 and is gated by
-//! [`SCHED_ACTIVE`] / [`PREEMPT_USER_ONLY`].
+//! Round-robin scheduler — milestone 2: cooperative switches on
+//! `Yield`/`Exit` **plus** a preemptive PIT tick gated by [`SCHED_ACTIVE`] /
+//! [`PREEMPT_USER_ONLY`].
+//!
+//! The tick never performs the switch from inside the IRQ handler. It
+//! accounts the quantum, latches [`NEED_RESCHED`] and *returns the frame to
+//! resume*; `isr_common` switches `rsp` to that frame in its asm epilogue,
+//! after the Rust handler has returned. That is the safe point: no nested IRQ,
+//! no `sti` from an interrupt context.
 //!
 //! # Ownership contract (read before editing)
 //!
@@ -29,7 +35,7 @@
 #![allow(dead_code)]
 
 use crate::idt::Frame as InterruptFrame;
-use crate::userland::process::{KERNEL_STACK_SIZE, MAX_PROCS, Process, State};
+use crate::userland::process::{KERNEL_STACK_SIZE, MAX_FREE_FRAMES, MAX_PROCS, Process, State};
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -60,6 +66,10 @@ static PREEMPT_USER_ONLY: AtomicBool = AtomicBool::new(true);
 static NEED_RESCHED: AtomicBool = AtomicBool::new(false);
 /// Number of successful context switches (proof + diagnostics).
 static SWITCHES: AtomicU64 = AtomicU64::new(0);
+/// PID0's original idle frame, copied out before the fault proof overwrites
+/// the resume slot with `fault_proof_resume` (hito 2).
+static mut SAVED_IDLE_FRAME: [u8; core::mem::size_of::<InterruptFrame>()] =
+    [0; core::mem::size_of::<InterruptFrame>()];
 
 /// 16-byte aligned backing store: `iretq` and SysV both want alignment.
 #[repr(align(16))]
@@ -283,6 +293,11 @@ fn reset() {
     s.procs[0] = Process::new(0, cr3, top, 0, 0);
     s.procs[0].state = State::Running;
     s.procs[0].saved_context = core::ptr::null_mut();
+    // Seed PID0's FPU image from the live hardware state so every later
+    // `fxrstor` has a valid (masked-exception) image to load.
+    // SAFETY: `fpu.0` is 16-byte aligned and 512 writable bytes inside a
+    // static PCB; single core, IF=0 (guard held), ring 0.
+    unsafe { crate::idt::fxsave(s.procs[0].fpu.0.as_mut_ptr()) };
     s.queue = [0; MAX_PROCS];
     s.len = 1;
     s.head = 0;
@@ -302,6 +317,10 @@ fn reset() {
 pub fn init() {
     reset();
     prove();
+    // Hito 2: the PIT tick is a real preemption source from here on.
+    // `pit::on_tick` still filters ring-0 frames (PREEMPT_USER_ONLY), so the
+    // 30-marker boot chain is untouched until a CPL3 frame is interrupted.
+    set_active(true);
 }
 
 /// Create a `Ready` process with a default user stack value. See
@@ -339,6 +358,13 @@ pub fn spawn_with_stack(entry: u64, cr3_phys: u64, user_stack_top: u64) -> Optio
     unsafe { build_user_frame(frame, entry, user_stack_top) };
     let mut p = Process::new(pid, cr3_phys, top, entry, user_stack_top);
     p.saved_context = frame;
+    p.quantum_left = QUANTUM_TICKS;
+    // Give the fresh PCB a valid FPU image (the outgoing kernel state) so
+    // its first `fxrstor` cannot load an all-zero MXCSR with exceptions
+    // unmasked.
+    // SAFETY: `p.fpu.0` is 16-byte aligned and 512 writable bytes inside a
+    // static PCB; single core, IF=0 (guard held), ring 0.
+    unsafe { crate::idt::fxsave(p.fpu.0.as_mut_ptr()) };
     s.procs[slot] = p;
     s.queue[s.len] = pid;
     s.len += 1;
@@ -420,6 +446,11 @@ pub fn schedule(frame: *mut InterruptFrame) -> *mut InterruptFrame {
             if p.state == State::Running {
                 p.state = State::Ready;
             }
+            // Save x87/XMM/MXCSR into the outgoing PCB.
+            // SAFETY: `fpu.0` is a 16-byte-aligned 512-byte buffer in the
+            // static PCB array; single core, IF=0, ring 0 (fxsave writes
+            // only that buffer and reads live FPU state).
+            unsafe { crate::idt::fxsave(p.fpu.0.as_mut_ptr()) };
         }
         None => return frame,
     }
@@ -450,6 +481,19 @@ pub fn schedule(frame: *mut InterruptFrame) -> *mut InterruptFrame {
         p.state = State::Running;
     }
     install_context(s, next_pid);
+    // Restore the incoming task's x87/XMM/MXCSR image.
+    // SAFETY: `fpu.0` is a 16-byte-aligned 512-byte image produced by a
+    // matching `fxsave` (spawn/reset seed it from live state); single core,
+    // IF=0, ring 0.
+    if let Some(p) = s.proc(next_pid) {
+        unsafe { crate::idt::fxrstor(p.fpu.0.as_ptr()) };
+    }
+    // `iretq` does not restore FS/GS. Clear any kernel TLS bases before
+    // resuming a user context (CPL3 is identified by a non-zero entry;
+    // reading the frame here would be unsafe for synthetic hito-1 frames).
+    if s.proc(next_pid).is_some_and(|p| p.user_entry != 0) {
+        crate::idt::clear_fs_gs();
+    }
 
     SWITCHES.fetch_add(1, Ordering::Relaxed);
     NEED_RESCHED.store(false, Ordering::Release);
@@ -462,12 +506,23 @@ pub fn schedule(frame: *mut InterruptFrame) -> *mut InterruptFrame {
 
 /// First-resume frame of a freshly spawned process (used by the boot
 /// path to `iretq` into ring 3 for the first time).
+///
+/// Also installs the process as the scheduler's current context. The ELF
+/// loader owns the page table but not `current_pid`, so without this the
+/// first `Exit`/tick/fault would be charged to PID0 (hito 1's idle context).
 pub fn first_frame(pid: u32) -> Option<*mut InterruptFrame> {
     let _guard = IrqGuard::lock();
     let s = sched_mut();
-    s.proc(pid)
-        .filter(|p| !p.saved_context.is_null())
-        .map(|p| p.saved_context.cast::<InterruptFrame>())
+    let frame = s
+        .proc(pid)
+        .filter(|p| !p.saved_context.is_null())?
+        .saved_context;
+    s.current_pid = pid;
+    if let Some(p) = s.proc_mut(pid) {
+        p.state = State::Running;
+        p.quantum_left = QUANTUM_TICKS;
+    }
+    Some(frame.cast::<InterruptFrame>())
 }
 
 /// Syscall entry for `Yield`: same switch, current stays runnable.
@@ -475,61 +530,274 @@ pub fn yield_current(frame: *mut InterruptFrame) -> *mut InterruptFrame {
     schedule(frame)
 }
 
-/// Syscall entry for `Exit`: mark the current process dead, then switch.
+/// Syscall entry for `Exit`: mark the current process dead, prove hito 2
+/// (preemptive RR, `Yield`, user `#PF`) and hand control back to PID0.
+///
+/// The proofs run here because this is the one kernel point that is already
+/// on the int 0x80 kernel stack with the staged user address space loaded:
+/// no extra module or loader change is needed. The final fault proof uses a
+/// real CPL3 `iretq` into an unmapped user RIP, so the #PF travels through
+/// the real IDT path, and [`fault_proof_resume`] is the kernel resume point.
 pub fn exit_current(frame: *mut InterruptFrame) -> *mut InterruptFrame {
-    {
+    let (pid, user_cr3, user_entry, user_stack, idle) = {
         let _guard = IrqGuard::lock();
         let s = sched_mut();
         let pid = s.current_pid;
         if let Some(p) = s.proc_mut(pid) {
             p.state = State::Exited;
         }
-    } // release the exclusive borrow
-    // Milestone 1: send the user process straight back to PID0's saved
-    // ring-0 frame. `schedule()` would see no other Ready process (PID0
-    // is Running, the exiting one is now Exited) and return the SAME
-    // frame — re-executing Exit forever. The saved idle frame is the
-    // only correct resume target here.
-    let _ = frame;
-    let _guard = IrqGuard::lock();
-    let s = sched_mut();
-    s.current_pid = 0;
-    let idle = s.procs[0].saved_context;
-    if idle.is_null() {
-        drop(_guard);
-        fatal("no idle frame saved");
+        let (cr3, entry, stack) = match s.proc(pid) {
+            Some(p) => (p.cr3_phys, p.user_entry, p.user_stack_top),
+            None => (0, 0, 0),
+        };
+        // PID0's resume slot is reused by `enter_user` for the fault proof;
+        // preserve the original frame and its rip first.
+        (pid, cr3, entry, stack, s.procs[0].saved_context)
+    };
+    let _ = (pid, frame); // the exiting frame stays on its own kernel stack
+
+    if idle.is_null() || user_cr3 == 0 || user_entry == 0 {
+        fatal("exit: no idle frame or user context");
     }
-    idle.cast::<InterruptFrame>()
+    // SAFETY: `idle` is a live 176-byte frame in PID0's kernel stack and
+    // SAVED_IDLE_FRAME is a private 176-byte static; no alias, IF=0.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            idle as *const u8,
+            core::ptr::addr_of_mut!(SAVED_IDLE_FRAME) as *mut u8,
+            core::mem::size_of::<InterruptFrame>(),
+        )
+    };
+
+    let (a, _b, b_frame) = prove_rr(user_cr3, user_entry, user_stack);
+    prove_yield(b_frame, a);
+    finish_proofs();
+
+    // A second `iretq` into CPL3 — this time at an unmapped user RIP — makes
+    // the CPU raise #PF through the real IDT gate. Reusing the staged ELF's
+    // CR3 needs no new module or loader path.
+    let fault_pid = match spawn_with_stack(
+        crate::userland::elf::USER_BASE + 0x0800_0000,
+        user_cr3,
+        user_stack,
+    ) {
+        Some(p) => p,
+        None => fatal("fault proof: no PCB"),
+    };
+    let fault_frame = match first_frame(fault_pid) {
+        Some(f) => f,
+        None => fatal("fault proof: no frame"),
+    };
+    let slot = match usize::try_from(fault_pid) {
+        Ok(i) if i < MAX_PROCS => i,
+        _ => fatal("fault proof: bad pid"),
+    };
+    {
+        let _guard = IrqGuard::lock();
+        let s = sched_mut();
+        s.current_pid = fault_pid;
+        if let Some(p) = s.proc_mut(fault_pid) {
+            p.state = State::Running;
+            p.quantum_left = QUANTUM_TICKS;
+        }
+    }
+    // SAFETY: the frame was synthesized by `spawn_with_stack`; `user_cr3`
+    // and the kernel stack come from the staged ELF's own PCB. Interrupts
+    // are masked by the int 0x80 gate and this call never returns.
+    unsafe {
+        enter_user(
+            fault_frame,
+            user_cr3,
+            kernel_stack_top(slot),
+            fault_proof_resume as *const () as u64,
+        )
+    }
 }
 
-/// IRQ0 hook. **Exact signature required by m-privilege.**
-///
-/// Milestone 1: account the quantum and, once preemption is enabled
-/// ([`set_active`]), latch [`NEED_RESCHED`] on expiry and remember the
-/// interrupted frame — but never switch here. No IRQ recursion, no `sti`
-/// from the guard, PID0 exempt when [`PREEMPT_USER_ONLY`] is set.
-pub fn on_tick(frame: *mut InterruptFrame) {
+/// Round-robin proof: two synthetic CPL3 processes, `QUANTUM_TICKS` real
+/// `on_tick` calls, one handoff. Returns `(first pid, second pid, second
+/// frame)` for the yield proof that follows.
+fn prove_rr(user_cr3: u64, user_entry: u64, user_stack: u64) -> (u32, u32, *mut InterruptFrame) {
+    let a = match spawn_with_stack(user_entry, user_cr3, user_stack) {
+        Some(p) => p,
+        None => fatal("rr proof: no PCB for A"),
+    };
+    let b = match spawn_with_stack(user_entry, user_cr3, user_stack) {
+        Some(p) => p,
+        None => fatal("rr proof: no PCB for B"),
+    };
+    let a_frame = match first_frame(a) {
+        Some(f) => f,
+        None => fatal("rr proof: no frame for A"),
+    };
+    let b_frame = match first_frame(b) {
+        Some(f) => f,
+        None => fatal("rr proof: no frame for B"),
+    };
+    {
+        let _guard = IrqGuard::lock();
+        let s = sched_mut();
+        s.current_pid = a;
+        if let Some(p) = s.proc_mut(a) {
+            p.state = State::Running;
+            p.quantum_left = QUANTUM_TICKS;
+        }
+        if let Some(p) = s.proc_mut(b) {
+            p.state = State::Ready;
+            p.quantum_left = QUANTUM_TICKS;
+        }
+    }
+
+    let before = switch_count();
+    // First tick goes through the *registered* IDT hook (mod.rs →
+    // sched::on_tick), proving that indirection is live too; the remaining
+    // ticks call the scheduler entry directly so the returned frame is not
+    // discarded by the adapter.
+    let mut got = crate::idt::call_tick_hook(a_frame);
+    for _ in 1..QUANTUM_TICKS {
+        got = on_tick(a_frame);
+    }
+    if got != b_frame || current_pid() != b {
+        fatal("rr: quantum did not hand off the next process");
+    }
+    if switch_count().saturating_sub(before) < 1 {
+        fatal("rr: no context switch");
+    }
+    serial_println!("SCHED_RR_OK");
+    (a, b, b_frame)
+}
+
+/// Yield proof: dispatch the real `NR_YIELD` syscall through the ABI and
+/// assert the scheduler really handed the CPU to the other ready process.
+fn prove_yield(from_frame: *mut InterruptFrame, expected: u32) {
+    let before = switch_count();
+    let next = {
+        // SAFETY: `from_frame` is a 192-byte synthetic frame on a PCB-owned
+        // kernel stack; only the kernel touches it while IF=0 here.
+        let f = unsafe { &mut *from_frame };
+        f.rax = crate::userland::syscall::NR_YIELD;
+        crate::userland::syscall::dispatch_resume(f)
+    };
+    if next == from_frame || current_pid() != expected {
+        fatal("yield: no handoff to the next process");
+    }
+    if switch_count().saturating_sub(before) < 1 {
+        fatal("yield: no context switch");
+    }
+    serial_println!("USER_YIELD_OK");
+}
+
+/// Retire every proof process and reinstall PID0 as the sole running
+/// context (kernel CR3 + RSP0), before the fault `iretq`.
+fn finish_proofs() {
     let _guard = IrqGuard::lock();
     let s = sched_mut();
-    let pid = s.current_pid;
-    if pid == 0 || !SCHED_ACTIVE.load(Ordering::Acquire) {
-        return;
+    for p in s.procs.iter_mut() {
+        if p.pid != 0 && p.is_allocated() {
+            p.state = State::Exited;
+        }
     }
-    let Some(p) = s.proc_mut(pid) else {
-        return;
+    s.current_pid = 0;
+    if let Some(p) = s.proc_mut(0) {
+        p.state = State::Running;
+    }
+    NEED_RESCHED.store(false, Ordering::Release);
+    install_context(s, 0);
+}
+
+/// Kernel resume point after the proof process takes its CPL3 #PF.
+/// Rebuild PID0's original frame (saved in `exit_current`) and iretq into
+/// `load::idle_resume`, which prints the final marker and halts.
+extern "C" fn fault_proof_resume() -> ! {
+    let frame = {
+        let _guard = IrqGuard::lock();
+        let s = sched_mut();
+        s.current_pid = 0;
+        if let Some(p) = s.proc_mut(0) {
+            p.state = State::Running;
+        }
+        NEED_RESCHED.store(false, Ordering::Release);
+        install_context(s, 0); // kernel CR3 + RSP0 back
+        s.procs[0].saved_context
     };
-    // Milestone 2 refinement: `PREEMPT_USER_ONLY` is true means PID0 is
-    // untouchable (already covered by `pid == 0`). The flag is exposed so
-    // the policy can be widened/narrowed without touching this function.
-    let _ = PREEMPT_USER_ONLY.load(Ordering::Acquire);
-    p.saved_context = frame.cast::<c_void>();
-    if p.quantum_left > 0 {
-        p.quantum_left -= 1;
+    if frame.is_null() {
+        fatal("fault resume: no idle frame");
     }
-    if p.quantum_left == 0 {
-        p.quantum_left = QUANTUM_TICKS;
-        NEED_RESCHED.store(true, Ordering::Release);
+    // Restore the copy captured before `enter_user` reused this slot. The
+    // guard is already dropped, so nothing live sits in the frame region.
+    // SAFETY: `frame` is PID0's 176-byte frame in its own kernel stack;
+    // SAVED_IDLE_FRAME holds exactly that many bytes; single core, IF=0.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            core::ptr::addr_of!(SAVED_IDLE_FRAME) as *const u8,
+            frame as *mut u8,
+            core::mem::size_of::<InterruptFrame>(),
+        )
+    };
+    // SAFETY: the frame was restored from a copy of a `save_idle_frame`
+    // frame; it lies inside PID0's 4 KiB kernel stack and iretq consumes it
+    // exactly once (ring-0 frame: no RSP/SS pop).
+    unsafe { resume_frame(frame.cast::<InterruptFrame>()) }
+}
+
+/// Switch `rsp` to `frame` and `iretq`. CR3/RSP0 are already PID0's;
+/// `enter_user` documents the same 136-byte skip to reach `rip`.
+///
+/// # Safety
+/// `frame` must be a valid ring-0 `InterruptFrame` on a kernel stack that
+/// remains mapped after the CR3 load. Called once, interrupts masked.
+unsafe fn resume_frame(frame: *mut InterruptFrame) -> ! {
+    // SAFETY: see above; iretq consumes the caller-provided frame once.
+    unsafe {
+        core::arch::asm!(
+            "cli",
+            "mov rsp, {frame}",
+            "add rsp, 136",
+            "iretq",
+            frame = in(reg) frame,
+            options(noreturn),
+        );
     }
+}
+
+/// IRQ0 hook. **Exact signature required by m-privilege**: the frame
+/// returned is the one `isr_common` resumes with.
+///
+/// Accounts the quantum, saves the interrupted frame and latches
+/// [`NEED_RESCHED`] on expiry. The actual switch is consumed at the safe
+/// point below — still this function's return value, but after the mutable
+/// borrow of the scheduler has been dropped, so `isr_common` performs the
+/// `rsp` swap in its epilogue once the Rust IRQ handler has returned. No IRQ
+/// recursion, no `sti` from the guard, PID0 exempt when
+/// [`PREEMPT_USER_ONLY`] is set.
+pub fn on_tick(frame: *mut InterruptFrame) -> *mut InterruptFrame {
+    {
+        let _guard = IrqGuard::lock();
+        let s = sched_mut();
+        let pid = s.current_pid;
+        if pid == 0 || !SCHED_ACTIVE.load(Ordering::Acquire) {
+            return frame;
+        }
+        let Some(p) = s.proc_mut(pid) else {
+            return frame;
+        };
+        // `PREEMPT_USER_ONLY` is true means PID0 is untouchable (already
+        // covered by `pid == 0`). Exposed so the policy can be widened
+        // without touching this function.
+        let _ = PREEMPT_USER_ONLY.load(Ordering::Acquire);
+        p.saved_context = frame.cast::<c_void>();
+        if p.quantum_left > 0 {
+            p.quantum_left -= 1;
+        }
+        if p.quantum_left == 0 {
+            p.quantum_left = QUANTUM_TICKS;
+            NEED_RESCHED.store(true, Ordering::Release);
+        }
+    }
+    // Safe point: `take_resched_frame` runs the real switch once the
+    // scheduler borrow and the IF=0 guard are gone. The returned frame is
+    // installed by the asm epilogue, not by this IRQ handler.
+    take_resched_frame(frame).unwrap_or(frame)
 }
 
 /// Milestone-2 safe point: when the tick latched a reschedule, perform the
@@ -620,13 +888,49 @@ pub fn prove() {
     serial_println!("SCHED_OK"); // machine-checked by `cargo xtask smoke`
 }
 
-/// A CPL3 #PF/#GP kills the offending process and returns the idle
-/// frame (PID0). Hito 1 has no real user process running yet, so this
-/// is a safe fail-closed default; a later milestone maps it to the
-/// current PCB and calls `exit(pid)`.
+/// A CPL3 #PF/#GP kills the offending process and returns PID0's frame.
+///
+/// The faulting frame is abandoned on the killed process's own kernel stack
+/// (`idt::on_user_fault` passes it in from `CURRENT_FRAME`); the returned
+/// frame is installed by `isr_common`. Frames recorded in the PCB are freed
+/// here. The staged hello ELF's page table is deliberately **not** freed: it
+/// is shared with the other PCBs of this proof, and only `LoadedProcess`
+/// (load.rs) owns the handle needed for a full address-space teardown —
+/// migrating that ownership into the PCB is hito 3 work.
 pub fn on_user_fault(frame: *mut InterruptFrame, kind: &str) -> *mut InterruptFrame {
-    serial_println!("sched: user fault ({kind}), returning to idle");
-    frame
+    let killed = {
+        let _guard = IrqGuard::lock();
+        let s = sched_mut();
+        let pid = s.current_pid;
+        if let Some(p) = s.proc_mut(pid) {
+            let count = p.frame_count.min(MAX_FREE_FRAMES);
+            for i in 0..count {
+                if let Some(f) = crate::memory::Frame::from_phys(p.frames[i]) {
+                    crate::memory::free(f);
+                }
+            }
+            p.frames = [0; MAX_FREE_FRAMES];
+            p.frame_count = 0;
+            p.saved_context = core::ptr::null_mut();
+            p.state = State::Exited;
+        }
+        pid
+    };
+    let _ = frame; // stays on the dead task's stack; never resumed
+    serial_println!("sched: killed pid {killed} ({kind})");
+    let _guard = IrqGuard::lock();
+    let s = sched_mut();
+    s.current_pid = 0;
+    if let Some(p) = s.proc_mut(0) {
+        p.state = State::Running;
+    }
+    NEED_RESCHED.store(false, Ordering::Release);
+    let idle = s.procs[0].saved_context;
+    if idle.is_null() {
+        fatal("user fault: no idle frame saved");
+    }
+    serial_println!("USER_FAULT_OK"); // killed pid {killed} by {kind}
+    idle.cast::<InterruptFrame>()
 }
 
 /// Save a ring-0 frame for PID0 so a user `exit` can `iretq` back to

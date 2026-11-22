@@ -60,15 +60,40 @@ pub fn set_exit_hook(hook: extern "C" fn(i64)) {
 /// `frame.rax`, the six SysV arguments from the saved GPRs, and returns the
 /// result (also stored back into `frame.rax` for either caller convention).
 pub fn dispatch(frame: &mut Frame) -> i64 {
+    let (ret, _next) = dispatch_inner(frame);
+    ret
+}
+
+/// Like [`dispatch`], but also returns the frame the caller must resume.
+///
+/// Ordinary syscalls return the incoming frame. `Yield` returns the frame
+/// of the next runnable process, so the `int 0x80` hook can make the switch
+/// real by returning *this* value instead of its own `frame` pointer.
+///
+/// **Integrator action (mod.rs, `syscall_hook`):** replace
+/// `syscall::dispatch(f);` with
+/// `let resume = syscall::dispatch_resume(f);` and return `resume` at the
+/// end of the adapter (keep the `NR_EXIT` arm's `exit_current` path).
+pub fn dispatch_resume(frame: &mut Frame) -> *mut Frame {
+    let (_ret, next) = dispatch_inner(frame);
+    next
+}
+
+fn dispatch_inner(frame: &mut Frame) -> (i64, *mut Frame) {
     let nr = frame.rax;
-    let ret = match nr {
-        NR_WRITE => sys_write(frame.rdi, frame.rsi, frame.rdx),
-        NR_EXIT => sys_exit(frame.rdi as i64),
-        NR_YIELD => sys_yield(),
-        NR_TIME => sys_time(),
-        _ => ENOSYS,
+    let ptr: *mut Frame = frame;
+    let (ret, next) = match nr {
+        NR_WRITE => (sys_write(frame.rdi, frame.rsi, frame.rdx), ptr),
+        NR_EXIT => (sys_exit(frame.rdi as i64), ptr),
+        NR_YIELD => (0, sys_yield(ptr)),
+        NR_TIME => (sys_time(), ptr),
+        _ => (ENOSYS, ptr),
     };
-    frame.rax = ret as u64;
+    // SAFETY: `ptr` was derived from the live `&mut frame` and is the only
+    // handle used again after the match (the Yield arm may have handed the
+    // raw pointer to the scheduler). Writing through it keeps that single
+    // provenance chain instead of reviving the `&mut`.
+    unsafe { (*ptr).rax = ret as u64 };
 
     // The marker fires on the first real dispatch even if the integrator
     // never calls `selftest()` explicitly. The flag is set before the
@@ -76,7 +101,7 @@ pub fn dispatch(frame: &mut Frame) -> i64 {
     if !SELFTEST_DONE.load(Ordering::Relaxed) {
         selftest();
     }
-    ret
+    (ret, next)
 }
 
 /// `write`: validate the user buffer, then mirror the bytes to the serial
@@ -122,11 +147,12 @@ fn sys_exit(code: i64) -> i64 {
     crate::halt()
 }
 
-/// `yield`: milestone 1 is cooperative — return 0 immediately. The
-/// scheduler replaces this with a context switch when the preemptive tick
-/// lands (milestone 2). No spin/hlt here: a yield must not block the caller.
-fn sys_yield() -> i64 {
-    0
+/// `yield`: hand the CPU to the next runnable process through the same
+/// scheduler entry point used by the tick (`sched::yield_current`). The
+/// returned frame is the one the `int 0x80` hook must resume; `dispatch`
+/// (used by the current adapter) still returns only the `0` result.
+fn sys_yield(frame: *mut Frame) -> *mut Frame {
+    super::sched::yield_current(frame)
 }
 
 /// `time`: whole milliseconds since boot, from the PIT-driven monotonic

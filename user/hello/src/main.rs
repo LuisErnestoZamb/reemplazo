@@ -15,6 +15,10 @@ core::arch::global_asm!(include_str!("../start.S"), options(att_syntax));
 pub extern "C" fn main() -> ! {
     const MSG: &[u8] = b"hello from userland\n";
     let _ = sys::write(1, MSG);
+    // Hito 2: exercise the real ring-3 `Yield` syscall before exiting. With
+    // only this process runnable the scheduler returns the same frame, so
+    // the call is a genuine cooperative handoff rather than a no-op stub.
+    let _ = sys::yield_now();
     sys::exit(0)
 }
 

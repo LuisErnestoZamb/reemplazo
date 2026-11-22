@@ -47,14 +47,15 @@ pub fn ticks() -> u64 {
 
 /// Scheduler seam for IRQ0: returns the frame the CPU must resume with.
 ///
-/// `HZ`, [`init`] and [`tick`] are unchanged — this is only the hook the
-/// integrator connects to `crate::userland::sched::on_tick` via
-/// [`crate::idt::register_sched_hooks`]. No hook (or `SCHED_ACTIVE == false`)
-/// means the interrupted context resumes, which keeps the boot chain and
-/// the cooperative milestone intact.
+/// `HZ`, [`init`] and [`tick`] are unchanged. PREEMPT_USER_ONLY: PID0 runs
+/// in ring 0 and is never switched out by a tick; only a frame saved from
+/// CPL3 is offered to the scheduler.
 ///
-/// PREEMPT_USER_ONLY: PID0 runs in ring 0 and is never switched out by a
-/// tick; only a frame saved from CPL3 is offered to the scheduler.
+/// Hito 2 calls `sched::on_tick` directly instead of going through
+/// `idt::call_tick_hook`: the switch is expressed as the *returned frame*,
+/// and `mod.rs::tick_hook` still discards that value. `isr_common` installs
+/// the returned frame in its asm epilogue, after this IRQ handler returned —
+/// that is the safe point, so no switch is performed recursively in the IRQ.
 pub fn on_tick(frame: *mut crate::idt::Frame) -> *mut crate::idt::Frame {
     if !crate::idt::SCHED_ACTIVE.load(Ordering::Acquire) {
         return frame;
@@ -65,5 +66,5 @@ pub fn on_tick(frame: *mut crate::idt::Frame) -> *mut crate::idt::Frame {
     if !from_user {
         return frame;
     }
-    crate::idt::call_tick_hook(frame)
+    crate::userland::sched::on_tick(frame)
 }
