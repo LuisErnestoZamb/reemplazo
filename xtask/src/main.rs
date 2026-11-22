@@ -144,6 +144,8 @@ fn check(root: &Path) -> bool {
                 "-p",
                 "dom",
                 "-p",
+                "csscore",
+                "-p",
                 "net",
                 "-p",
                 "pci",
@@ -197,6 +199,8 @@ fn check(root: &Path) -> bool {
                 "html",
                 "-p",
                 "dom",
+                "-p",
+                "csscore",
                 "-p",
                 "mbi",
                 "-p",
@@ -671,7 +675,14 @@ fn run(root: &Path) -> bool {
 /// paragraph, status URL — rendered in the TUI viewport and read back
 /// from `0xb8000`, plus a fixture frame asserting headings, list
 /// markers, `<pre>` whitespace, dim code, inverse link cells and the
-/// `display:none` skip) — within
+/// `display:none` skip), `BROWSER_CSS_OK` (B3 CSS subset: the
+/// kernel-owned styled fixture parsed by `csscore`, cascaded with
+/// specificity/source-order/inline precedence, rendered and read back
+/// from `0xb8000` — exact VGA attribute bytes for `color`,
+/// `background-color` and `font-weight`, the margin/padding cell shift,
+/// `display:none` absence — then the same body without its sheet,
+/// proving the defaults return; the real page's own sheet is applied
+/// as a robustness pass) — within
 /// [`SMOKE_TIMEOUT`]. Then the keyboard milestone:
 /// once `SHELL_OK` matches, connect to QEMU's HMP monitor
 /// ([`monitor_port`]) and type `echo KEYBOARD_OK` key by key with
@@ -696,7 +707,10 @@ fn run(root: &Path) -> bool {
 /// document, completion apply + undo round-trip, editor-frame
 /// readback), the B2 browser render (HTML tree builder over the
 /// tokenizer, text layout — wrap/heads/lists/pre/links — and the
-/// viewport frame read back from `0xb8000`), the serial
+/// viewport frame read back from `0xb8000`), the B3 CSS subset (sheet
+/// parsing, specificity/source-order/inline cascade, VGA attribute
+/// mapping and the styled-vs-unstyled fixture pair read back from
+/// `0xb8000`), the serial
 /// shell coming up, or the keyboard path (i8042 bring-up, scancode
 /// decode, input multiplexing) — so it gates every milestone in the
 /// chain.
@@ -704,7 +718,7 @@ fn run(root: &Path) -> bool {
 /// It runs **without a disk**, so the `ata::probe` that sits between
 /// `PCI_OK` and `E1000_OK` stays silent here.
 fn smoke(root: &Path) -> bool {
-    const MARKERS: [&str; 26] = [
+    const MARKERS: [&str; 27] = [
         "BOOT_OK",
         "VGA_OK",
         "MEM_OK",
@@ -729,6 +743,7 @@ fn smoke(root: &Path) -> bool {
         "BROWSER_FETCH_OK",
         "AI_EDIT_OK",
         "BROWSER_RENDER_OK",
+        "BROWSER_CSS_OK",
         "SHELL_OK",
         "KEYBOARD_OK",
     ];

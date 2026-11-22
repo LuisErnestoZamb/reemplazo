@@ -87,7 +87,7 @@ The smoke test asserts each milestone's serial marker in order — boot
 markers within 30 s, then the keyboard phase within a further 15 s:
 
 ```
-BOOT_OK → VGA_OK → MEM_OK → ALLOC_OK → RTC_OK → PCI_OK → USB_KBD_OK → E1000_OK → NET_OK → PING_OK → DHCP_OK → DNS_OK → TCP_OK → TLS_OK → HTTP_OK → GIT_LSREMOTE_OK → SSH_KEXINIT_OK → INT_OK → TUI_OK → EDITOR_OK → AI_CHAT_OK → BROWSER_FETCH_OK → AI_EDIT_OK → BROWSER_RENDER_OK → SHELL_OK → KEYBOARD_OK
+BOOT_OK → VGA_OK → MEM_OK → ALLOC_OK → RTC_OK → PCI_OK → USB_KBD_OK → E1000_OK → NET_OK → PING_OK → DHCP_OK → DNS_OK → TCP_OK → TLS_OK → HTTP_OK → GIT_LSREMOTE_OK → SSH_KEXINIT_OK → INT_OK → TUI_OK → EDITOR_OK → AI_CHAT_OK → BROWSER_FETCH_OK → AI_EDIT_OK → BROWSER_RENDER_OK → BROWSER_CSS_OK → SHELL_OK → KEYBOARD_OK
 ```
 
 `KEYBOARD_OK` is the keyboard milestone's end-to-end proof: after

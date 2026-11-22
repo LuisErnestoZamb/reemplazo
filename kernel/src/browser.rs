@@ -36,6 +36,7 @@ use crate::netstack::{OP_DEADLINE_MS, Stack};
 use crate::tls::{self, FetchCfg};
 use core::cmp::min;
 use core::ptr::addr_of_mut;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use net::http::{self, ResponseParser};
 use smoltcp::socket::tcp;
 use smoltcp::wire::Ipv4Address;
@@ -111,6 +112,10 @@ static mut BODY: [u8; BODY_SAMPLE] = [0; BODY_SAMPLE];
 /// Raw `Location` value of the current hop (wire bytes; the caller
 /// sanitizes before printing and validates before resolving).
 static mut LOC: [u8; LOC_CAP] = [0; LOC_CAP];
+/// Stored length of [`BODY`]'s head after the last [`fetch`] — read by
+/// the B3 CSS proof, which reuses the page B2 just rendered instead of
+/// spending a second network round-trip.
+static STORED: AtomicUsize = AtomicUsize::new(0);
 
 fn fatal(msg: &str) -> ! {
     serial_println!("FATAL: browser: {msg}");
@@ -521,6 +526,8 @@ fn fetch(stack: &mut Stack, start: &str) -> Fetched {
     if body_total == 0 {
         fatal("empty response body");
     }
+    let stored = min(body_total, BODY_SAMPLE);
+    STORED.store(stored, Ordering::Relaxed);
     let mut fbuf = [0u8; SANITIZE_CAP];
     let final_shown = sanitize(final_url.as_str().as_bytes(), &mut fbuf);
     serial_println!(
@@ -530,7 +537,7 @@ fn fetch(stack: &mut Stack, start: &str) -> Fetched {
         url: final_url,
         // The sample is filled head-first by both hop classes, so the
         // stored prefix is exactly `min(total, BODY_SAMPLE)`.
-        stored: min(body_total, BODY_SAMPLE),
+        stored,
         total: body_total,
     }
 }
@@ -584,4 +591,26 @@ pub fn render_smoke(stack: &mut Stack) {
         fatal("body sample out of range");
     };
     crate::apps::browser::boot_proof(html, status);
+}
+
+/// The B3 proof (docs/browser.md §5/§7): render the kernel-owned CSS
+/// fixture with and without its stylesheet and read the VGA attribute
+/// bytes back from `0xb8000`, then apply the **real page's** own sheet
+/// (the body sample [`render_smoke`] just fetched — no extra network)
+/// as a robustness pass. Prints `BROWSER_CSS_OK` between
+/// `BROWSER_RENDER_OK` and `SHELL_OK`; fail-closed
+/// (`FATAL: browser:` + [`crate::halt`]) on any fixture mismatch.
+///
+/// `kernel_main` calls this immediately after [`render_smoke`], so
+/// [`BODY`]/[`STORED`] still hold that fetch's sample. A missing or
+/// empty sample simply skips the real-page pass (the fixture proof is
+/// kernel-owned and still runs).
+pub fn css_smoke() {
+    let stored = STORED.load(Ordering::Relaxed);
+    // SAFETY: single-use static — the same `READ_STORAGE` contract as
+    // `render_smoke`: `fetch` has returned (its `&mut` is gone),
+    // sequential use on one core, IRQ0 never touches `BODY`.
+    let body = unsafe { &*core::ptr::addr_of!(BODY) };
+    let real = body.get(..stored.min(body.len())).filter(|h| !h.is_empty());
+    crate::apps::browser::css_boot_proof(real);
 }
