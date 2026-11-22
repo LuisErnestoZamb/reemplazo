@@ -7,6 +7,7 @@
 //!   smoke   boot the ISO headless; assert serial markers in order,
 //!           then type a command through QEMU's monitor (KEYBOARD_OK)
 //!   smoke-install  boot with a FAT16 IDE disk; assert BLK_OK + FAT_OK
+//!           + FS_WRITE_OK (write + re-mount read-back)
 //!   run     build + iso + boot interactively (serial on stdio; keys
 //!           can also be injected via the printed monitor address)
 //!
@@ -686,13 +687,16 @@ fn smoke(root: &Path) -> bool {
     boot_assert(root, "smoke", &MARKERS, None, true)
 }
 
-/// Installer milestones 1 + FS1 (`BLK_OK`, `FAT_OK`): build the ISO,
-/// write a 64 MiB `target/iso-root/disk.img` that is a **valid FAT16
-/// volume** carrying the `ata` magic in its boot sector's bootstrap
-/// area (see [`write_disk_image`]), boot with the image attached as an
-/// IDE drive, and require the kernel's `BLK_OK` (the ATA probe accepted
-/// LBA0) *and* `FAT_OK` (the kernel mounted that volume and read
-/// `/README.TXT` back byte for byte) in that order.
+/// Installer milestones 1 + FS1 + FS2 (`BLK_OK`, `FAT_OK`,
+/// `FS_WRITE_OK`): build the ISO, write a 64 MiB
+/// `target/iso-root/disk.img` that is a **valid FAT16 volume** carrying
+/// the `ata` magic in its boot sector's bootstrap area (see
+/// [`write_disk_image`]), boot with the image attached as an IDE drive,
+/// and require the kernel's `BLK_OK` (the ATA probe accepted LBA0),
+/// `FAT_OK` (the kernel mounted that volume and read `/README.TXT`
+/// back byte for byte) and `FS_WRITE_OK` (the kernel *wrote*
+/// `/RESULT.TXT`, re-mounted from scratch and read it back byte-exact,
+/// with `/README.TXT` re-checked for clobbering) in that order.
 ///
 /// Note the image is created **after** `iso()` (which wipes
 /// `target/iso-root`) and lives inside it, so the container's `/iso`
@@ -709,7 +713,7 @@ fn smoke_install(root: &Path) -> bool {
     boot_assert(
         root,
         "smoke-install",
-        &["BLK_OK", "FAT_OK"],
+        &["BLK_OK", "FAT_OK", "FS_WRITE_OK"],
         Some(&disk),
         false,
     )

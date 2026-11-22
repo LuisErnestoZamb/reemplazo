@@ -1,5 +1,6 @@
-//! Read-only **FAT16** reader — the filesystem half of installer
-//! milestone FS1 (`FAT_OK`, `cargo xtask smoke-install`).
+//! **FAT16** reader (FS1, `FAT_OK`) + writer (FS2, `FS_WRITE_OK`) — the
+//! filesystem half of the installer milestones (`cargo xtask
+//! smoke-install`).
 //!
 //! # Why this crate exists (dependency policy exception (a))
 //!
@@ -16,10 +17,11 @@
 //! maintained `no_std` FAT reader was adopted because the milestone's
 //! dependency policy admits **no new crates besides `fatfs`**.
 //!
-//! So: from-scratch, read-only, `#![no_std]`, `#![forbid(unsafe_code)]`,
-//! zero dependencies — parsing is pure byte arithmetic over a
+//! So: from-scratch, `#![no_std]`, `#![forbid(unsafe_code)]`, zero
+//! dependencies — parsing and writing are pure byte arithmetic over a
 //! [`BlockDevice`] the caller supplies, which is exactly what makes it
-//! host-testable (`tests/hostile.rs` feeds crafted in-memory images).
+//! host-testable (`tests/hostile.rs` feeds crafted in-memory images,
+//! `tests/write.rs` drives the write path against a model).
 //!
 //! # What is validated before a single cluster is touched
 //!
@@ -52,15 +54,49 @@
 //! # Documented v1 limits
 //!
 //! FAT16 only (FAT12 and FAT32 volumes are refused as [`Error::NotFat16`]),
-//! read-only, ASCII-case-insensitive lookup, no `/./`-style path syntax
+//! ASCII-case-insensitive lookup, no `/./`-style path syntax
 //! (`.`, `..` and empty components are refused — [`Error::Path`]), and
 //! long names are capped at 255 UTF-16 units.
+//!
+//! # FS2: the write slice
+//!
+//! [`Fat16::write_file`] (create-or-overwrite) and [`Fat16::create_file`]
+//! (refuses to clobber — [`Error::Exists`]) implement the minimal honest
+//! write set: create a file in the root directory *or in an existing
+//! subdirectory* (no `mkdir` — creating directories is not supported),
+//! overwrite in place, grow the cluster chain, truncate and free the
+//! tail. The full policy lives in [`write`]'s module docs; the headline
+//! points:
+//!
+//! - **Write-through, no `flush()`.** Every FAT sector, data sector and
+//!   directory sector is written to the device inside the operation, in
+//!   the order FAT → data → directory entry (the entry is the single
+//!   field readers consult, so it acts as the operation's commit point).
+//!   **Crash consistency is explicitly NOT a goal of FS2** — no journal,
+//!   no flush barriers, no drive `FLUSH CACHE`; power-loss ordering is a
+//!   later milestone.
+//! - **Names must be 8.3-encodable** (see [`write`]): long names are
+//!   *refused* ([`Error::InvalidName`]), short names are uppercased —
+//!   this crate never writes LFN entries.
+//! - Every refusal is fail-closed and panic-free: disk full
+//!   ([`Error::NoSpace`]), out-of-range/corrupt chains
+//!   ([`Error::BadChain`], reusing the FS1 validators), a device without
+//!   write support ([`Error::ReadOnly`], the [`BlockDevice::write_at`]
+//!   default), a bad timestamp ([`Error::Stamp`]).
+//!
+//! Timestamps come from the caller (the kernel passes its RTC reading, a
+//! fixed documented value when the clock is dead) — this crate never
+//! invents a clock.
 
 #![no_std]
 #![forbid(unsafe_code)]
 
 mod dir;
-/// Device-sector granularity the block layer speaks (ATA PIO reads
+/// The write half (FS2): [`write::Stamp`] and the writer's module docs
+/// (ordering, naming rule, refusals) live here.
+pub mod write;
+pub use write::Stamp;
+/// Device-sector granularity the block layer speaks (ATA PIO moves
 /// 512-byte sectors). [`BlockDevice`] implementations must expose a
 /// capacity that is a whole number of these.
 const DEV_SECTOR: u64 = 512;
@@ -133,23 +169,61 @@ pub enum Error {
     /// Malformed path: not absolute, empty, or a `.`/`..` component
     /// (no path syntax is interpreted in v1).
     Path,
+    /// A write was attempted on a [`BlockDevice`] that has no write
+    /// support — the default [`BlockDevice::write_at`] refuses this way,
+    /// so read-only adapters (and any caller holding one) fail closed.
+    ReadOnly,
+    /// The block device refused a write (transfer error).
+    Write,
+    /// No free cluster to grow into, or no free directory slot to create
+    /// a file in (disk/directory full).
+    NoSpace,
+    /// The name is not 8.3-encodable — see [`write`]'s naming rule.
+    /// This crate never writes LFN entries, so long or exotic names are
+    /// refused rather than silently mangled.
+    InvalidName,
+    /// [`Fat16::create_file`] on a path that already exists (use
+    /// [`Fat16::write_file`] to create-or-overwrite).
+    Exists,
+    /// The caller's timestamp falls outside FAT's representable range
+    /// (year 1980..=2107, valid month/day/hour/minute/second).
+    Stamp,
 }
 
-/// The minimal read-only block surface the filesystem needs — rule of
-/// three: this is the *only* trait, and the reader needs nothing else
-/// (no writes, no flushes, no geometry beyond capacity).
+/// The minimal block surface the filesystem needs — rule of three:
+/// reads, writes, and capacity (no flushes, no geometry beyond
+/// capacity).
 ///
 /// Implementations are expected to:
 /// - report a capacity that is a whole number of 512-byte sectors,
 /// - accept any 512-byte-aligned offset whose whole range lies inside
 ///   `size_bytes()`,
 /// - refuse anything else with [`Error::OutOfRange`] rather than
-///   reading past the end.
+///   reading or writing past the end.
+///
+/// [`write_at`](BlockDevice::write_at) has a default implementation that
+/// refuses with [`Error::ReadOnly`]: a read-only adapter stays
+/// read-only without saying anything, and the write tests can prove the
+/// refusal path exists. Devices that support writes override it with the
+/// same alignment/range contract as `read_at`.
 pub trait BlockDevice {
     /// Total capacity in bytes.
     fn size_bytes(&self) -> u64;
     /// Read `buf.len()` bytes starting at byte `offset`.
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), Error>;
+    /// Write `buf.len()` bytes starting at byte `offset`.
+    ///
+    /// Default: refuse with [`Error::ReadOnly`] (read-only devices stay
+    /// read-only). Overriding implementations get the same contract as
+    /// `read_at`: whole 512-byte sectors, 512-byte-aligned offsets,
+    /// range-checked against `size_bytes()`, [`Error::OutOfRange`]
+    /// otherwise. Writes are **write-through**: `Ok` means the bytes
+    /// reached the device — there is no cache and no `flush()` in this
+    /// crate (see [`write`]'s ordering docs).
+    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), Error> {
+        let _ = (offset, buf);
+        Err(Error::ReadOnly)
+    }
 }
 
 /// The single place an offset+length pair is validated: `Ok(end)` only
@@ -189,6 +263,33 @@ fn read_bytes<D: BlockDevice + ?Sized>(dev: &D, offset: u64, buf: &mut [u8]) -> 
     Ok(())
 }
 
+/// Write `buf` at an arbitrary byte offset — the mirror of
+/// [`read_bytes`], and the *only* way the writer touches the device
+/// outside whole-cluster data copies. FAT entries (2 B) and directory
+/// entries (32 B) are not sector-aligned, so each touched sector is
+/// read-modify-written through a 512-byte scratch: the untouched bytes
+/// of the sector (neighbouring FAT entries, the rest of a directory
+/// sector, padding inside a cluster) are preserved byte-for-byte.
+///
+/// The range is validated once up front ([`checked_end`]), and the
+/// device contract guarantees every scratch write stays inside it.
+fn write_bytes<D: BlockDevice + ?Sized>(dev: &D, offset: u64, buf: &[u8]) -> Result<(), Error> {
+    checked_end(dev.size_bytes(), offset, buf.len())?;
+    let mut done = 0usize;
+    while done < buf.len() {
+        let abs = offset + done as u64;
+        let sector = abs / DEV_SECTOR;
+        let within = (abs - sector * DEV_SECTOR) as usize;
+        let n = core::cmp::min(DEV_SECTOR as usize - within, buf.len() - done);
+        let mut scratch = [0u8; DEV_SECTOR as usize];
+        dev.read_at(sector * DEV_SECTOR, &mut scratch)?;
+        scratch[within..within + n].copy_from_slice(&buf[done..done + n]);
+        dev.write_at(sector * DEV_SECTOR, &scratch)?;
+        done += n;
+    }
+    Ok(())
+}
+
 /// Classification of a FAT16 table entry during a chain walk.
 enum Next {
     /// A data-cluster index (not yet range-checked against the volume).
@@ -221,6 +322,12 @@ pub struct Fat16<'a, D: BlockDevice + ?Sized> {
     bps: u32,
     /// Bytes per cluster (sectors/cluster × bps, ≤ 32 KiB).
     cluster_bytes: u32,
+    /// Number of FAT copies (1 or 2 — validated at mount). Writes keep
+    /// every copy in sync (FS2).
+    fat_count: u32,
+    /// Filesystem sectors per FAT copy (validated nonzero at mount and
+    /// large enough to hold every cluster entry — FS2 hardening).
+    fat_sectors: u32,
     /// Filesystem sector where FAT #0 starts.
     fat_start: u32,
     /// Filesystem sector where the fixed root directory starts.
@@ -341,6 +448,17 @@ impl<'a, D: BlockDevice + ?Sized> Fat16<'a, D> {
             return Err(Error::NotFat16);
         }
 
+        // FS2 hardening: each FAT copy must physically hold every
+        // cluster entry the data region can produce (`clusters + 2`
+        // entries × 2 bytes, entries 0 and 1 included). Without this a
+        // fat_entry/fat_set for a high cluster would spill past the FAT
+        // into the next FAT copy or the root directory. `clusters` is
+        // ≤ 65524, so `clusters + 2` cannot overflow u32.
+        let fat_bytes = u64::from(fat_sectors) * u64::from(bps);
+        if u64::from(clusters + 2) * 2 > fat_bytes {
+            return Err(Error::BadFatSize);
+        }
+
         // Spec: FAT[0]'s low byte mirrors the media descriptor. Reading
         // it also proves the FAT region is inside the device.
         let mut fat0 = [0u8; 2];
@@ -353,6 +471,8 @@ impl<'a, D: BlockDevice + ?Sized> Fat16<'a, D> {
             dev,
             bps,
             cluster_bytes,
+            fat_count,
+            fat_sectors,
             fat_start: reserved,
             root_start,
             root_entries,

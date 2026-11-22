@@ -3,17 +3,21 @@
 //!
 //! Scope and documented limits:
 //!
-//! - **PIO only, LBA28 only, reads only.** Sectors move as 16-bit
-//!   words over the data port with `READ SECTORS` (0x20) in 28-bit LBA
-//!   (≤ 128 GiB — the target's 120 GB disk fits). No LBA48, no
-//!   `READ MULTIPLE`; `WRITE SECTORS` arrives with the GPT-writer
-//!   milestone.
+//! - **PIO only, LBA28 only, reads and writes.** Sectors move as 16-bit
+//!   words over the data port with `READ SECTORS` (0x20) and
+//!   `WRITE SECTORS` (0x30) in 28-bit LBA (≤ 128 GiB — the target's
+//!   120 GB disk fits). No LBA48, no `READ MULTIPLE`/`WRITE MULTIPLE`.
+//!   The write path (FS2, `FS_WRITE_OK`) is the same discipline as the
+//!   reads: bounded polls, fail-closed, and a capacity check against the
+//!   IDENTIFY-reported sector count before any port is programmed.
 //! - **No ATAPI, no IRQ, no DMA.** A packet device (CD) answers
 //!   IDENTIFY with ERR and is skipped; IRQ14 stays masked by the PIC,
 //!   so every wait is a *bounded* poll ([`POLL_LIMIT`]) — polling is
 //!   the whole protocol. Bus-master DMA (the PCI BM registers in BAR4)
 //!   is future work: it needs PCI BAR setup and only pays off once
-//!   throughput matters.
+//!   throughput matters; the ATA `FLUSH CACHE` (0xE7) command for
+//!   drive-write-cache ordering is likewise future work (documented in
+//!   `fat::write`: crash consistency is not an FS2 goal).
 //! - **Legacy fixed ports, no PCI BAR decoding.** The command block
 //!   lives at 0x1F0–0x1F7 and the control block at 0x3F6 —
 //!   ISA-compatible fixed addresses that any PC chipset's IDE
@@ -33,7 +37,7 @@
 //! reads status 00h, a floating bus reads FFh) and never hang boot;
 //! that is the same bounded-poll discipline as `crate::rtc`.
 
-use crate::port::{inb, inw, outb};
+use crate::port::{inb, inw, outb, outw};
 
 // --- Primary channel ports (legacy fixed addresses, see module docs) ---
 const DATA: u16 = 0x1F0; // 16-bit PIO data port
@@ -54,6 +58,7 @@ const ST_BSY: u8 = 0x80; // command in progress
 // --- Commands ------------------------------------------------------------
 const CMD_IDENTIFY: u8 = 0xEC;
 const CMD_READ_SECTORS: u8 = 0x20;
+const CMD_WRITE_SECTORS: u8 = 0x30;
 
 /// Bounded poll budget (spins), mirroring `e1000`'s `TX_POLLS`: TCG
 /// answers in microseconds, real silicon in milliseconds — the bound
@@ -87,7 +92,8 @@ pub(crate) struct Drive {
     /// 0 = master, 1 = slave (drive-select bit in 0x1F6).
     unit: u8,
     /// Total addressable sectors, LBA28 (IDENTIFY words 60–61) — the
-    /// capacity the filesystem layer bounds every read against.
+    /// capacity the filesystem layer bounds every read *and write*
+    /// against (FS2 refuses writes past it, see [`write_sectors`]).
     pub(crate) sectors: u32,
     /// Model name (IDENTIFY words 27–46), ATA byte order decoded.
     model: [u8; 40],
@@ -150,6 +156,81 @@ impl Drive {
             }
             // ERR after the last word means the tail end failed.
             inb(STATUS) & ST_ERR == 0
+        }
+    }
+
+    /// Write `buf.len() / 512` sectors (1..=256) from `buf` starting at
+    /// `lba`, which must hold a whole number of sectors. Returns `false`
+    /// on any error, capacity violation or poll-timeout — never blocks
+    /// forever, never writes a byte outside the IDENTIFY-reported
+    /// capacity (FS2's device-side bound, mirrored from the read path).
+    ///
+    /// Protocol (PIO `WRITE SECTORS`, 0x30, no IRQ — polling only):
+    /// program the LBA/sector-count registers, issue the command, then
+    /// for each sector wait (bounded) for DRQ, push 256 words, and wait
+    /// (bounded) for the drive to consume the sector before the next
+    /// one — the final wait doubles as the command-completion check
+    /// (BSY clear, DRQ clear, no ERR). Drive-side write caches are not
+    /// flushed (`FLUSH CACHE` is future work — see `fat::write`'s
+    /// crash-consistency note).
+    pub(crate) fn write_sectors(&self, lba: u32, buf: &[u8]) -> bool {
+        let count = buf.len() / 512;
+        if buf.is_empty() || !buf.len().is_multiple_of(512) || count > 256 {
+            return false;
+        }
+        // End of the request must stay inside both the drive's reported
+        // capacity and the LBA28 window (bits 0..27 — that's all the
+        // drive/head register can carry).
+        let end = u64::from(lba) + count as u64;
+        if end > u64::from(self.sectors) || end > 1 << 28 {
+            return false;
+        }
+
+        // SAFETY: fixed primary-channel ports (module docs); register
+        // widths match the ATA contract; single-core boot, IRQ14 masked
+        // (polling only — no DMA, no IRQ on this path either).
+        unsafe {
+            // Select the unit first so the LBA registers below land on
+            // it, then the ≥400 ns settle time via alternate-status
+            // reads (0x3F6 reads have no INTRQ side effect).
+            outb(
+                DRIVE_HEAD,
+                0xE0 | (self.unit << 4) | (((lba >> 24) as u8) & 0x0F),
+            );
+            for _ in 0..4 {
+                let _ = inb(ALT_STATUS);
+            }
+            if !wait_bsy_clear() {
+                return false;
+            }
+            outb(SECTOR_COUNT, count as u8); // 256 sectors encodes as 0
+            outb(LBA_LOW, lba as u8);
+            outb(LBA_MID, (lba >> 8) as u8);
+            outb(LBA_HIGH, (lba >> 16) as u8);
+            outb(COMMAND, CMD_WRITE_SECTORS);
+
+            // Whole sectors only (checked above), so the tail is empty.
+            let (sectors, _) = buf.as_chunks::<512>();
+            for sector in sectors {
+                if !wait_drq() {
+                    return false;
+                }
+                let (pairs, _) = sector.as_chunks::<2>();
+                for pair in pairs {
+                    // ATA wants byte 0 of the sector in the low half of
+                    // the word — the inverse of the read path's `inw`.
+                    let word = u16::from_le_bytes([pair[0], pair[1]]);
+                    outw(DATA, word);
+                }
+                // The drive clears DRQ once it has consumed the 256
+                // words; wait for that before offering the next sector,
+                // and (for the last one) for BSY to drop with no ERR —
+                // the bounded command-completion check.
+                if !wait_drq_clear() {
+                    return false;
+                }
+            }
+            true
         }
     }
 }
@@ -293,6 +374,29 @@ fn wait_drq() -> bool {
             }
             // BSY clear, no ERR, no DRQ: transient — keep polling
             // within the budget.
+        }
+        spins += 1;
+        if spins > POLL_LIMIT {
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// Bounded wait for the drive to *finish* a data phase: BSY clear and
+/// DRQ clear (the drive consumed the 256 words), no ERR. Fails on a
+/// vanished drive (00h/FFh) or budget exhaustion — the write path's
+/// per-sector handshake and its final command-completion check.
+fn wait_drq_clear() -> bool {
+    let mut spins = 0u32;
+    loop {
+        // SAFETY: primary-channel status port; read-only, fixed address.
+        let status = unsafe { inb(STATUS) };
+        if status == 0x00 || status == 0xFF {
+            return false;
+        }
+        if status & ST_BSY == 0 && status & ST_DRQ == 0 {
+            return status & ST_ERR == 0;
         }
         spins += 1;
         if spins > POLL_LIMIT {

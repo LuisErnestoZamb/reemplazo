@@ -481,6 +481,17 @@ fn structures_overrunning_the_declared_total_are_refused() {
     assert_eq!(mount_err(&img), Error::Truncated);
 }
 
+#[test]
+fn undersized_fat_is_refused() {
+    // FS2 hardening: each FAT copy must hold (clusters + 2) × 2 bytes.
+    // At FATsz16 = 16 the volume has 4159 clusters → 4161 entries ×
+    // 2 = 8322 B > 16 sectors (8192 B), so a high cluster's FAT entry
+    // would spill into the next FAT copy or the root directory.
+    let mut img = image();
+    put16(&mut img, 22, 16);
+    assert_eq!(mount_err(&img), Error::BadFatSize);
+}
+
 // --- Bounds arithmetic ----------------------------------------------------
 
 #[test]

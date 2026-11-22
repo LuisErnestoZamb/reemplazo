@@ -98,10 +98,12 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
     // primary channel answers IDENTIFY *and* LBA0 carries the installer
     // magic — the main smoke has no disk, so its marker chain is untouched.
     // FS1's FAT_OK stacks on it: mount the volume and read /README.TXT
-    // back, byte for byte. No drive → `prove` never runs and nothing at
-    // all is printed (the diskless neutrality the main smoke requires).
+    // back, byte for byte. FS2's FS_WRITE_OK then writes /RESULT.TXT,
+    // re-mounts from scratch and reads it back (plus a README re-check).
+    // No drive → `prove` never runs and nothing at all is printed (the
+    // diskless neutrality the main smoke requires).
     if let Some(drive) = crate::ata::probe() {
-        crate::fs::prove(&drive); // FAT_OK — or `FATAL: fs:` + halt
+        crate::fs::prove(&drive); // FAT_OK + FS_WRITE_OK — or `FATAL: fs:` + halt
     }
 
     // QEMU's e1000 first (byte-identical history: on a machine with

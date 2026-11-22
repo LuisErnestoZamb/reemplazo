@@ -1,7 +1,8 @@
 # Installer design — bootable ISO + network installer
 
-Status: design (research complete) + **FS1 landed** — read-only FAT16 and its `FAT_OK`
-smoke marker (§8.1). Scope: the two installer deliverables from
+Status: design (research complete) + **FS1 landed** — FAT16 reader and its `FAT_OK`
+smoke marker (§8.1) + **FS2 landed** — FAT16 write path and its `FS_WRITE_OK` marker
+(§8.2). Scope: the two installer deliverables from
 AGENTS.md — *a bootable ISO* and *a network installer that fetches the system over the
 network with the OS's own stack*. Target: 2007 MacBook2,1, GRUB i386-pc boot chain
 (32-bit Apple EFI in BIOS emulation — **no UEFI, no ESP**, see AGENTS.md).
@@ -553,6 +554,50 @@ The read-only first slice of milestone 3 is in (branch `m-fs`).
 
 Still open for milestone 3 proper: the FAT32 write path and the GPT wrapper from milestone 2, both
 blocked on the ATA write milestone.
+
+### 8.2 FS2 landed — FAT16 write support (`FS_WRITE_OK`)
+
+The write slice is in (branch `m-fs2`); it unblocks editor save, git checkout and the installer's
+file operations on FAT16.
+
+- **Marker.** `cargo xtask smoke-install` now asserts `["BLK_OK", "FAT_OK", "FS_WRITE_OK"]`: after
+  `FAT_OK`, the kernel writes `/RESULT.TXT` (`kernel/src/fs::write_proof`), then **re-mounts from
+  scratch** — a fresh `fat::Fat16` over a fresh block handle, no state from the write surviving —
+  reads the file back byte-exact, and re-reads `/README.TXT` to prove the write didn't clobber its
+  neighbour. Any failure with a drive present is `FATAL: fs: …` + halt; no drive stays silent (the
+  main smoke's 22 markers are untouched).
+- **ATA writes.** `kernel/src/ata.rs` gains PIO `WRITE SECTORS` (LBA28): same discipline as the
+  reads — drive-select + 400 ns settle, bounded polls (`POLL_LIMIT`, a new bounded DRQ-clear wait),
+  1..=256 sectors per request, refusal past the IDENTIFY-reported capacity, `SAFETY` comments on
+  every port I/O, no DMA/IRQ (future work, as documented for reads). The probe/magic-at-offset-62
+  semantics are unchanged.
+- **Writer.** `fat/src/write.rs` (the `fat` crate stays `no_std`, `forbid(unsafe_code)`, zero
+  deps): `write_file` (create-or-overwrite) and `create_file` (no-clobber) — in-place overwrite,
+  chain grow (first-fit free-FAT allocation, both mirrors updated), truncate with tail freeing
+  (cycle-bounded, no double-free), creation in the root **and in existing subdirectories** (no
+  `mkdir`). Refusals: disk/directory full (`NoSpace`, pre-checked before any mutation), corrupt
+  chain mid-write (FS1's validators: cycle/out-of-range/free-entry → `BadChain`, checked *before*
+  mutating so a refused write leaves the disk byte-identical), non-8.3 names (`InvalidName`),
+  out-of-range timestamps (`Stamp`), read-only device (`ReadOnly`), `NotAFile`/`NotFound`/`Exists`.
+- **8.3 naming decision:** names must be 8.3-encodable (1..=8 base, 0..=3 ext, FAT's legal
+  character set); lowercase is folded to uppercase on disk; long/exotic names are **refused**, never
+  mangled — this crate writes no LFN entries. Overwriting an existing file *through* its long name
+  still works (the stored 8.3 name is kept).
+- **Flush policy:** write-through, no `flush()` — every FAT/data/directory sector is written inside
+  the operation, ordered **FAT → data → directory entry** (the entry readers consult is the commit
+  point, written last). **Crash consistency is explicitly NOT a goal yet**: no journal, no flush
+  barriers, no drive `FLUSH CACHE` (0xE7) — power-loss ordering is a later milestone.
+- **Mount hardening:** `fat::Fat16::mount` now refuses a FAT too small to hold every cluster entry
+  (spill would cross into the next FAT/root), with a hostile test.
+- **Host tests:** `fat/tests/write.rs` — 23 tests (round-trips, grow/shrink across cluster
+  boundaries, full-disk and slot-exhaustion refusals, cycle/out-of-range refusals leaving the image
+  byte-identical, no-double-free, stale-LFN clearing, LFN overwrite, mirror sync, invalid
+  names/stamps, read-only device, subdirectory create, plus a 120-op **xorshift-seeded oracle**
+  against a `Vec` model re-mounted after every op); `fat/tests/hostile.rs` stays green (47 FS1
+  tests + 1 new mount-hardening test = 48). Total: **71 host tests** in `fat/`.
+- **Still open (FS3+):** crash consistency (journal/flush ordering, drive `FLUSH CACHE`), LFN
+  writes, `mkdir`/unlink as public operations, cross-file cross-link detection (needs a visited set
+  — i.e. the heap), FAT32, and the GPT wrapper (milestone 2).
 
 ---
 
