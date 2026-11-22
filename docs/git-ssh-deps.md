@@ -115,8 +115,9 @@ Honest sizing for a full clone (numbers derived from [pack-format](https://git-s
 | G6 | push: serialize full-object pack + idx, `receive-pack` state machine | **`GIT_PUSH_OK`** against a test repo | G5, G1 |
 | G7 | git over ssh (`git-upload-pack` exec channel) | **`GIT_SSH_OK`** | G2 + S4 (§B.4) |
 
-**Status (G3, landed 2026-11-22):** `GIT_FETCH_OK` is in the boot chain
-between `GIT_LSREMOTE_OK` and `SSH_KEXINIT_OK`. The kernel POSTs the v0
+**Status (G3, landed 2026-11-22; full checkout landed with FS3):**
+`GIT_FETCH_OK` is in the boot chain between `GIT_LSREMOTE_OK` and
+`SSH_KEXINIT_OK`. The kernel POSTs the v0
 `want <head> ofs-delta shallow` / `deepen 1` / flush / `done` / flush
 stream (no `side-band`, per
 [pack-protocol](https://git-scm.com/docs/pack-protocol#_packfile_negotiation))
@@ -127,13 +128,17 @@ offset `PackIndex` (the in-memory `.idx` main table). An iterative
 commit → tree → blob walk then enforces depth/entry/path/bounds caps.
 **Deferred:** the **`.idx` file write** (the index exists in memory and
 is exercised, but no `.idx` bytes are written to disk yet) and the
-loose-object store — both belong to G4/G5's `clone` layout. **Partial
-G4:** `smoke-install`'s `GIT_CHECKOUT_OK` checks the fetched repo's
-8.3-representable **root-level** blobs (`README.md`, `AGENTS.md`,
-`LICENSE`, …) into the FAT16 volume and re-reads `/README.md`
-byte-exactly (AGPL fragment checked); nested paths and long names are
-counted as skipped because `fat` has no `mkdir`/LFN writer yet (the
-full tree checkout is the rest of G4).
+loose-object store — both belong to G5's `clone` layout. **G4 checkout
+(full, FS3):** `smoke-install`'s `GIT_CHECKOUT_OK` writes the fetched
+repo's **whole** depth-1 tree into the FAT16 volume — every regular
+blob, directories created as needed through `fat::create_dir_all`, long
+names behind LFN chains through the FS3 writer — asserts the written
+count equals the fetched blob count (112 files in 53 dirs at the time
+of writing; symlinks/gitlinks are counted as skipped), then re-mounts
+from scratch and reads `/README.md` and the nested `docs/hardware.md`
+back byte-exactly with a content fragment each. The old `mkdir`/LFN
+limitation is resolved: the G3 proof's root-only, 8.3-only checkout no
+longer exists.
 
 ---
 

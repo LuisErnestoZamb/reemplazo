@@ -1,24 +1,25 @@
 //! FAT16 write support — the FS2 slice (`FS_WRITE_OK`, `cargo xtask
-//! smoke-install`).
+//! smoke-install`), extended by FS3's directory/long-name writer
+//! ([`crate::tree`], `FS_TREE_OK`).
 //!
 //! The minimal honest write set on top of FS1's reader: create a file,
 //! overwrite in place, grow the cluster chain, truncate and free the
 //! tail. Every refusal fail-closes with an [`Error`]; nothing here
 //! panics on disk data.
 //!
-//! # Naming rule (8.3 only — no LFN writes)
+//! # Naming rule
 //!
-//! [`Fat16::create_file`] requires the final path component to be
-//! **8.3-encodable**: an optional base of 1..=8 characters, an optional
-//! extension of 1..=3 characters, each character ASCII alphanumeric or
-//! one of `$%'-_@~`!(){}^#&` (the FAT spec's legal set), a single `.`
-//! separator. Lowercase is folded to uppercase on disk — lookup stays
-//! ASCII-case-insensitive, so `read_file("/lower.txt")` finds
-//! `LOWER.TXT`. Anything else (long names, spaces, non-ASCII, extra
-//! dots, an empty base) is [`Error::InvalidName`]: this crate **never
-//! writes LFN entries**, so it refuses rather than mangling. Overwriting
-//! an *existing* file through its long name still works — the stored
-//! 8.3 name is kept as-is and only the size/cluster/timestamps change.
+//! FS2 required the final path component to be **8.3-encodable** and
+//! refused everything else. FS3 keeps that fast path and adds the long
+//! path: a name that is not 8.3-encodable gets a generated unique 8.3
+//! alias plus an LFN chain ([`crate::tree`]'s module docs carry the
+//! alias probe and the exact entry bytes). 8.3 names are uppercase
+//! (lookup stays ASCII-case-insensitive, so `read_file("/lower.txt")`
+//! finds `LOWER.TXT`). A long name containing a FAT-illegal character
+//! (`/\:*?"<>|`, control bytes, > 255 UTF-16 units) is
+//! [`Error::InvalidName`] — refused rather than mangled. Overwriting an
+//! *existing* file keeps its stored names byte-for-byte and only
+//! changes size/cluster/timestamps.
 //!
 //! # Ordering and crash consistency
 //!
@@ -59,8 +60,10 @@
 //!   [`BlockDevice::write_at`] default);
 //! - a timestamp outside FAT's range → [`Error::Stamp`];
 //! - a path that is a directory → [`Error::NotAFile`]; a missing parent
-//!   directory → [`Error::NotFound`] (there is no `mkdir`); `create_file`
-//!   on an existing path → [`Error::Exists`].
+//!   directory → [`Error::NotFound`] (use
+//!   [`Fat16::create_dir_all`](crate::Fat16::create_dir_all) /
+//!   [`Fat16::write_file_all`](crate::Fat16::write_file_all) to create
+//!   parents); `create_file` on an existing path → [`Error::Exists`].
 //!
 //! # Documented limits
 //!
@@ -69,7 +72,9 @@
 //!   exist here; the closest analogues are [`Error::Exists`] (refusing
 //!   to clobber via `create_file`) and [`Error::NotAFile`].
 //! - **Creation works in the root and in existing subdirectories**;
-//!   creating directories (`mkdir`) is not supported.
+//!   directories are created with [`crate::tree`]'s `create_dir`/
+//!   `create_dir_all` (FS3) — existing directories are never grown past
+//!   their extent (`NoSpace` when full).
 //! - **No delete/unlink** — freeing happens only inside truncate of the
 //!   file being written (tail or whole chain), never on another file's
 //!   chain, so no double-free is reachable through this API.
@@ -83,12 +88,13 @@
 //!   sharing is deferred with the heap.
 
 use super::dir::{DirLoc, Placement};
+use super::tree::build_entry;
 use super::{BlockDevice, Error, Fat16, Next, classify, read_bytes, write_bytes};
 
 /// End-of-chain marker written into a FAT16 entry (any value in
 /// `0xFFF8..=0xFFFF` terminates a chain; the canonical all-ones form is
 /// what formatters write).
-const EOC: u16 = 0xFFFF;
+pub(crate) const EOC: u16 = 0xFFFF;
 
 /// Maximum LFN entries a chain may hold (FAT spec §7.4) — the bound on
 /// the stale-LFN backwalk when a create reuses a deleted slot.
@@ -128,7 +134,7 @@ impl Stamp {
     /// Pack into FAT's date and time words, refusing anything outside
     /// the representable range ([`Error::Stamp`]) — no clamping, no
     /// guessing (fail-closed, like every other refusal here).
-    fn encode(&self) -> Result<(u16, u16), Error> {
+    pub(crate) fn encode(&self) -> Result<(u16, u16), Error> {
         if !(1980..=2107).contains(&self.year)
             || !(1..=12).contains(&self.month)
             || self.day < 1
@@ -191,10 +197,11 @@ fn name_char_ok(c: u8) -> bool {
 
 /// Encode the final path component as a space-padded 11-byte 8.3 name,
 /// folding ASCII lowercase to uppercase. Refuses (see the module docs'
-/// naming rule): an empty name ([`Error::Path`]), an empty base or
-/// base > 8 / extension > 3 / a second dot / any character outside the
-/// legal set ([`Error::InvalidName`]).
-fn parse_83(name: &str) -> Result<[u8; 11], Error> {
+/// naming rule, and [`crate::tree`] for the long-name path): an empty
+/// name ([`Error::Path`]), an empty base or base > 8 / extension > 3 / a
+/// second dot / any character outside the legal set
+/// ([`Error::InvalidName`]).
+pub(crate) fn parse_83(name: &str) -> Result<[u8; 11], Error> {
     if name.is_empty() {
         return Err(Error::Path);
     }
@@ -230,7 +237,7 @@ fn parse_83(name: &str) -> Result<[u8; 11], Error> {
 /// which [`parse_83`] refuses). `rsplit` yields at least one item for
 /// any `&str`, so the default is unreachable — `unwrap_or_default`
 /// keeps it panic-free anyway.
-fn final_component(path: &str) -> &str {
+pub(crate) fn final_component(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or_default()
 }
 
@@ -239,8 +246,9 @@ impl<'a, D: BlockDevice + ?Sized> Fat16<'a, D> {
     /// if it already exists (the general create-or-overwrite primitive
     /// the boot proof and the tests use).
     ///
-    /// Semantics by existing state: absent → create (8.3 name required,
-    /// see module docs); present and shorter → truncate + free the tail;
+    /// Semantics by existing state: absent → create (an 8.3 name, or a
+    /// long name behind an LFN chain — see [`crate::tree`]); present and
+    /// shorter → truncate + free the tail;
     /// present and longer → grow the chain; present and equal → in-place
     /// overwrite. Directories are refused ([`Error::NotAFile`]).
     /// `stamp` records the write (and creation) time — no clock lives
@@ -273,7 +281,10 @@ impl<'a, D: BlockDevice + ?Sized> Fat16<'a, D> {
         let placement = self.locate(path)?;
 
         // Where the entry lives (or will live) and its current state.
-        let name8 = match &placement {
+        // Overwrite keeps the stored 8.3 name byte-for-byte (also the
+        // case when the path matched via an LFN); a create plans the
+        // name — 8.3, or a long name with its unique alias (FS3).
+        let create = match &placement {
             Placement::Found { entry, .. } => {
                 if !allow_overwrite {
                     return Err(Error::Exists);
@@ -281,11 +292,12 @@ impl<'a, D: BlockDevice + ?Sized> Fat16<'a, D> {
                 if entry.is_dir() {
                     return Err(Error::NotAFile);
                 }
-                // Overwrite keeps the stored 8.3 name byte-for-byte
-                // (also the case when the path matched via an LFN).
                 None
             }
-            Placement::Missing { .. } => Some(parse_83(final_component(path))?),
+            Placement::Missing { parent } => {
+                let plan = self.plan_name(*parent, final_component(path))?;
+                Some((*parent, plan))
+            }
         };
         let (date, time) = stamp.encode()?;
 
@@ -294,12 +306,17 @@ impl<'a, D: BlockDevice + ?Sized> Fat16<'a, D> {
         let data_len = u32::try_from(data.len()).map_err(|_| Error::OutOfRange)?;
 
         // Directory-slot pre-check for a create: refuse before touching
-        // the FAT if there is no room in the directory.
-        let create_slot = match &placement {
-            Placement::Missing { parent } => {
-                Some(self.find_free_slot(*parent)?.ok_or(Error::NoSpace)?)
+        // the FAT if the directory has no run long enough for the LFN
+        // chain plus the 8.3 entry.
+        let create_slot = match &create {
+            Some((parent, plan)) => {
+                let slots = plan.lfn_entries() + 1;
+                Some((
+                    *parent,
+                    self.alloc_run(*parent, slots)?.ok_or(Error::NoSpace)?,
+                ))
             }
-            Placement::Found { .. } => None,
+            None => None,
         };
 
         // Existing chain, walked with FS1's validators *before* any
@@ -349,14 +366,22 @@ impl<'a, D: BlockDevice + ?Sized> Fat16<'a, D> {
         }
 
         // Phase 3: directory entry — the commit point, written last.
-        match (&placement, create_slot) {
+        match (&placement, &create_slot) {
             (Placement::Found { loc, slot, .. }, _) => {
                 self.update_entry(*loc, *slot, head, data_len, date, time)?;
             }
-            (Placement::Missing { .. }, Some((loc, slot))) => {
-                let name8 = name8.ok_or(Error::Path)?; // always Some for Missing
-                self.clear_stale_lfn(loc, slot)?;
-                self.create_entry(loc, slot, &name8, head, data_len, date, time)?;
+            (Placement::Missing { .. }, Some((dir, run))) => {
+                let (_, plan) = create.as_ref().ok_or(Error::Path)?;
+                self.install_entry(
+                    *dir,
+                    *run,
+                    plan,
+                    super::tree::ATTR_ARCHIVE,
+                    head,
+                    data_len,
+                    date,
+                    time,
+                )?;
             }
             // Unreachable: `create_slot` was pre-checked above. Kept as
             // a fail-closed arm rather than an unwrap.
@@ -389,7 +414,7 @@ impl<'a, D: BlockDevice + ?Sized> Fat16<'a, D> {
     /// not a silent stop) and
     /// the hop budget that turns a cyclic FAT into [`Error::BadChain`]
     /// instead of a hang.
-    fn walk_chain(&self, head: u32) -> Result<(u32, u32), Error> {
+    pub(crate) fn walk_chain(&self, head: u32) -> Result<(u32, u32), Error> {
         if head == 0 {
             return Ok((0, 0));
         }
@@ -409,10 +434,11 @@ impl<'a, D: BlockDevice + ?Sized> Fat16<'a, D> {
     }
 
     /// The `n`-th cluster of the chain (1-based) and its successor, for
-    /// truncation. `n ≤ have` is guaranteed by the caller's earlier
+    /// truncation and for logical directory-slot addressing. `n ≤ have`
+    /// is guaranteed by the caller's earlier
     /// [`walk_chain`](Self::walk_chain), so a chain that ends early here
     /// means the disk changed under us → [`Error::BadChain`].
-    fn chain_nth(&self, head: u32, n: u32) -> Result<(u32, Option<u32>), Error> {
+    pub(crate) fn chain_nth(&self, head: u32, n: u32) -> Result<(u32, Option<u32>), Error> {
         let mut cluster = head;
         for _ in 1..n {
             // `n ≤ clusters` (see above), so this loop is bounded by
@@ -469,24 +495,48 @@ impl<'a, D: BlockDevice + ?Sized> Fat16<'a, D> {
     }
 
     /// First free (`0x0000`) FAT entry in the data region — the
-    /// allocator, first-fit from cluster 2. Bounded by the
-    /// mount-validated cluster count; [`Error::NoSpace`] when none is
-    /// free (never allocates an entry that reads as in-use, so a write
-    /// cannot create a cross-link).
-    fn alloc_free(&self) -> Result<u32, Error> {
-        for cluster in 2..=self.clusters + 1 {
-            if self.fat_entry(cluster)? == 0 {
+    /// allocator. It starts from the mount's allocation hint (the last
+    /// search position), which turns a sequential checkout into a linear
+    /// scan instead of an O(n²) one, and wraps to `2..hint` when the
+    /// tail is exhausted so a cluster freed behind the hint is still
+    /// reused. Every candidate is re-verified against the FAT, so the
+    /// hint can never hand out an in-use cluster (no cross-links) and
+    /// [`Error::NoSpace`] means a full volume scan found nothing.
+    pub(crate) fn alloc_free(&self) -> Result<u32, Error> {
+        let hint = self.next_free.get().clamp(2, self.clusters + 1);
+        if let Some(cluster) = self.first_free_from(hint)? {
+            self.next_free.set(cluster);
+            return Ok(cluster);
+        }
+        if hint > 2 {
+            // The tail is full: a truncate may have freed something
+            // behind the hint. Any hit here is necessarily `< hint`
+            // (the tail scan above found nothing at or above it).
+            if let Some(cluster) = self.first_free_from(2)?
+                && cluster < hint
+            {
+                self.next_free.set(cluster);
                 return Ok(cluster);
             }
         }
         Err(Error::NoSpace)
     }
 
+    /// First free FAT entry in `start..=clusters + 1`, or `None`.
+    fn first_free_from(&self, start: u32) -> Result<Option<u32>, Error> {
+        for cluster in start..=self.clusters + 1 {
+            if self.fat_entry(cluster)? == 0 {
+                return Ok(Some(cluster));
+            }
+        }
+        Ok(None)
+    }
+
     /// Set FAT entry `cluster` in **every** FAT copy (spec: the copies
     /// are mirrors; a formatter writes both, and so does every write
     /// here — the mirror test pins it). Refuses any cluster outside the
     /// data region — reserved entries 0/1 are never writable.
-    fn fat_set(&self, cluster: u32, value: u16) -> Result<(), Error> {
+    pub(crate) fn fat_set(&self, cluster: u32, value: u16) -> Result<(), Error> {
         if cluster < 2 || cluster > self.clusters + 1 {
             return Err(Error::BadChain);
         }
@@ -538,75 +588,13 @@ impl<'a, D: BlockDevice + ?Sized> Fat16<'a, D> {
         Ok(())
     }
 
-    /// First free slot in directory `dir` (root or subdirectory chain):
-    /// the first `0xE5` (deleted) or `0x00` (end-of-directory) entry,
-    /// preferring the earlier of the two. `0x00` ends the scan (nothing
-    /// after it is in use), the chain walk is hop-budgeted, and the root
-    /// scan is entry-count-bounded — same discipline as `scan_dir`.
-    /// [`Error::NoSpace`] when the directory has no free slot.
-    fn find_free_slot(&self, dir: DirLoc) -> Result<Option<(DirLoc, u32)>, Error> {
-        match dir {
-            DirLoc::Root => {
-                let mut deleted: Option<u32> = None;
-                for index in 0..self.root_entries {
-                    let mut raw = [0u8; 32];
-                    read_bytes(self.dev, self.root_byte(index)?, &mut raw)?;
-                    match raw[0] {
-                        0x00 => {
-                            return Ok(Some((DirLoc::Root, deleted.unwrap_or(index))));
-                        }
-                        0xE5 => deleted = deleted.or(Some(index)),
-                        _ => {}
-                    }
-                }
-                Ok(deleted.map(|slot| (DirLoc::Root, slot)))
-            }
-            DirLoc::Cluster(head) => {
-                if head < 2 {
-                    return Err(Error::BadDirectory);
-                }
-                let per_cluster = self.cluster_bytes / 32;
-                let mut cluster = head;
-                let mut visited = 0u32;
-                let mut deleted: Option<(DirLoc, u32)> = None;
-                loop {
-                    visited += 1;
-                    if visited > self.clusters {
-                        return Err(Error::BadChain); // cyclic directory chain
-                    }
-                    let base = self.cluster_byte(cluster)?;
-                    for slot in 0..per_cluster {
-                        let mut raw = [0u8; 32];
-                        read_bytes(self.dev, base + u64::from(slot) * 32, &mut raw)?;
-                        match raw[0] {
-                            0x00 => {
-                                return Ok(Some(
-                                    deleted.unwrap_or((DirLoc::Cluster(cluster), slot)),
-                                ));
-                            }
-                            0xE5 => deleted = deleted.or(Some((DirLoc::Cluster(cluster), slot))),
-                            _ => {}
-                        }
-                    }
-                    match classify(self.fat_entry(cluster)?)? {
-                        Next::Eoc => return Ok(deleted),
-                        Next::Data(next) => {
-                            self.cluster_byte(next)?;
-                            cluster = next;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     /// When a create reuses a deleted (`0xE5`) slot, LFN entries
     /// directly *before* it are stale leftovers of the entry that used
     /// to live there (LFNs always immediately precede their 8.3 entry).
     /// Clear them so a later scan can never assemble them onto the new
     /// entry — bounded to the spec's 20-entry chain cap, stopping at
     /// any non-LFN, already-deleted, or end-of-directory slot.
-    fn clear_stale_lfn(&self, loc: DirLoc, slot: u32) -> Result<(), Error> {
+    pub(crate) fn clear_stale_lfn(&self, loc: DirLoc, slot: u32) -> Result<(), Error> {
         for back in 1..=MAX_LFN_ENTRIES {
             if slot < back {
                 break;
@@ -630,7 +618,7 @@ impl<'a, D: BlockDevice + ?Sized> Fat16<'a, D> {
     /// subdirectory slot by the cluster's entry capacity, and the
     /// cluster itself by the data region — so a slot write can never
     /// land in a FAT, past the root, or outside the volume.
-    fn slot_byte(&self, loc: DirLoc, slot: u32) -> Result<u64, Error> {
+    pub(crate) fn slot_byte(&self, loc: DirLoc, slot: u32) -> Result<u64, Error> {
         match loc {
             DirLoc::Root => self.root_byte(slot),
             DirLoc::Cluster(cluster) => {
@@ -669,33 +657,23 @@ impl<'a, D: BlockDevice + ?Sized> Fat16<'a, D> {
         write_bytes(self.dev, byte, &raw)
     }
 
-    /// Write a fresh 8.3 entry (attribute `0x20` = archive, creation =
-    /// write timestamp, FAT16 high word zero) into a pre-selected free
-    /// slot. Only ever called after [`find_free_slot`](Self::find_free_slot)
-    /// succeeded, i.e. the slot is `0xE5`/`0x00`.
+    /// Write a fresh directory entry (FS2 used attribute `0x20`; FS3
+    /// passes `0x10` for a directory) into a pre-selected free slot.
+    /// Only ever called after the slot run was found free, i.e. the slot
+    /// is `0xE5`/`0x00`.
     #[allow(clippy::too_many_arguments)] // one 32-byte record's worth of fields
-    fn create_entry(
+    pub(crate) fn create_entry(
         &self,
         loc: DirLoc,
         slot: u32,
         name8: &[u8; 11],
+        attr: u8,
         cluster: u32,
         size: u32,
         date: u16,
         time: u16,
     ) -> Result<(), Error> {
-        let lo = u16::try_from(cluster).map_err(|_| Error::BadDirectory)?;
-        let mut raw = [0u8; 32];
-        raw[0..11].copy_from_slice(name8);
-        raw[11] = 0x20; // archive
-        raw[14..16].copy_from_slice(&time.to_le_bytes()); // creation time
-        raw[16..18].copy_from_slice(&date.to_le_bytes()); // creation date
-        raw[18..20].copy_from_slice(&date.to_le_bytes()); // last-access date
-        // 20..22 high cluster word stays 0 (FAT16)
-        raw[22..24].copy_from_slice(&time.to_le_bytes()); // write time
-        raw[24..26].copy_from_slice(&date.to_le_bytes()); // write date
-        raw[26..28].copy_from_slice(&lo.to_le_bytes()); // first cluster
-        raw[28..32].copy_from_slice(&size.to_le_bytes()); // size
+        let raw = build_entry(name8, attr, cluster, size, date, time)?;
         write_bytes(self.dev, self.slot_byte(loc, slot)?, &raw)
     }
 }

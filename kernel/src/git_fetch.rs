@@ -42,19 +42,20 @@
 //! modes) or sanitized before it reaches the serial log, exactly like
 //! `git.rs`.
 //!
-//! # Checkout scope (v1, documented)
+//! # Checkout scope (FS3/G4)
 //!
-//! `fat` (FS1/FS2) can create **files in the root and in existing
-//! subdirectories**, but has no `mkdir` and no LFN writer. So v1
-//! checks out every *root-level* blob whose name is 8.3-encodable
-//! (`README.md`, `AGENTS.md`, `Cargo.toml`, `Cargo.lock`, `LICENSE` in
-//! this repo) byte-for-byte, and counts the rest as skipped (nested
-//! paths need `mkdir`; long/exotic names need LFN writes). That is
-//! enough to prove the fetch → tree walk → blob → disk → read-back
-//! path with real bytes; the full tree checkout lands with `mkdir` +
-//! LFN support. `.git/objects`/refs/HEAD are likewise G4/G5 work: the
-//! decoded pack and its in-memory index are proof-of-fetch, not a
-//! clone layout.
+//! The kernel's FAT16 writer now has `mkdir` and LFN writes, so the
+//! checkout is **full**: every regular blob in the depth-1 tree is
+//! written to the volume, creating directories as needed and storing
+//! names longer than 8.3 behind LFN chains (`fat::write_file_all`).
+//! Symlinks and gitlink/submodule entries are still skipped and counted
+//! (a symlink is not a file yet; a submodule's objects are not in this
+//! pack). The proof re-mounts from scratch, asserts the file **count**
+//! matches what the walk saw (a silent skip fails), reads back
+//! `README.md` and the nested `docs/hardware.md` byte-exact, and
+//! checks a content fragment in each. `.git/objects`/refs/HEAD remain
+//! G4/G5 work: the decoded pack and its in-memory index are
+//! proof-of-fetch, not a clone layout.
 
 use crate::fs;
 use crate::git::sanitize;
@@ -105,13 +106,26 @@ const MAX_TREE_ENTRIES: usize = 4096;
 const MAX_FILES: usize = 1024;
 /// Full path length cap (POSIX-ish; also bounds the walker's buffer).
 const PATH_CAP: usize = 255;
-/// Read-back buffer for the checkout proof (`README.md` is ~4.5 KiB;
-/// the cap makes a runaway file fail loudly instead of truncating).
-const READ_BACK_CAP: usize = 64 * 1024;
+/// Read-back buffer for the checkout proof (`docs/hardware.md` is
+/// ~60 KiB; the cap makes a runaway file fail loudly instead of
+/// truncating).
+const READ_BACK_CAP: usize = 128 * 1024;
 /// Printable-ASCII sanitizer buffer for logged tree paths.
 const SANITIZE_CAP: usize = 128;
 /// The smoke requires a real tree, not a one-file toy.
 const MIN_FILES: usize = 20;
+/// The checkout proof requires the *whole* depth-1 tree (this repo has
+/// 106 files in 49 directories); a silent skip regression fails here.
+const MIN_CHECKOUT_FILES: usize = 100;
+const MIN_CHECKOUT_DIRS: usize = 45;
+/// A nested file (three path components) that the checkout proof reads
+/// back byte-exact — it exists only if the directory tree was created.
+const NESTED_PROOF_PATH: &str = "docs/hardware.md";
+/// A fragment that must appear in the nested proof file (the target
+/// CPU's model number, stable across rewrites of the document).
+const NESTED_PROOF_FRAGMENT: &[u8] = b"T7400";
+/// A fragment that must appear in the checked-out `README.md`.
+const README_FRAGMENT: &[u8] = b"AGPL";
 
 /// Response storage (the `READ_STORAGE` idiom of `tls.rs`/`git.rs`):
 /// written once by [`fetch`] on a single core; IRQ0 never touches it.
@@ -226,8 +240,8 @@ pub fn fetch(
 
     // 6. commit → tree → files (iterative; see `walk`).
     let tree_oid = commit_tree(&objects, &by_oid, &head);
-    let mut root_files: Vec<(&[u8], &[u8])> = Vec::new();
-    let walk = walk(&objects, &by_oid, &tree_oid, &mut root_files);
+    let mut files: Vec<(Vec<u8>, &[u8])> = Vec::new();
+    let walk = walk(&objects, &by_oid, &tree_oid, &mut files);
 
     serial_println!(
         "git: tree: {} files in {} dirs, {} symlinks/submodules skipped, {} entries",
@@ -242,11 +256,14 @@ pub fn fetch(
     if !walk.readme || !walk.agents {
         fatal("fetched tree lacks README.md or AGENTS.md");
     }
+    if files.len() != walk.files {
+        fatal("tree walk collected fewer blobs than it counted");
+    }
     // A couple of sanitized paths: enough to see it is the real repo,
     // never a giant log (and never raw wire bytes).
     let mut path_buf = [0u8; SANITIZE_CAP];
-    for sample in walk.samples.into_iter().flatten() {
-        let name = sanitize(&sample, &mut path_buf);
+    for sample in walk.samples.iter().flatten() {
+        let name = sanitize(sample, &mut path_buf);
         serial_println!("git: file: {name}");
     }
 
@@ -256,39 +273,76 @@ pub fn fetch(
     //    skipped (the diskless smoke); the handle comes from the boot
     //    probe, so `BLK_OK` is never printed a second time.
     if let Some(drive) = drive {
-        checkout(drive, &root_files);
+        checkout(drive, &files, &walk);
     }
 }
 
-/// Check out the representable blobs and prove the round trip:
-/// write them into the FAT16 root, re-mount from scratch, read
-/// `README.md` back byte-exact and check the AGPL fragment; then
-/// print `GIT_CHECKOUT_OK` (smoke-install).
-fn checkout(drive: &crate::ata::Drive, root_files: &[(&[u8], &[u8])]) {
-    let (written, skipped) = fs::checkout_root(drive, root_files);
+/// Check out the **whole** fetched tree and prove the round trip:
+/// write every blob (directories created as needed), re-mount from
+/// scratch, read `README.md` and the nested [`NESTED_PROOF_PATH`] back
+/// byte-exact with a content fragment each, assert the file count (a
+/// silently skipped blob fails loudly), then print `GIT_CHECKOUT_OK`
+/// (smoke-install).
+fn checkout(drive: &crate::ata::Drive, files: &[(Vec<u8>, &[u8])], walk: &Walk) {
+    if walk.files < MIN_CHECKOUT_FILES || walk.dirs < MIN_CHECKOUT_DIRS {
+        fatal("checkout: fetched tree is smaller than the full checkout requires");
+    }
+    let (written, skipped) = fs::checkout_tree(drive, files);
     serial_println!(
-        "git: checkout: {written} root file(s) written, {skipped} skipped (needs mkdir/LFN)"
+        "git: checkout: {written} of {} file(s) written in {} dirs, {skipped} skipped",
+        files.len(),
+        walk.dirs
     );
+    if skipped != 0 || written != files.len() {
+        fatal("checkout: not every fetched blob reached the volume");
+    }
+
+    // SAFETY: single-use static (see `READ_BACK`).
+    let read_back = unsafe { &mut *addr_of_mut!(READ_BACK) };
 
     // The fetched README.md bytes are the reference; the read-back is
     // served by a *fresh* mount inside `fs::read_back`.
-    let Some(readme) = root_files.iter().find(|(name, _)| *name == b"README.md") else {
+    let Some(readme) = files
+        .iter()
+        .find(|(name, _)| name.as_slice() == b"README.md")
+    else {
         fatal("checkout: fetched tree has no root README.md");
     };
     if readme.1.len() > READ_BACK_CAP {
         fatal("checkout: README.md exceeds the read-back buffer");
     }
-    // SAFETY: single-use static (see `READ_BACK`).
-    let read_back = unsafe { &mut *addr_of_mut!(READ_BACK) };
     let n = fs::read_back(drive, "/README.md", read_back);
     if n != readme.1.len() || read_back[..n] != *readme.1 {
         fatal("checkout: README.md read back does not match the fetched blob");
     }
-    if !contains(read_back[..n].as_ref(), b"AGPL") {
+    if !contains(&read_back[..n], README_FRAGMENT) {
         fatal("checkout: README.md read back lacks the AGPL fragment");
     }
     serial_println!(
         "git: checkout: README.md {} bytes verified (AGPL fragment present)",
+        n
+    );
+
+    // The nested proof: a file that exists only if `fat::create_dir_all`
+    // built `docs/` and the blob was written inside it.
+    let Some(nested) = files
+        .iter()
+        .find(|(name, _)| name.as_slice() == NESTED_PROOF_PATH.as_bytes())
+    else {
+        fatal("checkout: fetched tree has no docs/hardware.md");
+    };
+    if nested.1.len() > READ_BACK_CAP {
+        fatal("checkout: docs/hardware.md exceeds the read-back buffer");
+    }
+    let n = fs::read_back(drive, "/docs/hardware.md", read_back);
+    if n != nested.1.len() || read_back[..n] != *nested.1 {
+        fatal("checkout: docs/hardware.md read back does not match the fetched blob");
+    }
+    if !contains(&read_back[..n], NESTED_PROOF_FRAGMENT) {
+        fatal("checkout: docs/hardware.md read back lacks the T7400 fragment");
+    }
+    serial_println!(
+        "git: checkout: docs/hardware.md {} bytes verified (nested directory tree)",
         n
     );
 
@@ -435,13 +489,14 @@ struct Frame {
 
 /// Walk the fetched tree **iteratively** (an explicit frame stack, so
 /// a hostile 16-level tree cannot smash the kernel stack), resolving
-/// blobs through `by_oid`. Regular root-level files are collected in
-/// `root_files` for the FAT16 checkout; everything else is counted.
+/// blobs through `by_oid`. Every regular file is collected in `files`
+/// as its full relative path (bytes, `Vec`) plus the blob — the
+/// checkout's input; symlinks and gitlinks are counted only.
 fn walk<'a>(
     objects: &'a [git_pack::Object],
     by_oid: &BTreeMap<[u8; 20], usize>,
     root_tree: &[u8; 20],
-    root_files: &mut Vec<(&'a [u8], &'a [u8])>,
+    files: &mut Vec<(Vec<u8>, &'a [u8])>,
 ) -> Walk {
     let mut stats = Walk {
         files: 0,
@@ -531,11 +586,11 @@ fn walk<'a>(
                         } else if path == b"AGENTS.md" {
                             stats.agents = true;
                         }
-                        // Root-level only: the FAT crate has no mkdir
-                        // and no LFN writer yet (see the module docs).
-                        if !path.contains(&b'/') {
-                            root_files.push((entry.name, blob.data.as_slice()));
-                        }
+                        // The whole tree is checked out (directories are
+                        // created by `fat::write_file_all`); the path is
+                        // copied because `path` is reused for the next
+                        // entry.
+                        files.push((path.clone(), blob.data.as_slice()));
                         if stats.samples[0].is_none() {
                             stats.samples[0] = Some(path.clone());
                         } else if stats.samples[1].is_none() && path != b"README.md" {

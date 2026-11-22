@@ -10,11 +10,11 @@
 //! that fails any of them is *discarded* — lookup then falls back to the
 //! 8.3 name instead of trusting a partially verified string.
 
-use super::{BlockDevice, Error, Fat16, Next, classify, read_bytes};
+use super::{BlockDevice, Error, Fat16, Kind, Next, classify, read_bytes};
 
 /// Maximum UTF-16 units a long name may hold (FAT spec: 255 characters;
 /// a surrogate pair counts twice, so the cap is on units here).
-const MAX_LFN_UNITS: usize = 255;
+pub(crate) const MAX_LFN_UNITS: usize = 255;
 
 /// Where the directory being scanned lives.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -192,9 +192,12 @@ impl LfnState {
     }
 }
 
-/// The FAT spec's LFN checksum over an entry's raw 11-byte 8.3 name.
-fn short_checksum(short: &[u8; 32]) -> u8 {
-    short[..11].iter().fold(0u8, |sum, &c| {
+/// The FAT spec's LFN checksum over an entry's raw 11-byte 8.3 name
+/// (`short` may be longer; only the first 11 bytes count). Shared by the
+/// reader ([`LfnState::finish`]) and the FS3 writer, so both sides of
+/// the checksum agree by construction.
+pub(crate) fn short_checksum(short: &[u8]) -> u8 {
+    short.iter().take(11).fold(0u8, |sum, &c| {
         // Rotate right by one, then add — wrapping, per spec.
         (((sum & 1) << 7) | (sum >> 1)).wrapping_add(c)
     })
@@ -276,6 +279,19 @@ fn short_matches(raw: &[u8; 32], component: &str) -> bool {
 }
 
 impl<'a, D: BlockDevice + ?Sized> Fat16<'a, D> {
+    /// What does `path` name? [`Error::NotFound`] when nothing does;
+    /// otherwise [`Kind::Dir`] or [`Kind::File`] — the read-side check a
+    /// caller uses instead of attempting a read that would fail with
+    /// [`Error::NotAFile`].
+    pub fn kind(&self, path: &str) -> Result<Kind, Error> {
+        let entry = self.resolve(path)?.ok_or(Error::NotFound)?;
+        Ok(if entry.is_dir() {
+            Kind::Dir
+        } else {
+            Kind::File
+        })
+    }
+
     /// Resolve an absolute path to its directory entry (read path
     /// convenience over [`locate`](Self::locate)).
     pub(crate) fn resolve(&self, path: &str) -> Result<Option<DirEntry>, Error> {
@@ -355,7 +371,11 @@ impl<'a, D: BlockDevice + ?Sized> Fat16<'a, D> {
     /// the directory's own end. Both forms of end are bounded: the root
     /// by its entry count, a subdirectory by its (cycle-checked) chain.
     /// On a match the entry's exact slot location travels with it.
-    fn scan_dir(&self, dir: DirLoc, name: &str) -> Result<Option<(DirLoc, u32, DirEntry)>, Error> {
+    pub(crate) fn scan_dir(
+        &self,
+        dir: DirLoc,
+        name: &str,
+    ) -> Result<Option<(DirLoc, u32, DirEntry)>, Error> {
         let mut lfn = LfnState::new();
         match dir {
             DirLoc::Root => {
