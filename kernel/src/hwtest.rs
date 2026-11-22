@@ -34,8 +34,12 @@ pub const PREFIX: u8 = 24;
 
 /// Grace period before rebooting when the NIC never came up.
 const NO_NIC_GRACE_MS: u64 = 90_000;
-/// Consecutive accept windows with no client before rebooting.
-const IDLE_WINDOWS: u32 = 2;
+/// Total time budget for the serve loop before the watchdog reboots.
+/// A *time* budget (not a window count): a failed session must leave
+/// room for the operator's next attempt — that second connection is
+/// where the server replays the previous failure as a banner, the
+/// only remote-readable diagnosis channel this machine has.
+const SERVE_BUDGET_MS: u64 = 600_000; // 10 minutes
 
 /// Run the bring-up service loop. Never returns: it either keeps
 /// serving connections or reboots the machine.
@@ -51,20 +55,24 @@ pub fn run(stack: &mut Stack, cfg: &ServerConfig) -> ! {
         "hw: sshd on 192.168.1.79:{} (sky2) — waiting for a client",
         crate::sshd::LISTEN_PORT
     );
-    let mut idle = 0u32;
+    let started = crate::clock::now_ms();
     loop {
         if crate::sshd::serve_once(stack, cfg) {
-            idle = 0;
-        } else {
-            idle += 1;
-            serial_println!("hw: idle accept window {idle}/{IDLE_WINDOWS}");
-            if idle >= IDLE_WINDOWS {
-                serial_println!(
-                    "hw: no client; rebooting so the loader returns to the previous system"
-                );
-                crate::power::reboot();
-            }
+            // A session ran: the machine is useful — restart the
+            // clock. The next round re-listens (see serve_once).
+            continue;
         }
+        let elapsed = crate::clock::now_ms().saturating_sub(started);
+        serial_println!("hw: serve round ended ({elapsed} ms of {SERVE_BUDGET_MS} budget)");
+        if elapsed >= SERVE_BUDGET_MS {
+            serial_println!(
+                "hw: no successful session in the budget; rebooting so the loader returns to the previous system"
+            );
+            crate::power::reboot();
+        }
+        // Keep serving within the budget: each new connection gets
+        // the previous failure replayed as a banner (the remote
+        // diagnosis channel), so retries are cheap and visible.
     }
 }
 
