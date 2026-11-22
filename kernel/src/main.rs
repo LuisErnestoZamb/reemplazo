@@ -23,6 +23,7 @@ mod apps;
 mod ata;
 mod e1000;
 mod entropy;
+mod fs;
 mod git;
 mod heap;
 mod idt;
@@ -95,7 +96,12 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
     // Installer milestone BLK_OK: prints only when a drive on the legacy
     // primary channel answers IDENTIFY *and* LBA0 carries the installer
     // magic — the main smoke has no disk, so its marker chain is untouched.
-    crate::ata::probe();
+    // FS1's FAT_OK stacks on it: mount the volume and read /README.TXT
+    // back, byte for byte. No drive → `prove` never runs and nothing at
+    // all is printed (the diskless neutrality the main smoke requires).
+    if let Some(drive) = crate::ata::probe() {
+        crate::fs::prove(&drive); // FAT_OK — or `FATAL: fs:` + halt
+    }
 
     let mut stack = crate::e1000::init(&scan).map(|dev| {
         // Two draws: smoltcp's random_seed feeds its sPCG32 (TCP ISNs,

@@ -1,0 +1,10 @@
+[package]
+name = "fat"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+# None on purpose: read-only FAT16 parsing is pure byte arithmetic over a
+# `BlockDevice` the caller supplies (no_std, `forbid(unsafe_code)`),
+# host-tested in `tests/hostile.rs` the same way the kernel runs it.

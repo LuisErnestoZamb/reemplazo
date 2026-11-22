@@ -385,6 +385,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "00d174d5400e5e8fd687ad1049e2f578285fa914201b1af7e8b112a4546bd826"
 
 [[package]]
+name = "fat"
+version = "0.1.0"
+
+[[package]]
 name = "ff"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -577,6 +581,7 @@ dependencies = [
  "embassy-crypto-rustcrypto",
  "embedded-io",
  "embedded-tls",
+ "fat",
  "git-pktline",
  "linked_list_allocator",
  "log",
@@ -1220,6 +1225,9 @@ dependencies = [
 [[package]]
 name = "xtask"
 version = "0.1.0"
+dependencies = [
+ "fat",
+]
 
 [[package]]
 name = "zerocopy"

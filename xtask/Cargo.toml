@@ -5,3 +5,9 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+
+[dev-dependencies]
+# Host round-trip test only: `write_disk_image` must emit a volume the
+# kernel's own reader (`fat`) mounts — same crate, same code path the
+# `FAT_OK` boot proof takes, exercised on the build host first.
+fat = { path = "../fat" }
