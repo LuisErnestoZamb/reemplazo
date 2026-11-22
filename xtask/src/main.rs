@@ -142,6 +142,8 @@ fn check(root: &Path) -> bool {
                 "-p",
                 "html",
                 "-p",
+                "dom",
+                "-p",
                 "net",
                 "-p",
                 "pci",
@@ -193,6 +195,8 @@ fn check(root: &Path) -> bool {
                 "sky2-wire",
                 "-p",
                 "html",
+                "-p",
+                "dom",
                 "-p",
                 "mbi",
                 "-p",
@@ -661,7 +665,13 @@ fn run(root: &Path) -> bool {
 /// `AI_EDIT_OK` (A5 editor ↔ AI: the mock completion applied into the
 /// retained editor buffer through the `ai apply` path, undo/redo
 /// round-trip asserted on the buffer, the editor frame read back from
-/// `0xb8000`) — within
+/// `0xb8000`), `BROWSER_RENDER_OK` (B2 browser render: `example.com`
+/// fetched through the parameterized B1 fetch, the `dom` arena tree
+/// built over our tokenizer, the text layout — title bar, word-wrapped
+/// paragraph, status URL — rendered in the TUI viewport and read back
+/// from `0xb8000`, plus a fixture frame asserting headings, list
+/// markers, `<pre>` whitespace, dim code, inverse link cells and the
+/// `display:none` skip) — within
 /// [`SMOKE_TIMEOUT`]. Then the keyboard milestone:
 /// once `SHELL_OK` matches, connect to QEMU's HMP monitor
 /// ([`monitor_port`]) and type `echo KEYBOARD_OK` key by key with
@@ -684,7 +694,9 @@ fn run(root: &Path) -> bool {
 /// browser fetch (URL parse/resolve + redirect-following HTTP(S) GET
 /// against github.com), the A5 editor ↔ AI integration (retained
 /// document, completion apply + undo round-trip, editor-frame
-/// readback), the serial
+/// readback), the B2 browser render (HTML tree builder over the
+/// tokenizer, text layout — wrap/heads/lists/pre/links — and the
+/// viewport frame read back from `0xb8000`), the serial
 /// shell coming up, or the keyboard path (i8042 bring-up, scancode
 /// decode, input multiplexing) — so it gates every milestone in the
 /// chain.
@@ -692,7 +704,7 @@ fn run(root: &Path) -> bool {
 /// It runs **without a disk**, so the `ata::probe` that sits between
 /// `PCI_OK` and `E1000_OK` stays silent here.
 fn smoke(root: &Path) -> bool {
-    const MARKERS: [&str; 25] = [
+    const MARKERS: [&str; 26] = [
         "BOOT_OK",
         "VGA_OK",
         "MEM_OK",
@@ -716,6 +728,7 @@ fn smoke(root: &Path) -> bool {
         "AI_CHAT_OK",
         "BROWSER_FETCH_OK",
         "AI_EDIT_OK",
+        "BROWSER_RENDER_OK",
         "SHELL_OK",
         "KEYBOARD_OK",
     ];

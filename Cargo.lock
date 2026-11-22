@@ -288,6 +288,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dom"
+version = "0.1.0"
+dependencies = [
+ "html",
+]
+
+[[package]]
 name = "ecdsa"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -714,6 +721,7 @@ name = "kernel"
 version = "0.1.0"
 dependencies = [
  "aiwire",
+ "dom",
  "editorbuf",
  "embassy-crypto",
  "embassy-crypto-rustcrypto",

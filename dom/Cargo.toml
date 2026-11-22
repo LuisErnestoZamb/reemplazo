@@ -1,0 +1,10 @@
+[package]
+name = "dom"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The zero-copy tokenizer this tree builder consumes. Workspace crate,
+# `no_std`, `forbid(unsafe_code)`, zero dependencies of its own.
+html = { path = "../html" }
