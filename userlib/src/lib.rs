@@ -30,6 +30,35 @@ pub const NR_VGA_PUT_CELL: u64 = 6;
 pub const NR_VGA_CLEAR: u64 = 7;
 pub const NR_VGA_FLUSH: u64 = 8;
 pub const NR_VGA_PEEK: u64 = 9;
+// Hito 4 — filesystem service (mirrors kernel/src/userland/fs.rs).
+pub const NR_OPEN: u64 = 10;
+pub const NR_CLOSE: u64 = 11;
+pub const NR_FS_READ: u64 = 12;
+pub const NR_FS_WRITE: u64 = 13;
+pub const NR_STAT: u64 = 14;
+pub const NR_READDIR: u64 = 15;
+
+// --- Hito 4: open flags and wire layouts ---------------------------------
+/// Read-only access (the default).
+pub const O_RDONLY: u64 = 0;
+/// Write-only access.
+pub const O_WRONLY: u64 = 1;
+/// Read/write access.
+pub const O_RDWR: u64 = 2;
+/// Create the file when it does not exist.
+pub const O_CREAT: u64 = 0x40;
+/// Truncate an existing file on open.
+pub const O_TRUNC: u64 = 0x200;
+/// Start every write at end of file.
+pub const O_APPEND: u64 = 0x400;
+
+/// `Stat` record size: `size: u64 LE`, `kind: u8` (0 file / 1 dir),
+/// `flags: u8`, six reserved bytes.
+pub const STAT_LEN: usize = 16;
+/// `Readdir` record size: `kind: u8`, `name_len: u8`, 62 name bytes.
+pub const DIRENT_LEN: usize = 64;
+/// Number of name bytes in one `Readdir` record.
+pub const DIRENT_NAME: usize = DIRENT_LEN - 2;
 
 // --- Errnos (mirror kernel/src/userland/syscall.rs) ----------------------
 pub const EINVAL: i64 = -1;
@@ -143,6 +172,96 @@ pub fn vga_peek(x: u16, y: u16) -> Option<(u8, u8)> {
         let packed = packed as u64;
         Some((packed as u8, (packed >> 8) as u8))
     }
+}
+
+// --- Hito 4: filesystem syscalls -----------------------------------------
+
+/// Open a volume path. `path` must be absolute, ≤256 bytes and free of
+/// `.`/`..`; the kernel returns an opaque fd (negative = errno).
+#[inline]
+pub fn fs_open(path: &[u8], flags: u64) -> i64 {
+    arch::syscall3(NR_OPEN, path.as_ptr() as u64, path.len() as u64, flags)
+}
+
+/// Close an opaque volume fd. `0` on success, negative errno otherwise.
+#[inline]
+pub fn fs_close(fd: i64) -> i64 {
+    arch::syscall1(NR_CLOSE, fd as u64)
+}
+
+/// Read from an opaque volume fd into `buf`. Byte count or negative errno.
+#[inline]
+pub fn fs_read(fd: i64, buf: &mut [u8]) -> i64 {
+    arch::syscall3(
+        NR_FS_READ,
+        fd as u64,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+    )
+}
+
+/// Write `buf` to an opaque volume fd. Byte count or negative errno.
+#[inline]
+pub fn fs_write(fd: i64, buf: &[u8]) -> i64 {
+    arch::syscall3(
+        NR_FS_WRITE,
+        fd as u64,
+        buf.as_ptr() as u64,
+        buf.len() as u64,
+    )
+}
+
+/// Fill `out` (≥[`STAT_LEN`] bytes) with the fd's stat record. Returns the
+/// record length or a negative errno.
+#[inline]
+pub fn fs_stat(fd: i64, out: &mut [u8]) -> i64 {
+    arch::syscall3(
+        NR_STAT,
+        fd as u64,
+        out.as_mut_ptr() as u64,
+        out.len() as u64,
+    )
+}
+
+/// Fill `out` with whole [`DIRENT_LEN`] records for a directory fd.
+/// Returns bytes written (a multiple of [`DIRENT_LEN`]) or an errno.
+#[inline]
+pub fn fs_readdir(fd: i64, out: &mut [u8]) -> i64 {
+    arch::syscall3(
+        NR_READDIR,
+        fd as u64,
+        out.as_mut_ptr() as u64,
+        out.len() as u64,
+    )
+}
+
+/// Decode the little-endian `size` field of a `Stat` record. `None` when
+/// the record is short. No allocation, no panic.
+#[inline]
+pub fn stat_size(record: &[u8]) -> Option<u64> {
+    if record.len() < STAT_LEN {
+        return None;
+    }
+    let mut size = 0u64;
+    for (i, b) in record[..8].iter().enumerate() {
+        size |= (*b as u64) << (8 * i);
+    }
+    Some(size)
+}
+
+/// Decode one `Readdir` record's name into `out`; `None` for a malformed
+/// record. The returned slice borrows `out`.
+#[inline]
+pub fn dirent_name<'a>(record: &[u8], out: &'a mut [u8; DIRENT_NAME]) -> Option<&'a [u8]> {
+    if record.len() < DIRENT_LEN {
+        return None;
+    }
+    let n = record[1] as usize;
+    if n == 0 || n > DIRENT_NAME {
+        return None;
+    }
+    out[..n].copy_from_slice(&record[2..2 + n]);
+    Some(&out[..n])
 }
 
 /// The one piece of unsafe in this crate: the raw `int 0x80` wrappers.

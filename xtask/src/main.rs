@@ -383,14 +383,17 @@ fn build_user(root: &Path) -> bool {
     true
 }
 
-/// Hito 3: cross-compile `user-shell` (its own tiny workspace, so the root
+/// Hito 4: cross-compile `user-edit` (its own tiny workspace, so the root
 /// member list stays owned by the integrator) and leave the ELF at
-/// `target/x86_64-unknown-none/release/user-shell`. `stage_shell_module`
+/// `target/x86_64-unknown-none/release/user-edit`. `stage_edit_module`
 /// then copies it into the ISO under the multiboot module name `hello`,
-/// which is the one name the kernel's U1 loader captures today. Same
-/// `code-model=large` scoping rule as `build_user` — never set it globally.
-fn build_user_shell(root: &Path) -> bool {
-    let manifest = root.join("user/shell/Cargo.toml");
+/// which is the one name the kernel's U1 loader captures today. The editor
+/// ELF carries the hito-3 console preamble + REPL too, so the existing
+/// `USER_CONSOLE_OK`/`USER_SHELL_OK` markers and the keyboard phase keep
+/// working. Same `code-model=large` scoping rule as `build_user` — never
+/// set it globally.
+fn build_user_edit(root: &Path) -> bool {
+    let manifest = root.join("user/edit/Cargo.toml");
     let status = Command::new("cargo")
         .args([
             "build",
@@ -410,20 +413,20 @@ fn build_user_shell(root: &Path) -> bool {
     match status {
         Ok(s) if s.success() => {}
         Ok(s) => {
-            eprintln!("xtask user-shell: cargo build failed with {s}");
+            eprintln!("xtask user-edit: cargo build failed with {s}");
             return false;
         }
         Err(e) => {
-            eprintln!("xtask user-shell: cannot run cargo: {e}");
+            eprintln!("xtask user-edit: cannot run cargo: {e}");
             return false;
         }
     }
-    let elf = root.join("target/x86_64-unknown-none/release/user-shell");
+    let elf = root.join("target/x86_64-unknown-none/release/user-edit");
     if !elf.is_file() {
-        eprintln!("xtask user-shell: no ELF at {}", elf.display());
+        eprintln!("xtask user-edit: no ELF at {}", elf.display());
         return false;
     }
-    println!("xtask user-shell: built {}", elf.display());
+    println!("xtask user-edit: built {}", elf.display());
     true
 }
 
@@ -431,30 +434,30 @@ fn build_user_shell(root: &Path) -> bool {
 /// ELF as the `hello` multiboot module for the dedicated `smoke-user` ISO.
 /// Reuses the existing capture path in `kernel/src/userland/module.rs`, so
 /// no kernel loader change is needed to run the console-owning process.
-fn stage_shell_module(root: &Path, iso_root: &Path, cfg_path: &Path) {
-    let relative = root.join("target/x86_64-unknown-none/release/user-shell");
+fn stage_edit_module(root: &Path, iso_root: &Path, cfg_path: &Path) {
+    let relative = root.join("target/x86_64-unknown-none/release/user-edit");
     let bytes = match std::fs::read(&relative) {
         Ok(bytes) => bytes,
         Err(e) => {
-            eprintln!("xtask user-shell: cannot read {}: {e}", relative.display());
+            eprintln!("xtask user-edit: cannot read {}: {e}", relative.display());
             return;
         }
     };
     if bytes.len() as u64 > HELLO_MODULE_CAP {
         eprintln!(
-            "xtask user-shell: ELF is {} B, above the {HELLO_MODULE_CAP} B module cap",
+            "xtask user-edit: ELF is {} B, above the {HELLO_MODULE_CAP} B module cap",
             bytes.len()
         );
         return;
     }
     if let Err(e) = std::fs::write(iso_root.join("boot/hello.elf"), bytes) {
-        eprintln!("xtask user-shell: cannot write boot/hello.elf: {e}");
+        eprintln!("xtask user-edit: cannot write boot/hello.elf: {e}");
         return;
     }
     let cfg = match std::fs::read_to_string(cfg_path) {
         Ok(cfg) => cfg,
         Err(e) => {
-            eprintln!("xtask user-shell: cannot read {}: {e}", cfg_path.display());
+            eprintln!("xtask user-edit: cannot read {}: {e}", cfg_path.display());
             return;
         }
     };
@@ -467,7 +470,7 @@ fn stage_shell_module(root: &Path, iso_root: &Path, cfg_path: &Path) {
         1,
     );
     if let Err(e) = std::fs::write(cfg_path, cfg) {
-        eprintln!("xtask user-shell: cannot write {}: {e}", cfg_path.display());
+        eprintln!("xtask user-edit: cannot write {}: {e}", cfg_path.display());
     }
 }
 
@@ -616,9 +619,11 @@ fn iso_inner(root: &Path, hwtest: bool, user_mode: bool) -> bool {
     // U1: build/stage the userland ELF only in the dedicated smoke-user
     // ISO. The standard smoke/install/ssh/hwtest ISOs stay byte-identical
     // (no hello module -> no ELF_OK -> original marker chains).
-    // Hito 3: the smoke-user ISO runs the console-owning user shell under
+    // Hito 4: the smoke-user ISO runs the console-owning user editor under
     // the existing `hello` module name (the U1 loader's one capture slot).
-    if user_mode && !build_user_shell(root) {
+    // It carries the hito-3 console/REPL proof as well, so both marker
+    // groups stay in the chain.
+    if user_mode && !build_user_edit(root) {
         return false;
     }
     let kernel = root.join("target/x86_64-unknown-none/release/kernel");
@@ -705,7 +710,7 @@ fn iso_inner(root: &Path, hwtest: bool, user_mode: bool) -> bool {
     // chains. With the ELF present the kernel's ELF_OK proof runs after
     // SHELL_OK (the module is captured before `memory::init`).
     if user_mode {
-        stage_shell_module(root, &iso_root, &boot_dir.join("grub.cfg"));
+        stage_edit_module(root, &iso_root, &boot_dir.join("grub.cfg"));
     }
     // I1b: the config embedded in the installed disk's core.img.
     if let Err(e) = std::fs::write(iso_root.join("boot/early.cfg"), GRUB_EARLY_CFG) {
@@ -2100,6 +2105,11 @@ fn smoke_user(root: &Path) -> bool {
         // serves its own prompt before handing control back to PID0.
         "USER_CONSOLE_OK",
         "USER_SHELL_OK",
+        // Hito 4: the user process proves the FS syscalls (including the
+        // fail-closed path/fd cases) and the gap-buffer save/byte-exact
+        // read-back before handing control back to PID0.
+        "USER_FS_OK",
+        "USER_EDITOR_OK",
         "USER_RETURN_OK",
         "SCHED_RR_OK",
         "USER_YIELD_OK",
