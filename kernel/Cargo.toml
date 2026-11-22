@@ -30,6 +30,14 @@ editorbuf = { path = "../editorbuf" }
 # (exact serialization, truncated/malformed JSON, SSE split torture)
 # live in the crate's docs; review recorded in the A3 commit.
 aiwire = { path = "../aiwire" }
+# sky2 wire logic (Marvell 88E8053 — the MacBook's NIC): descriptor
+# and status-ring layouts, SMI/MDIO encoding, PHY/MAC validation and
+# the bring-up register-value composition. From-scratch under
+# dependency-policy exception (a): there is no maintained no_std sky2
+# crate and Linux sky2.c is the register-level truth; zero deps,
+# forbid(unsafe_code), adversarially host-tested (the MMIO `unsafe`
+# glue stays in kernel/src/sky2.rs).
+sky2-wire = { path = "../sky2-wire" }
 multiboot2 = { version = "0.28", default-features = false }
 # Read-only FAT16 (FS1, `FAT_OK`): workspace crate, `no_std` +
 # `forbid(unsafe_code)`, zero dependencies, adversarially host-tested in
