@@ -17,12 +17,14 @@
 
 pub mod console;
 pub mod elf;
+pub mod fs;
 pub mod load;
 pub mod module;
 pub mod process;
 pub mod sched;
 pub mod syscall;
 pub mod userptr;
+pub mod vfs;
 pub mod vgaservice;
 
 /// Boot-time proof that the staged user ELF parses and maps (U1).

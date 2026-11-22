@@ -20,7 +20,7 @@ Estado: **hito 1 completado** (`e53295e`).kernel+apps separados por una frontera
 | Gate | cadena |
 |---|---|
 | `cargo xtask smoke` | 30 markers originales, byte-idénticos — el ISO no lleva módulo `hello` |
-| `cargo xtask smoke-user` | `BOOT_OK … SHELL_OK, ELF_OK, USER_RUN_OK, SYSCALL_OK, USER_CONSOLE_OK, USER_SHELL_OK, USER_RETURN_OK, SCHED_RR_OK, USER_YIELD_OK, USER_FAULT_OK` (30 marcadores) |
+| `cargo xtask smoke-user` | 33 marcadores: `… SHELL_OK, ELF_OK, USER_RUN_OK, SYSCALL_OK, USER_CONSOLE_OK, USER_SHELL_OK, USER_FS_OK, USER_EDITOR_OK, USER_RETURN_OK, SCHED_RR_OK, USER_YIELD_OK, USER_FAULT_OK` |
 | `cargo xtask smoke-ssh` | PASS (interop OpenSSH real, intento 1) |
 | `cargo xtask smoke-install` | temporalmente limitado por el presupuesto de 60 s con carga de host >7 (documentado; no es regresión) |
 
@@ -31,7 +31,7 @@ Estado: **hito 1 completado** (`e53295e`).kernel+apps separados por una frontera
 | 1 · frontera mínima | ✅ `e53295e` | — |
 | 2 · RR preventivo por PIT | ✅ (mergeado) | quantum 10 ticks, `Yield` real, #PF→kill con #PF real desde CPL3, `fxsave`/`fxrstor` por PCB; `userptr::set_vm` publicado en cada switch (hito 2b) |
 | 3 · consola de usuario | ✅ (mergeado) | syscalls 4–9 (`Read`, `VgaDims/PutCell/Clear/Flush/Peek`), `vgaservice.rs` con diff contra `0xb8000`, proceso `user/shell` con REPL; deuda: publicar `owns_console` desde el PCB |
-| 4 · FS | 🔨 (agente activo) | `Open/Close/Read/Write/Stat`, fds por PCB, editor como proceso |
+| 4 · FS | ✅ (mergeado) | syscalls 10–15, fds opacos por PID, volumen RAM acotado, `user/edit` con readback byte-exacto; deuda: volumen FAT-backed real, `Seek`, persistencia |
 | 5 · red/TLS | 📋 | handles opacos para `netstack`/`tls`, estados `Blocked`, migrar AI y browser |
 | 6 · git/ssh/instalador | 📋 | `Spawn/Waitpid`, IPC acotado, ELFs de usuario en p2 y `GRUB_EARLY_CFG` |
 | 7 · corte total | 📋 | borrar `kernel/src/apps/`, `shell::run` solo fallback, `USER_ONLY_OK` |

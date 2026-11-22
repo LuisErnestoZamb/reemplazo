@@ -373,6 +373,12 @@ pub fn spawn_with_stack(entry: u64, cr3_phys: u64, user_stack_top: u64) -> Optio
     // inside this process's own kernel stack.
     unsafe { build_user_frame(frame, entry, user_stack_top) };
     let mut p = Process::new(pid, cr3_phys, top, entry, user_stack_top);
+    // U2b: publish the ELF's data region as the initial `brk` VMA,
+    // otherwise install_context() would overwrite it with 0 on each
+    // switch and every user Write after a Yield would be EFAULT.
+    // The loader maps the PT_LOAD at USER_BASE..USER_BASE+1 MiB; the
+    // userptr caps bound it, so a coarse but honest end is fine here.
+    p.brk_end = crate::memory::USER_BASE + (1 << 20);
     p.saved_context = frame;
     p.quantum_left = QUANTUM_TICKS;
     // Give the fresh PCB a valid FPU image (the outgoing kernel state) so

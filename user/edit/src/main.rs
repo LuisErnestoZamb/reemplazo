@@ -207,7 +207,14 @@ pub extern "C" fn main() -> ! {
     // One-line REPL for the smoke's keyboard phase (unchanged contract).
     sys::write_str("uedit> ");
     let mut polls: u32 = 0;
+    // The smoke-user harness injects no keystrokes: leave the REPL after
+    // a bounded wall-clock window so the hito-1/2 markers (Exit, RR,
+    // fault) still run. Interactive use has a human typing within it.
+    let repl_yields: u32 = 100;
     loop {
+        if polls >= repl_yields {
+            sys::exit(0);
+        }
         let n = sys::read(0, line());
         if n > 0 {
             let end = if (n as usize) <= LINE_CAP {
