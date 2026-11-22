@@ -78,8 +78,7 @@ All in Rust, all in this workspace:
 ```sh
 cargo xtask check   # fmt + clippy (host and kernel target) + tests + cross-build
 cargo xtask smoke   # build ISO, boot headless, assert serial markers in order
-cargo xtask smoke-install  # two IDE disks (FAT16 source + blank target); assert BLK_OK + FAT_OK + FS_WRITE_OK + FS_TREE_OK + INST_OK + GIT_CHECKOUT_OK + NETINST_OK
-cargo xtask smoke-install  # same + FAT16 IDE disk; assert BLK_OK + FAT_OK + FS_WRITE_OK + GIT_CHECKOUT_OK
+cargo xtask smoke-install  # two IDE disks (FAT16 source + blank target); assert BLK_OK + FAT_OK + FS_WRITE_OK + FS_TREE_OK + INST_OK + GIT_CHECKOUT_OK + NETINST_OK, then boot target.img alone and assert BOOT_OK … SHELL_OK
 cargo xtask smoke-ssh  # two VMs: our sshd (one disk) ↔ our client (other disk) — SSHD_OK + SSHD_EXEC_OK
 cargo xtask run     # interactive boot in QEMU (Ctrl-C quits)
 cargo test -p mbi <name>   # single test
@@ -118,6 +117,27 @@ stack**, walks the ustar headers, reinstalls onto the target and reads
 everything back byte-exact. When QEMU exits, xtask re-verifies
 `target.img` on the host — GPT + FAT + the installed kernel byte-exact
 against the built binary.
+
+**The installed disk is bootable (I1b).** `xtask iso()` builds GRUB's
+`boot.img` (512 B, from `grub-pc-bin`) and `core.img` with
+`grub-mkimage -O i386-pc -p '(hd0,gpt2)/boot/grub' -c <early.cfg>` in
+the tools image, and concatenates them as `boot.img ‖ core.img`; the
+ISO config loads that blob and the kernel as multiboot2 modules
+(`module2 … grubpayload`, `module2 /boot/kernel.elf payload`). The
+kernel copies both modules into statics before the frame allocator
+exists (`mbi::check_module` bounds-checks every range), and both install
+paths end by writing `core.img` to p1 (`bios_grub`, block list
+recomputed and patched) and `boot.img` to LBA0 (partition table
+preserved, kernel LBA patched at `0x5c`, exactly `grub-setup`'s patch
+set) — GRUB boot code last, as the commit point. The offline install
+also writes `/KERNEL.ELF` from the `payload` module, so a disk installed
+with no network still boots. After the host re-verify (which now also
+compares LBA0/p1 against the ISO's GRUB artifact byte-for-byte),
+`smoke-install` starts a **second QEMU with `target.img` alone** (no
+ISO) and asserts the installed system's chain — `BOOT_OK → VGA_OK →
+MEM_OK → ALLOC_OK → RTC_OK → PCI_OK → E1000_OK → SHELL_OK` within 45 s
+(`SHELL_OK` implies every earlier fail-closed network/AI/browser phase
+passed).
 
 
 `cargo xtask smoke-ssh` is the **ssh server**'s end-to-end proof. It
@@ -193,11 +213,11 @@ Milestones landed so far (see `git log` for details):
 - [ ] ISO installer + network installer
   - [x] Block layer: ATA PIO driver on the legacy IDE primary channel (`cargo xtask smoke-install` asserts `BLK_OK`)
   - [x] Filesystem: FAT16 reader + writer + directories + LFN writes, `no_std` + `forbid(unsafe_code)` + zero deps (`smoke-install` asserts `FAT_OK`, `FS_WRITE_OK` — write + re-mount read-back — and `FS_TREE_OK` — nested mkdir + long-name write + re-mount read-back; `fat/` crate, 102 adversarial host tests incl. randomized write/tree oracles)
-  - [x] Filesystem: FAT16 reader + writer, `no_std` + `forbid(unsafe_code)` + zero deps (`smoke-install` asserts `FAT_OK` then `FS_WRITE_OK` — write + re-mount read-back; `fat/` crate, 71 adversarial host tests incl. a randomized write oracle)
   - [x] Shared FAT16 formatter: `fat::format_fat16` derives the geometry from the device size and self-checks against the reader — used by xtask's disk images *and* the kernel installer (`fat/tests/format.rs`, +8 tests)
   - [x] GPT reader + writer: `gptwire` crate, `no_std` + `forbid(unsafe_code)` + zero deps, 49 adversarial host tests (CRC32 vectors, truncated/bad-CRC headers, absurd entry counts, backup mismatch, overlap, MBR garbage)
-  - [x] Install-to-disk (I1): GPT → FAT16 p2 → payload copy → byte-exact re-read (`smoke-install` asserts `INST_OK`; host-side re-verify after QEMU exits). GRUB boot code on the target is deferred (I1b) — the installed disk is not yet bootable
+  - [x] Install-to-disk (I1): GPT → FAT16 p2 → payload copy → byte-exact re-read (`smoke-install` asserts `INST_OK`; host-side re-verify after QEMU exits)
   - [x] Network installer (I2): `payload.tar` (ustar: built kernel + README) fetched from an in-container HTTP responder over the OS's own smoltcp/`net::http` stack, ustar walked with checksum validation, installed + byte-exact re-read (`smoke-install` asserts `NETINST_OK`; host verifies the installed kernel against the built binary). Real-`api.github.com` fetch and HTTPS remain later milestones
+  - [x] **Bootable target (I1b)**: GRUB `boot.img`+`core.img` built by `grub-mkimage` at ISO time, shipped as a multiboot2 module, written by the installer to LBA0 + the `bios_grub` partition with `grub-setup`'s LBA patch and the GPT protective MBR preserved; `smoke-install` boots `target.img` **alone** (no ISO) and asserts the installed system's `BOOT_OK … SHELL_OK`. GRUB boot code on real-hardware disks (AHCI) and a p2 `grub.cfg`/menu remain later work
 
 ## License
 

@@ -81,20 +81,29 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
         halt();
     }
 
-    match read_mbi(mbi_addr) {
+    let payloads = match read_mbi(mbi_addr) {
         Ok(info) => {
             report_boot_info(&info);
             sync_vga(&info);
+            // I1b: copy the installer's multiboot2 modules (GRUB's
+            // boot.img+core.img and the kernel payload) out of GRUB's
+            // memory **before** the frame allocator exists — module
+            // frames are not reserved in the multiboot2 memory map, so
+            // they would otherwise be reused by the heap (see
+            // `install::capture_modules`). Silent when a boot carries no
+            // modules (the installed system's own boot).
+            let payloads = crate::install::capture_modules(&info);
             memory::init(&info, mbi_addr);
             memory::selftest(&info, mbi_addr); // MEM_OK
             heap::init(); // carve a contiguous run, init the global heap
             heap::prove_alloc(); // ALLOC_OK — before the network chain
+            payloads
         }
         Err(e) => {
             serial_println!("FATAL: bad multiboot2 info: {:?}", e);
             halt();
         }
-    }
+    };
 
     arm_interrupts();
     report_rtc(); // pure port I/O: no PCI needed, and RTC_OK precedes PCI_OK
@@ -135,7 +144,7 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
         // *marked* target disk is attached (single-disk and diskless
         // boots print nothing extra); with one, every failure is
         // `FATAL: install:` + halt.
-        crate::install::prove(drive, target_drive.as_ref());
+        crate::install::prove(drive, target_drive.as_ref(), &payloads);
     }
 
     // S5 (docs/git-ssh-deps.md §B.4 row S5): a disk carrying a host key
@@ -288,7 +297,7 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
     // the source disk exists) — silently skipped otherwise, so the
     // diskless main smoke's marker chain stays untouched.
     if let (Some(stack), Some(target)) = (stack.as_mut(), target_drive.as_ref()) {
-        crate::install::netprove(stack, Some(target));
+        crate::install::netprove(stack, Some(target), &payloads);
     }
 
     // The shell is the kernel's idle state until a scheduler exists;

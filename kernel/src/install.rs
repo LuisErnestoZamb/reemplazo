@@ -1,6 +1,7 @@
-//! Milestones **I1** (docs/installer.md §3.2, §4, §8.3) and **I2**
-//! (§6, §8.4): the install-to-disk flow (`INST_OK`) and the network
-//! installer (`NETINST_OK`).
+//! Milestones **I1** (docs/installer.md §3.2, §4, §8.3), **I2**
+//! (§6, §8.4) and **I1b** (§4, §8.6): the install-to-disk flow
+//! (`INST_OK`), the network installer (`NETINST_OK`) and the GRUB boot
+//! code that makes the installed target **bootable on its own**.
 //!
 //! Given the *source* disk (the FS1/FS2 volume — already proven by
 //! `crate::fs::prove`) and a *target* disk found by
@@ -17,11 +18,19 @@
 //!    with xtask's disk images (one implementation, one contract,
 //!    host-tested in `fat/tests/format.rs`).
 //! 3. **Copy the payload** — `/README.TXT` + `/RESULT.TXT` read from
-//!    the source volume (the FS1 machinery) into a fixed
-//!    [`PAYLOAD_CAP`]-sized buffer and written to p2.
+//!    the source volume (the FS1 machinery) and `/KERNEL.ELF` from the
+//!    ISO's `payload` multiboot2 module (I1b: the running kernel's own
+//!    ELF bytes, so the installed disk boots standalone even offline).
 //! 4. **Verify** — re-mount p2 from scratch (fresh `Part` + fresh
-//!    `fat::Fat16`, no state from the write surviving) and read both
-//!    files back byte-exact against the bytes read from the source.
+//!    `fat::Fat16`, no state from the write surviving) and read every
+//!    file back byte-exact.
+//! 5. **GRUB (I1b)** — the `grubpayload` module carries GRUB's own
+//!    `boot.img` (512 B) + `core.img` (built by `grub-mkimage` during
+//!    `xtask iso`); [`install_grub`] writes `core.img` to p1 with the
+//!    block list patched to p1's first LBA, then `boot.img` to LBA0
+//!    with the partition table preserved and the same LBA patched in
+//!    (exactly `grub-bios-setup`'s write sequence, §4/§8.6), and reads
+//!    both back. GRUB boot code is the **commit point** and goes last.
 //!
 //! ## I2: the network installer (`NETINST_OK`)
 //!
@@ -33,9 +42,22 @@
 //! incremental `ResponseParser`, streamed into a bounded 2 MiB
 //! [`DOWNLOAD`] static), walks the tar headers (bounded, checksum-
 //! validated), then runs the *same* [`install_payload`] the offline
-//! path uses and reads every file back byte-exact → `NETINST_OK`.
-//! The host then re-verifies `target.img` against the **built kernel
-//! binary** (xtask's `verify_installed_image`).
+//! path uses (GPT + FAT + files + GRUB) and reads every file back
+//! byte-exact → `NETINST_OK`. The host then re-verifies `target.img`
+//! against the **built kernel binary** and the ISO's GRUB artifacts
+//! (xtask's `verify_installed_image`).
+//!
+//! ## Module payloads: copied before the heap exists
+//!
+//! Both artifacts arrive as multiboot2 **modules** on the installer
+//! ISO (`module2 /boot/grubpayload.bin grubpayload`,
+//! `module2 /boot/kernel.elf payload`). GRUB's module memory is *not*
+//! reserved in the multiboot2 memory map (only the kernel image and
+//! the MBI are), so the frame allocator would eventually hand those
+//! frames out and overwrite the bytes. [`capture_modules`] therefore
+//! copies each recognized module into a kernel-owned static **before
+//! `memory::init`** (still interrupts-off, single core) and the
+//! installer reads only those copies afterwards.
 //!
 //! ## Neutrality (diskless boots stay silent)
 //!
@@ -50,27 +72,24 @@
 //! loud `FATAL: install: …` + `halt()` — the smoke can never pass on
 //! a half-written disk.
 //!
-//! ## What these milestones deliberately do *not* do (I1b / later)
+//! ## What these milestones deliberately do *not* do (later work)
 //!
-//! - **No GRUB boot code on the target** (`boot.img` → LBA0,
-//!   `core.img` → p1): the artifacts live on the ISO
-//!   (`/boot/grub/{boot,core}.img`) but the kernel has no ISO9660
-//!   reader and no multiboot2-module payload path yet (docs milestone
-//!   `MOD_OK`) — there is no honest way for the kernel to *have* the
-//!   bytes in I1, so the installed disk is not yet bootable. Deferred
-//!   to I1b with the payload-delivery milestone, never faked:
-//!   `INST_OK`/`NETINST_OK` assert only what they actually do.
-//! - No shell `disks`/`install`/`netinstall` builtins (boot-time
+//! - **No shell `disks`/`install`/`netinstall` builtins** (boot-time
 //!   proof chosen for I1/I2 — see docs/installer.md §8.3/§8.4), no
 //!   HTTPS fetch (TLS against a local server is impossible — §7.2;
-//!   the real `api.github.com` fetch is a later milestone), no AHCI.
+//!   the real `api.github.com` fetch is a later milestone), no AHCI,
+//!   no `/boot/grub/grub.cfg` on p2 (I1b embeds a tiny early config in
+//!   `core.img` instead, §8.6), no GRUB modules beyond the tested
+//!   boot-critical set, and no interactive menu (timeout 0 semantics:
+//!   boot the only entry).
 
 use crate::ata;
 use crate::clock;
 use crate::fs::{AtaDisk, stamp};
 use crate::netstack::{OP_DEADLINE_MS, Stack};
-use core::ptr::addr_of_mut;
+use core::ptr::{addr_of, addr_of_mut};
 use gptwire::{Guid, Partition, TYPE_BASIC_DATA, TYPE_BIOS_GRUB};
+use multiboot2::BootInformation;
 use net::http::{self, ResponseParser};
 use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp;
@@ -120,6 +139,184 @@ const VOLUME_ID: u32 = 0x2026_1122;
 const DISK_GUID: Guid = Guid::from_bytes([0xA5; 16]);
 const P1_UNIQUE_GUID: Guid = Guid::from_bytes([0xB1; 16]);
 const P2_UNIQUE_GUID: Guid = Guid::from_bytes([0xB2; 16]);
+
+// --- I1b: GRUB boot code on the target (docs/installer.md §4, §8.6) -----
+
+/// `boot.img` is one 512-byte MBR sector by construction (GRUB's
+/// `grub-bios-setup` refuses any other size).
+const GRUB_BOOT_BYTES: usize = 512;
+/// Hard cap for `core.img`: p1 is exactly 1 MiB (2048 sectors), the
+/// block-list `len` field counts the remaining sectors in 16 bits, and
+/// everything must fit the partition whole — so the artifact is bounded
+/// by the *consumer* (the installed layout), never by the tag. The
+/// measured artifact is ≈148 KiB; drift past 1 MiB is a build error,
+/// not a runtime guess.
+const GRUB_CORE_CAP: usize = 1 << 20;
+/// Hard cap for the whole `grubpayload` module: `boot.img ‖ core.img`.
+const GRUB_MODULE_CAP: usize = GRUB_BOOT_BYTES + GRUB_CORE_CAP;
+/// Hard cap for the kernel payload module (the offline `/KERNEL.ELF`
+/// source). Same bound as the network download ([`DOWNLOAD_CAP`]) and
+/// well above the ~2.1 MiB kernel, so build drift fails loudly.
+const KERNEL_MODULE_CAP: usize = DOWNLOAD_CAP;
+
+/// `boot.img` field offsets — GRUB 2.12's
+/// `include/grub/i386-pc/boot.h`:
+/// `GRUB_BOOT_MACHINE_KERNEL_SECTOR = 0x5c` (kernel_sector +
+/// kernel_sector_high: `grub-setup`'s `write_rootdev` stores an
+/// *unaligned 64-bit* little-endian sector here),
+/// `BOOT_DRIVE = 0x64`, `DRIVE_CHECK = 0x66`, `WINDOWS_NT_MAGIC =
+/// 0x1b8`, `PART_START = 0x1be`, `PART_END = 0x1fe`, `BPB_START =
+/// 0x03`, `BPB_END = 0x5a`.
+const GRUB_KERNEL_SECTOR: usize = 0x5c;
+const GRUB_BOOT_DRIVE: usize = 0x64;
+const GRUB_DRIVE_CHECK: usize = 0x66;
+const GRUB_NT_MAGIC: usize = 0x1b8;
+const GRUB_PART_START: usize = 0x1be;
+const GRUB_PART_END: usize = 0x1fe;
+const GRUB_BPB_START: usize = 0x03;
+const GRUB_BPB_END: usize = 0x5a;
+
+/// `core.img`'s first sector is GRUB's `diskboot.S`: the block list
+/// starts at `512 - sizeof(grub_boot_blocklist)` = **500** and grows
+/// *downward*; each entry is `{ u64 start; u16 len; u16 segment }`
+/// (absolute disk LBA, sector count, load segment) and a zero-length
+/// entry terminates it. The entry before the first one is at 488..500.
+/// The default entry's segment is
+/// `(GRUB_BOOT_I386_PC_KERNEL_SEG + 0x20) = 0x820` — the value
+/// `grub-setup`'s `bl.current_segment` starts from and `diskboot.S`
+/// expects to load the rest of core at `0x8200`.
+const GRUB_BLOCKLIST: usize = 500;
+const GRUB_BLOCKLIST_TERM: usize = 488;
+const GRUB_BLOCKLIST_SEGMENT: u16 = 0x0820;
+
+/// The two multiboot2 module command lines the installer ISO's GRUB
+/// config attaches (`module2 … grubpayload`, `module2 … payload`), and
+/// the only names [`capture_modules`] recognizes.
+const GRUB_MODULE_NAME: &str = "grubpayload";
+const KERNEL_MODULE_NAME: &str = "payload";
+
+/// Captured `grubpayload` module: `boot.img` then `core.img` (the split
+/// is the first [`GRUB_BOOT_BYTES`], §8.6 documents the layout).
+/// Single-use statics, written **once** by [`capture_modules`] before
+/// `memory::init` and only read afterwards — the `DOWNLOAD`/`VERIFY`
+/// idiom.
+static mut GRUB_COPY: [u8; GRUB_MODULE_CAP] = [0; GRUB_MODULE_CAP];
+/// Captured `payload` module: the running kernel's own ELF file.
+static mut KERNEL_COPY: [u8; KERNEL_MODULE_CAP] = [0; KERNEL_MODULE_CAP];
+
+/// What [`capture_modules`] found (lengths into the statics; `0` means
+/// the module was absent — a disk-boot of the installed system has no
+/// modules at all).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Payloads {
+    grub_len: usize,
+    kernel_len: usize,
+}
+
+impl Payloads {
+    /// `(boot.img, core.img)` slices of the captured GRUB module —
+    /// `None` when the ISO did not carry it.
+    fn grub(&self) -> Option<(&'static [u8], &'static [u8])> {
+        if self.grub_len < GRUB_BOOT_BYTES {
+            return None;
+        }
+        // SAFETY: `grub_len` was validated by `mbi::check_module`
+        // against `GRUB_MODULE_CAP` and written by `capture_modules`;
+        // the static outlives every use (kernel lifetime) and nothing
+        // writes it after the copy (single core).
+        let all =
+            unsafe { core::slice::from_raw_parts(addr_of!(GRUB_COPY) as *const u8, self.grub_len) };
+        let (boot, core) = all.split_at(GRUB_BOOT_BYTES);
+        Some((boot, core))
+    }
+
+    /// The kernel image bytes from the `payload` module, or `None` when
+    /// absent (the network path carries its own kernel file instead).
+    fn kernel_image(&self) -> Option<&'static [u8]> {
+        if self.kernel_len == 0 {
+            return None;
+        }
+        // SAFETY: as `grub()`: validated length, single-use static.
+        Some(unsafe {
+            core::slice::from_raw_parts(addr_of!(KERNEL_COPY) as *const u8, self.kernel_len)
+        })
+    }
+}
+
+/// Copy the installer's multiboot2 modules into kernel-owned statics.
+///
+/// Called from `kernel_main` **before `memory::init`**: GRUB's module
+/// memory is not listed as reserved in the multiboot2 memory map, so
+/// once frames are handed out the module bytes are fair game for the
+/// heap/allocator. Copying first (interrupts still off, single core)
+/// makes the installer independent of that.
+///
+/// Bounds: [`mbi::check_module`] validates every range (non-zero start,
+/// `end > start`, length ≤ the module's consumer cap) before anything
+/// is dereferenced. A module that is *present but malformed or too
+/// large* is `FATAL` + `halt()` — it can only be a broken ISO build,
+/// never boot noise. Unknown module names are ignored (GRUB may pass
+/// other files); duplicates of a recognized name are refused so the
+/// installer can never pick one of two.
+pub(crate) fn capture_modules(info: &BootInformation) -> Payloads {
+    let mut payloads = Payloads {
+        grub_len: 0,
+        kernel_len: 0,
+    };
+    for tag in info.module_tags() {
+        let Ok(name) = tag.cmdline() else {
+            continue; // no command line → not one of ours
+        };
+        let cap = match name {
+            GRUB_MODULE_NAME => GRUB_MODULE_CAP,
+            KERNEL_MODULE_NAME => KERNEL_MODULE_CAP,
+            _ => continue,
+        };
+        let len = match mbi::check_module(tag.start_address(), tag.end_address(), cap) {
+            Ok(len) => len,
+            Err(e) => {
+                serial_println!("FATAL: mbi: module range refused: {:?}", e);
+                crate::halt();
+            }
+        };
+        let already = if name == GRUB_MODULE_NAME {
+            payloads.grub_len != 0
+        } else {
+            payloads.kernel_len != 0
+        };
+        if already {
+            serial_println!("FATAL: mbi: duplicate module (same command line twice)");
+            crate::halt();
+        }
+        let dst = if name == GRUB_MODULE_NAME {
+            addr_of_mut!(GRUB_COPY) as *mut u8
+        } else {
+            addr_of_mut!(KERNEL_COPY) as *mut u8
+        };
+        // SAFETY: `check_module` proved `start != 0`, `end > start`, and
+        // `len <= cap` (the destination static's length). Both halves
+        // are the multiboot2 ABI's 32-bit physical addresses, inside
+        // `entry.S`'s identity map. The destination is this function's
+        // single-use static and no other writer exists; interrupts are
+        // still off and the machine is single-core during boot.
+        unsafe { core::ptr::copy_nonoverlapping(tag.start_address() as *const u8, dst, len) };
+        if name == GRUB_MODULE_NAME {
+            payloads.grub_len = len;
+        } else {
+            payloads.kernel_len = len;
+        }
+    }
+    // One line, numbers only (the command lines / lengths come from the
+    // bootloader; never print the strings raw).
+    if payloads.grub_len != 0 || payloads.kernel_len != 0 {
+        serial_println!(
+            "mbi: module payloads captured: grub {} B, kernel {} B",
+            payloads.grub_len,
+            payloads.kernel_len
+        );
+    }
+    payloads
+}
 
 // --- I2: the payload download -------------------------------------------
 
@@ -324,10 +521,11 @@ fn prepare_target(target: Option<&ata::Drive>) -> Option<&ata::Drive> {
 }
 
 /// The shared install: GPT → format p2 → copy `files` → byte-exact
-/// re-read (see the module docs). Any failure with a target present
-/// is `FATAL: install:` + halt — both markers stand on this one path,
-/// so `INST_OK` and `NETINST_OK` assert identical disk work.
-fn install_payload(target: &ata::Drive, files: &[PayloadFile<'_>]) {
+/// re-read → GRUB boot code last (the commit point). Any failure with a
+/// target present is `FATAL: install:` + halt — both markers stand on
+/// this one path, so `INST_OK` and `NETINST_OK` assert identical disk
+/// work (including an identical, bootable GRUB installation).
+fn install_payload(target: &ata::Drive, files: &[PayloadFile<'_>], payloads: &Payloads) {
     // --- Step 1: GPT (docs/installer.md §3.2) ---
     let total = u64::from(target.sectors);
     let Some((_, last_usable)) = gptwire::usable_range(total * 512) else {
@@ -463,6 +661,152 @@ fn install_payload(target: &ata::Drive, files: &[PayloadFile<'_>]) {
             crate::halt();
         }
     }
+
+    // --- Step 5: GRUB boot code (I1b) — the commit point, last ---
+    install_grub(target, payloads);
+}
+
+/// Write GRUB's `boot.img` + `core.img` onto the freshly installed
+/// target, replicating `grub-bios-setup`'s BIOS-on-GPT sequence
+/// (docs/installer.md §4/§8.6):
+///
+/// 1. **`core.img` → p1 (`bios_grub`, LBA 2048), whole.** The first
+///    sector is GRUB's `diskboot`; its block list is *recomputed* here
+///    (never trusted from the artifact): the range is contiguous, so one
+///    entry `{ start = p1_first + 1, len = core_sectors - 1,
+///    segment = 0x820 }` plus the zero terminator is exactly what
+///    `grub-setup` emits for a contiguous embedding, and the same
+///    position `grub-setup` patches (`core_img + 512 - 12`).
+/// 2. **`boot.img` → LBA0.** Preserve what `grub-setup` preserves — the
+///    DOS BPB area (`0x03..0x5a`) and the Windows-NT magic + disk
+///    signature + partition table (`0x1b8..0x1fe`, which is where the
+///    GPT protective MBR entry lives) — then patch
+///    `GRUB_BOOT_MACHINE_KERNEL_SECTOR` (unaligned u64 LE) with p1's
+///    first LBA, force `boot_drive = 0xFF`, and apply the hard-disk
+///    drive-check workaround (`0x66..0x68` = `nop; nop`) exactly as
+///    `grub-setup` does for a non-floppy destination.
+/// 3. **Read both back** and compare byte-exact, then require the
+///    protective MBR's `0xEE` record and `55 AA` signature still parse
+///    — the marker asserts the device, not our intent.
+///
+/// The installed `core.img` embeds an early config that searches for
+/// `/KERNEL.ELF` and boots it with `multiboot2` (§8.6 documents the
+/// exact config), so p2 needs no `/boot/grub` directory at all.
+fn install_grub(target: &ata::Drive, payloads: &Payloads) {
+    let Some((boot, core)) = payloads.grub() else {
+        fatal_msg("grubpayload module missing (ISO built without GRUB artifacts?)");
+    };
+    if boot.len() != GRUB_BOOT_BYTES
+        || boot.first() != Some(&0xEB)
+        || boot.get(510..512) != Some(&[0x55, 0xAA][..])
+    {
+        fatal_msg("grubpayload: boot.img is not a GRUB MBR sector");
+    }
+    // Non-empty, fits p1, and is really GRUB's diskboot sector: the
+    // block-list terminator + default segment are fixed artifacts.
+    if core.len() < 2 * 512 || core.len() > GRUB_CORE_CAP {
+        fatal_msg("grubpayload: core.img size out of range");
+    }
+    if core[GRUB_BLOCKLIST_TERM..GRUB_BLOCKLIST] != [0u8; 12] {
+        fatal_msg("grubpayload: core.img has no block-list terminator");
+    }
+    if core[510..512] != GRUB_BLOCKLIST_SEGMENT.to_le_bytes() {
+        fatal_msg("grubpayload: core.img is not a diskboot image");
+    }
+    let core_sectors = core.len().div_ceil(512);
+    let p1_sectors = P1_LAST_LBA - P1_FIRST_LBA + 1;
+    if core_sectors as u64 > p1_sectors || core_sectors < 2 {
+        fatal_msg("grubpayload: core.img does not fit the bios_grub partition");
+    }
+    // `len` counts the sectors after the first; p1's 2048 sectors keep
+    // this far below u16::MAX (asserted by the fit check above).
+    let rest = match u16::try_from(core_sectors - 1) {
+        Ok(n) => n,
+        Err(_) => fatal_msg("grubpayload: core.img block list too long"),
+    };
+
+    // (1) core.img: first sector patched, the rest written as-is.
+    let mut first = [0u8; 512];
+    first.copy_from_slice(&core[..512]);
+    first[GRUB_BLOCKLIST_TERM..GRUB_BLOCKLIST].fill(0); // terminator
+    first[GRUB_BLOCKLIST..GRUB_BLOCKLIST + 8].copy_from_slice(&(P1_FIRST_LBA + 1).to_le_bytes());
+    first[GRUB_BLOCKLIST + 8..GRUB_BLOCKLIST + 10].copy_from_slice(&rest.to_le_bytes());
+    first[GRUB_BLOCKLIST + 10..GRUB_BLOCKLIST + 12]
+        .copy_from_slice(&GRUB_BLOCKLIST_SEGMENT.to_le_bytes());
+    if !write_sectors_at(target, P1_FIRST_LBA, &first) {
+        fatal_msg("writing core.img's first sector to p1");
+    }
+    let body = &core[512..];
+    let full = body.len() / 512 * 512;
+    if full > 0 && !write_sectors_at(target, P1_FIRST_LBA + 1, &body[..full]) {
+        fatal_msg("writing core.img to p1");
+    }
+    let tail = &body[full..];
+    if !tail.is_empty() {
+        let mut pad = [0u8; 512];
+        pad[..tail.len()].copy_from_slice(tail);
+        if !write_sectors_at(target, P1_FIRST_LBA + 1 + (full / 512) as u64, &pad) {
+            fatal_msg("writing core.img's tail to p1");
+        }
+    }
+
+    // (2) boot.img → LBA0, preserving what grub-setup preserves.
+    let mut mbr = [0u8; 512];
+    if !target.read_sectors(0, &mut mbr) {
+        fatal_msg("reading LBA0 before writing boot.img");
+    }
+    let mut out = [0u8; 512];
+    out.copy_from_slice(boot);
+    out[GRUB_BPB_START..GRUB_BPB_END].copy_from_slice(&mbr[GRUB_BPB_START..GRUB_BPB_END]);
+    out[GRUB_NT_MAGIC..GRUB_PART_END].copy_from_slice(&mbr[GRUB_NT_MAGIC..GRUB_PART_END]);
+    out[GRUB_KERNEL_SECTOR..GRUB_KERNEL_SECTOR + 8].copy_from_slice(&P1_FIRST_LBA.to_le_bytes());
+    out[GRUB_BOOT_DRIVE] = 0xFF;
+    out[GRUB_DRIVE_CHECK] = 0x90; // nop out the jmp → run the hard-disk
+    out[GRUB_DRIVE_CHECK + 1] = 0x90; // drive-number workaround
+    if !target.write_sectors(0, &out) {
+        fatal_msg("writing boot.img to LBA0");
+    }
+
+    // (3) Read back: LBA0 byte-exact, p1's first sector byte-exact, and
+    // the protective MBR still valid (0xEE type + 55 AA signature).
+    let mut check = [0u8; 512];
+    if !target.read_sectors(0, &mut check) || check != out {
+        fatal_msg("boot.img read back from LBA0 differs");
+    }
+    if check[GRUB_PART_START + 4] != 0xEE || check[510..512] != [0x55, 0xAA] {
+        fatal_msg("protective MBR is no longer valid after boot.img");
+    }
+    let mut check_core = [0u8; 512];
+    if !target.read_sectors(P1_FIRST_LBA as u32, &mut check_core) || check_core != first {
+        fatal_msg("core.img's first sector read back from p1 differs");
+    }
+    serial_println!(
+        "install: GRUB on disk (boot.img {} B at LBA0, core.img {} B at LBA {})",
+        GRUB_BOOT_BYTES,
+        core.len(),
+        P1_FIRST_LBA
+    );
+}
+
+/// Write whole sectors at `lba` in ≤256-sector commands (the ATA
+/// driver's documented per-command bound), range-checked first.
+fn write_sectors_at(target: &ata::Drive, lba: u64, bytes: &[u8]) -> bool {
+    const CHUNK: usize = 256 * 512;
+    if bytes.is_empty() || !bytes.len().is_multiple_of(512) {
+        return false;
+    }
+    let mut off = 0usize;
+    while off < bytes.len() {
+        let n = (bytes.len() - off).min(CHUNK);
+        let Ok(lba) = u32::try_from(lba + (off / 512) as u64) else {
+            return false;
+        };
+        if !target.write_sectors(lba, &bytes[off..off + n]) {
+            return false;
+        }
+        off += n;
+    }
+    true
 }
 
 /// Length of the [`VERIFY`] scratch, checked against every payload
@@ -470,12 +814,18 @@ fn install_payload(target: &ata::Drive, files: &[PayloadFile<'_>]) {
 /// `FATAL`, never a truncated "pass").
 const VERIFY_LEN: usize = DOWNLOAD_CAP;
 
-/// Offline install (I1): read the payload from the source volume,
-/// run [`install_payload`], print `INST_OK`. Silent without a marked
-/// target disk; `FATAL:` + `halt()` on any failure with one.
-pub(crate) fn prove(source: &ata::Drive, target: Option<&ata::Drive>) {
+/// Offline install (I1): read the payload from the source volume, add
+/// the ISO's `payload` module as `/KERNEL.ELF`, run [`install_payload`],
+/// print `INST_OK`. Silent without a marked target disk; `FATAL:` +
+/// `halt()` on any failure with one.
+pub(crate) fn prove(source: &ata::Drive, target: Option<&ata::Drive>, payloads: &Payloads) {
     let Some(target) = prepare_target(target) else {
         return; // no (marked) target disk → zero output, boot continues
+    };
+    // The installed system's kernel: the ISO's own `payload` module
+    // (I1b — without it an offline install could not boot standalone).
+    let Some(kernel) = payloads.kernel_image() else {
+        fatal_msg("payload module missing (installed disk would not boot)");
     };
 
     // Read the payload from the source volume — the FS1 machinery,
@@ -505,9 +855,14 @@ pub(crate) fn prove(source: &ata::Drive, target: Option<&ata::Drive>) {
             name: PAYLOAD[1],
             data: &second[..n_second],
         },
+        PayloadFile {
+            // 8.3, uppercase: the path core.img's embedded config opens.
+            name: "KERNEL.ELF",
+            data: kernel,
+        },
     ];
 
-    install_payload(target, &files);
+    install_payload(target, &files, payloads);
     serial_println!("INST_OK"); // machine-checked by `cargo xtask smoke-install`
 }
 
@@ -532,7 +887,7 @@ fn read_named(
 /// [`install_payload`], print `NETINST_OK`. Requires the NIC (called
 /// after the boot network chain) and a *marked* target — silent
 /// otherwise, like every other proof here.
-pub(crate) fn netprove(stack: &mut Stack, target: Option<&ata::Drive>) {
+pub(crate) fn netprove(stack: &mut Stack, target: Option<&ata::Drive>, payloads: &Payloads) {
     let Some(target) = prepare_target(target) else {
         return; // no marked target → no network noise either
     };
@@ -560,7 +915,7 @@ pub(crate) fn netprove(stack: &mut Stack, target: Option<&ata::Drive>) {
     };
     serial_println!("netinstall: payload carries {count} files");
 
-    install_payload(target, &files[..count]);
+    install_payload(target, &files[..count], payloads);
     serial_println!("NETINST_OK"); // machine-checked by `cargo xtask smoke-install`
 }
 

@@ -15,6 +15,12 @@
 //! within the declared `total_size`. What could *not* move: "declared
 //! `total_size` ≤ the real buffer length", which a pointer API cannot
 //! check; that stays this crate's job, bounded by [`MBI_MAX_BYTES`].
+//!
+//! [`check_module`] covers the other bootloader pointer the kernel
+//! dereferences: a module tag's `mod_start..mod_end` byte range
+//! (tag type 3, §3.6.4), capped by its *consumer* (the installer's
+//! 1 MiB `bios_grub` partition for GRUB's artifacts, the download bound
+//! for the kernel payload).
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -63,6 +69,62 @@ pub fn check_range(addr: u64, total: usize) -> Result<(), RangeError> {
         return Err(RangeError::CrossesMap { addr, total });
     }
     Ok(())
+}
+
+/// Why a boot-module range was rejected (`FATAL: mbi:` in the kernel —
+/// modules are only dereferenced when the installer needs their bytes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModuleError {
+    /// `mod_start == 0`: address zero is never a valid module (it is
+    /// reserved low memory, and a zero start usually means a malformed
+    /// tag).
+    NullStart,
+    /// `mod_end == mod_start`: the tag describes an empty blob. GRUB
+    /// never emits this for a real module file, so treat it as invalid.
+    Empty { start: u32, end: u32 },
+    /// `mod_end < mod_start`: the only way this happens is a corrupt or
+    /// hostile tag (the `multiboot2` crate exposes both halves verbatim
+    /// and its `module_size()` asserts on this case).
+    Reversed { start: u32, end: u32 },
+    /// The blob is bigger than the caller's hard cap. Callers pick a cap
+    /// from the *consumer* (the 1 MiB `bios_grub` partition for GRUB's
+    /// artifacts, the download bound for a kernel payload), never from
+    /// the tag.
+    TooLarge { len: usize, cap: usize },
+}
+
+/// Validate one Multiboot2 **module tag** range (tag type 3, §3.6.4) and
+/// return its byte length.
+///
+/// The tag holds two 32-bit physical addresses; the kernel dereferences
+/// the range as a byte slice, so this is the whole safety contract, in
+/// the same spirit as [`check_range`] for the MBI itself:
+///
+/// - `start != 0`, because zero is never a module and a zero start is a
+///   corrupt tag;
+/// - `end > start` (the crate's own `module_size()` panics on the
+///   reverse; we refuse instead);
+/// - the length fits the caller's hard `cap` — a size derived from the
+///   consumer, so a hostile bootloader cannot make us copy or read an
+///   unbounded blob;
+/// - both halves are `u32`, so the range is inside the first 4 GiB,
+///   i.e. inside `entry.S`'s identity map by construction.
+///
+/// Dependencies: none, pure arithmetic — host-tested with adversarial
+/// ranges below.
+pub fn check_module(start: u32, end: u32, cap: usize) -> Result<usize, ModuleError> {
+    if start == 0 {
+        return Err(ModuleError::NullStart);
+    }
+    let len = match end.cmp(&start) {
+        core::cmp::Ordering::Less => return Err(ModuleError::Reversed { start, end }),
+        core::cmp::Ordering::Equal => return Err(ModuleError::Empty { start, end }),
+        core::cmp::Ordering::Greater => (end - start) as usize,
+    };
+    if len > cap {
+        return Err(ModuleError::TooLarge { len, cap });
+    }
+    Ok(len)
 }
 
 #[cfg(test)]
@@ -127,6 +189,87 @@ mod tests {
             Err(RangeError::CrossesMap {
                 addr: 0xFFFF_FFFF,
                 total: 8
+            })
+        );
+    }
+
+    // --- module tags (tag type 3) -------------------------------------
+
+    #[test]
+    fn accepts_a_sane_module_range_and_returns_its_length() {
+        // 152 KiB GRUB blob just above 1 MiB, a 2 MiB kernel payload
+        assert_eq!(check_module(0x10_0000, 0x12_6000, 4 << 20), Ok(0x2_6000));
+        assert_eq!(check_module(0x20_0000, 0x40_0000, 2 << 20), Ok(2 << 20));
+        // one byte is a legal (if useless) module; the consumer decides
+        // whether that is enough
+        assert_eq!(check_module(0x1000, 0x1001, 1), Ok(1));
+        // the highest representable in-map range
+        assert_eq!(check_module(1, 0xFFFF_FFFF, 0xFFFF_FFFE), Ok(0xFFFF_FFFE));
+    }
+
+    #[test]
+    fn rejects_null_start_before_anything_else() {
+        for (start, end) in [(0u32, 0u32), (0, 1), (0, 0xFFFF_FFFF)] {
+            assert_eq!(
+                check_module(start, end, 1 << 20),
+                Err(ModuleError::NullStart),
+                "start={start} end={end}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_empty_and_reversed_ranges() {
+        for start in [1u32, 0x1000, 0xFFFF_FFFE, 0xFFFF_FFFF] {
+            assert_eq!(
+                check_module(start, start, usize::MAX),
+                Err(ModuleError::Empty { start, end: start }),
+                "start={start}"
+            );
+        }
+        for (start, end) in [
+            (2u32, 1u32),
+            (0x1000, 0x0FFF),
+            (0xFFFF_FFFF, 0),
+            (0xFFFF_FFFF, 0xFFFF_FFFE),
+        ] {
+            // reversal is detected before the cap, whatever the cap is
+            assert_eq!(
+                check_module(start, end, 1),
+                Err(ModuleError::Reversed { start, end }),
+                "start={start} end={end}"
+            );
+        }
+    }
+
+    #[test]
+    fn enforces_the_callers_cap_exactly() {
+        let (start, cap) = (0x10_0000u32, 0x2_6000usize);
+        let end = start + cap as u32;
+        // exactly at the cap is accepted…
+        assert_eq!(check_module(start, end, cap), Ok(cap));
+        // …one byte over is refused with both numbers for the log line
+        assert_eq!(
+            check_module(start, end + 1, cap),
+            Err(ModuleError::TooLarge { len: cap + 1, cap })
+        );
+        // a zero cap cannot accept any real module
+        assert_eq!(
+            check_module(start, start + 1, 0),
+            Err(ModuleError::TooLarge { len: 1, cap: 0 })
+        );
+    }
+
+    #[test]
+    fn a_whole_4gib_module_never_wraps() {
+        // start=1, end=u32::MAX: the length is computed in u32 (no
+        // overflow), then compared with the cap as usize
+        assert_eq!(check_module(1, u32::MAX, usize::MAX), Ok(0xFFFF_FFFE));
+        assert_eq!(
+            check_module(1, u32::MAX, 0xFFFF_FFFD),
+            Err(ModuleError::TooLarge {
+                len: 0xFFFF_FFFE,
+                cap: 0xFFFF_FFFD
             })
         );
     }

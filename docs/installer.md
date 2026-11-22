@@ -4,7 +4,9 @@ Status: design (research complete) + **FS1 landed** — FAT16 reader and its `FA
 smoke marker (§8.1) + **FS2 landed** — FAT16 write path and its `FS_WRITE_OK` marker
 (§8.2) + **I1 landed** — GPT + install-to-disk and its `INST_OK` marker (§8.3) +
 **I2 landed** — the network installer and its `NETINST_OK` marker (§8.4) +
-**FS3 landed** — directories/LFN writes and `FS_TREE_OK` + the full-tree git checkout (§8.5).
+**FS3 landed** — directories/LFN writes and `FS_TREE_OK` + the full-tree git checkout (§8.5) +
+**I1b landed** — GRUB boot code on the installed target and the standalone
+disk-boot proof (§8.6).
 Scope: the two installer deliverables from
 AGENTS.md — *a bootable ISO* and *a network installer that fetches the system over the
 network with the OS's own stack*. Target: 2007 MacBook2,1, GRUB i386-pc boot chain
@@ -222,6 +224,21 @@ menuentry "reemplazo" { multiboot2 /boot/kernel.elf; boot }
 ```
 GRUB needs `multiboot2`, `part_gpt`, `fat`, `normal`, `search` — all present in
 `grub-pc-bin` *(verified file list)*.
+
+**As landed (I1b, §8.6) — the exact mechanism differs from the sketch above,
+deliberately and documented there:** the kernel never writes a
+`/boot/grub/grub.cfg` on p2. Instead `grub-mkimage -c` embeds a three-line early
+config *inside* `core.img` (`search --no-floppy --file /KERNEL.ELF --set=root`,
+`multiboot2 /KERNEL.ELF`, `boot`), so the installed disk needs exactly one file on
+p2 — the kernel — and no `/boot/grub` directory. `grub-install` is still absent
+from the image, but `grub-bios-setup` **is** present (at
+`/usr/lib/grub/i386-pc/grub-bios-setup`); it could not be used directly for the
+build proof (it failed with `failed to get canonical path of
+'/run/host_mark/private'` on Docker Desktop for macOS — it probes host devices),
+so the installer replicates its write patch set from its source (`util/setup.c`,
+`grub-core/boot/i386/pc/{boot,diskboot}.S`, `include/grub/i386/pc/boot.h`) and the
+host verifier compares the result byte-for-byte with the ISO artifacts
+*(verified: the hand-patched image boots in QEMU)*.
 
 ---
 
@@ -667,15 +684,16 @@ the target image on the host.
   constants, mounts p2 through `fat` and requires both payload files byte-exact against the
   kernel-side constants (`README_CONTENT`/`RESULT_PAYLOAD`, duplicated as everywhere because
   host crates cannot depend on the kernel).
-- **GRUB-on-target: deferred to I1b, honestly split.** §4's plan needs `boot.img`/`core.img`
-  *bytes inside the kernel*, and today the kernel has neither an ISO9660 reader nor the
-  multiboot2-module payload path (milestone `MOD_OK`) — the artifacts exist only on the ISO.
-  Embedding them at kernel-build time would also invert the build order (`core.img` is made by
-  `grub-mkimage` *during* `xtask iso`, after the kernel compiles). So I1 lands without GRUB:
-  the installed disk is **not yet bootable**, and `INST_OK` asserts only what it actually did
-  (GPT + FAT + files + read-back). I1b = §4's write sequence once `MOD_OK` (or an ISO reader)
-  delivers the bytes; the §4 ordering rule (GRUB boot code last = commit point) is already
-  honored in spirit by `gptwire::write`, which writes the protective MBR last.
+- **GRUB-on-target: deferred to I1b, honestly split — now resolved (§8.6).** §4's plan
+  needed `boot.img`/`core.img` *bytes inside the kernel*, and at I1 time the kernel had
+  neither an ISO9660 reader nor the multiboot2-module payload path (milestone `MOD_OK`) —
+  the artifacts existed only on the ISO. Embedding them at kernel-build time would also
+  invert the build order (`core.img` is made by `grub-mkimage` *during* `xtask iso`, after
+  the kernel compiles). So I1 landed without GRUB and `INST_OK` asserted only what it
+  actually did. I1b (§8.6) delivered the bytes as a multiboot2 **module** and the write
+  sequence, so the installed disk is now bootable; the §4 ordering rule (GRUB boot code
+  last = commit point) is honored by the GRUB step being the final action of
+  `install_payload`.
 - **Not in I1:** `PT_OK`/`FS_OK` are folded into `INST_OK` (the GPT write + re-read and the FAT
   format + read-back are asserted inside it — the milestone table's separate markers would be
   redundant in the chain); shell builtins (§7.1), reboot-from-disk assert (needs GRUB), AHCI.
@@ -793,6 +811,101 @@ depth-1 tree instead of root-only 8.3 blobs. Branch `m-fs3`.
   directory is `NoSpace`; no cluster extension yet), no `unlink`, crash consistency
   (journal/flush ordering, drive `FLUSH CACHE`), cross-file cross-link detection (needs the
   heap), FAT32, and the GPT wrapper (milestone 2).
+
+### 8.6 I1b landed — GRUB on the target, the installed disk **boots** (disk-boot phase)
+
+Branch `m-grub`. `cargo xtask smoke-install` now ends with a **second QEMU** that boots
+`target.img` alone (no ISO) and asserts the installed system's chain. This is the milestone
+that makes "install" mean "bootable".
+
+- **Artifacts (`xtask iso`, in the tools image).** `grub-mkimage -O i386-pc` builds
+  `core.img` (measured **151 317 B**) with exactly the boot-critical modules and an embedded
+  early config; `boot.img` (**512 B**, pristine, from `/usr/lib/grub/i386-pc/boot.img`)
+  is concatenated after it:
+  ```
+  grub-mkimage -O i386-pc -o core.img \
+      -p '(hd0,gpt2)/boot/grub' -c early.cfg \
+      biosdisk part_gpt fat multiboot2 normal search search_fs_file
+  cat boot.img core.img > grubpayload.bin        # 151 829 B
+  ```
+  `early.cfg` is generated by xtask and is what the installed disk executes
+  (`grub_main` runs the embedded config after `grub_load_modules`, so every command it uses
+  is already registered — GRUB 2.12 `grub-core/kern/main.c`):
+  ```
+  search --no-floppy --file /KERNEL.ELF --set=root
+  multiboot2 /KERNEL.ELF
+  boot
+  ```
+  `search` makes the disk independent of the BIOS drive number; the `-p` prefix sets
+  `(hd0,gpt2)` as the fallback root, so a failed search still boots a single-disk machine.
+  **No `/boot/grub/grub.cfg` is written to p2** — the installed disk carries only
+  `/KERNEL.ELF` (plus README/RESULT). A menu, a p2 config and `timeout` UI are later work.
+- **Delivery: two multiboot2 modules.** The ISO's GRUB config gained
+  `module2 /boot/grubpayload.bin grubpayload` and `module2 /boot/kernel.elf payload`; the
+  kernel's `install::capture_modules` copies each recognized module into a kernel-owned
+  static **before `memory::init`**. Why: GRUB's module memory is not reserved in the
+  multiboot2 memory map (only the kernel image and the MBI are), so the frame allocator
+  would eventually hand those frames to the heap and overwrite the artifacts. `mbi` grew
+  `check_module(start, end, cap)` — non-zero start, `end > start`, length ≤ a *consumer*
+  cap (1 MiB p1 for GRUB; the 4 MiB download bound for the kernel) — with six adversarial
+  host tests (null start, empty, reversed, cap edge, whole-4-GiB range). The capsule is
+  `grubpayload.bin = boot.img (first 512 B) ‖ core.img`; the kernel splits at that fixed
+  boundary and validates the artifacts (boot `0xEB`/`55 AA`, core ≥ 2 sectors,
+  block-list terminator at 488..500, default segment `0x820` at 510).
+- **The write sequence (`install::install_grub`) = `grub-setup`'s, from its source.**
+  `grub-bios-setup` is present in the image but unusable here (it failed with
+  `failed to get canonical path of '/run/host_mark/private'` on Docker Desktop macOS — it
+  probes host block devices), so the kernel implements the documented patch set:
+  1. **`core.img` → p1 (LBA 2048)**, all sectors (padded to 512). The first sector is GRUB's
+     `diskboot`; its block list at **500..512** (`{ u64 start; u16 len; u16 segment }`,
+     growing downward, zero terminator at 488..500) is *recomputed*: contiguous embedding ⇒
+     one entry `start = 2048+1`, `len = ceil(core/512)-1`, `segment = 0x820` — exactly
+     `util/setup.c`'s `save_blocklists` result for contiguous sectors and its
+     `GRUB_BOOT_I386_PC_KERNEL_SEG + 0x20` initial segment.
+  2. **`boot.img` → LBA0** (`util/setup.c`): copy the existing sector's BPB
+     (`0x03..0x5a`) and NT-magic + disk-signature + partition table (`0x1b8..0x1fe`, which
+     holds the GPT protective MBR entry) into the artifact; patch
+     `GRUB_BOOT_MACHINE_KERNEL_SECTOR` at **0x5c** with an *unaligned 64-bit LE* p1 LBA
+     (`write_rootdev`), set `boot_drive = 0xFF` at 0x64, and replace the drive-check `jmp`
+     at **0x66** with `nop; nop` (the hard-disk workaround). The `0xEE` record and `55 AA`
+     signature survive; `gptwire::read` still parses the disk.
+  3. **Read both back** byte-exact (LBA0 whole sector, p1's first sector) and re-check the
+     protective MBR — the marker asserts the device.
+- **Ordering = commit point.** `install_payload` already does GPT → format → files →
+  fresh-mount read-back; GRUB is the final step, after every p2 byte proved. Both the
+  offline and the network install end with the same `install_grub`, so `INST_OK` and
+  `NETINST_OK` now prove identical, bootable disk work. The offline path also writes
+  `/KERNEL.ELF` from the `payload` module, so an install with **no network** boots too.
+- **Disk-boot proof.** After the install VM exits and `verify_installed_image` re-checks
+  GPT + p2 + `/KERNEL.ELF` + **the GRUB bytes against the ISO artifacts**
+  (`grubpayload.bin` is still in `target/iso-root/boot`; the host rebuilds the same LBA0
+  patch from the image's own preserved fields and the same block list, then compares
+  LBA0 and p1 byte-for-byte), xtask starts a second container/QEMU with
+  `-drive file=/iso/target.img,if=ide,format=raw -boot order=c` and **no ISO**, same
+  e1000/USB devices and the chat mock. Asserted markers:
+  `BOOT_OK → VGA_OK → MEM_OK → ALLOC_OK → RTC_OK → PCI_OK → E1000_OK → SHELL_OK`
+  within **45 s**. `SHELL_OK` is the last line of the whole fail-closed boot chain, so it
+  implies the network/AI/browser phases passed too; the asserted prefix names the
+  disk-relevant ones (MBI handoff, VGA mirror, allocators, PCI, NIC). The disk markers
+  (`BLK_OK`/`FAT_OK`/`INST_OK`/…) are correctly **absent** — LBA0 is now `boot.img`, so
+  `ata::probe` finds no installer source magic and the installer stays silent; that is the
+  neutrality rule observed from the booted system's side. The milestone table's proposed
+  `GRUB_OK` marker is deliberately **not** added (the boot chain's 30 markers stay
+  untouched): a marker printed by the *installer* would prove intent, while the
+  standalone disk boot is the observable fact.
+- **Not in I1b:** a p2 `/boot/grub/grub.cfg` + menu (`search`-based, timeout UI), GRUB's
+  graphical/video modules (text only), an INI/`grubenv` (no writable config yet), AHCI
+  (the disk-boot proof is QEMU's IDE; the MacBook's ICH7 needs the separate AHCI driver),
+  crash consistency around the GRUB write, and `grub-bios-setup` parity for block-listed
+  (fragmented) installs — this implementation requires the contiguous p1 it creates, which
+  the §3.2 layout guarantees.
+- **Verified:** `cargo xtask check` exit 0; `cargo xtask smoke` PASS, all 30 markers
+  unchanged (the ISO boot now prints one extra `mbi: module payloads captured: grub … B,
+  kernel … B` line between `VGA_OK` and `MEM_OK`; marker order untouched); `cargo xtask
+  smoke-install` PASS with the install chain + host verify + the standalone disk boot
+  (recorded in the commit message); `cargo xtask smoke-ssh` PASS (ISO boot path unchanged);
+  `mbi` unit tests now 9 (4 range + 5 module) plus its 10 adversarial `tests/hostile.rs`
+  cases.
 
 ---
 

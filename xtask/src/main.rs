@@ -50,6 +50,42 @@ const SMOKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// 17-key sequence), so this is generous headroom for a phase that
 /// should take about a second.
 const KEYBOARD_PHASE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Budget for the I1b **disk-boot phase**: boot `target.img` alone (no
+/// ISO), GRUB from disk, then the installed kernel's whole boot chain
+/// up to `SHELL_OK` — the network phases (DNS/git fetch/TLS/SSH) are
+/// the slow part and dominate, exactly as in the ISO smoke's 30 s. 45 s
+/// is that budget plus the slower CD-less disk read and margin; the
+/// failure mode stays loud (the marker dump) rather than a silent hang.
+const DISK_BOOT_TIMEOUT: Duration = Duration::from_secs(45);
+/// Markers asserted from the target-boot serial. Chosen to prove the
+/// **whole chain is really running from the installed disk**, not just
+/// that GRUB printed something:
+///
+/// - `BOOT_OK` — GRUB (from LBA0/core.img on the target) handed over a
+///   valid multiboot2 MBI to the kernel loaded from p2's `/KERNEL.ELF`;
+/// - `VGA_OK` — the text mirror works in that handoff;
+/// - `MEM_OK` / `ALLOC_OK` — the frame allocator and kernel heap came
+///   up from the same MBI (no ISO, no source disk);
+/// - `RTC_OK` — port I/O after interrupts;
+/// - `PCI_OK` — the machine scan;
+/// - `E1000_OK` — the NIC the chain needs (this is the marker missing
+///   if the disk-boot QEMU's device set ever drifts);
+/// - `SHELL_OK` — the kernel reached its idle shell *after* the full
+///   fail-closed boot chain (DHCP/DNS/TLS/git/SSH, TUI/editor/AI/
+///   browser). The markers not listed (`NET_OK`… `BROWSER_NAV_OK`) are
+///   still asserted implicitly: `SHELL_OK` cannot print unless every
+///   earlier phase passed (each one halts on failure), and the dump on
+///   failure shows exactly where it stopped.
+///
+/// Not asserted: `USB_KBD_OK` (present, but the keyboard proof belongs
+/// to `smoke`'s sendkey phase) and every disk marker (`BLK_OK`, `FAT_OK`,
+/// `INST_OK`, …): the installed LBA0 is GRUB `boot.img`, so
+/// `ata::probe` correctly finds no installer source magic and the
+/// installer stays silent — the neutrality rule, observed here from the
+/// other side.
+const DISK_BOOT_MARKERS: [&str; 8] = [
+    "BOOT_OK", "VGA_OK", "MEM_OK", "ALLOC_OK", "RTC_OK", "PCI_OK", "E1000_OK", "SHELL_OK",
+];
 
 /// Hash of the checkout path — the stable per-checkout discriminator.
 /// `DefaultHasher::new()` uses fixed keys, so the same directory always
@@ -259,6 +295,58 @@ fn build_kernel(root: &Path) -> bool {
     )
 }
 
+/// The early config embedded **inside `core.img`** (`grub-mkimage -c`)
+/// — this is what boots the *installed* disk (§4, §8.6):
+///
+/// - `search --no-floppy --file /KERNEL.ELF --set=root` finds the FAT16
+///   partition by content, so the installed system does not depend on
+///   the BIOS/GRUB drive number or on `(hd0,gpt2)` being the right one
+///   (the `-p` prefix baked below still sets that as the fallback root
+///   in `grub_set_prefix_and_root`, so even a failed search leaves a
+///   working root on a single-disk machine);
+/// - `multiboot2 /KERNEL.ELF` loads the kernel the installer wrote;
+/// - `boot` transfers control (the `boot` command is a dependency of
+///   `multiboot2.mod` in GRUB's `moddep.lst`, so it is in core).
+///
+/// The config runs from `grub_main` *after* the embedded modules are
+/// loaded and after `root`/`prefix` are set (GRUB 2.12
+/// `grub-core/kern/main.c`), which is why these commands exist.
+const GRUB_EARLY_CFG: &str = "\
+search --no-floppy --file /KERNEL.ELF --set=root
+multiboot2 /KERNEL.ELF
+boot
+";
+
+/// Build the I1b artifacts in the tools image, the exact commands
+/// `grub-install` would use to obtain them (docs/installer.md §8.6):
+///
+/// - `grub-mkimage -O i386-pc` builds `core.img` for the BIOS platform
+///   with the boot-critical modules only (`biosdisk` to read the disk,
+///   `part_gpt` + `fat` to find p2, `multiboot2` to load our kernel,
+///   `normal` for the command machinery, `search` + `search_fs_file`
+///   for the embedded config), prefix `(hd0,gpt2)/boot/grub` (the
+///   single-disk default the early config's `search` self-heals), and
+///   the early config embedded;
+/// - `boot.img` is copied verbatim from `grub-pc-bin`
+///   (`/usr/lib/grub/i386-pc/boot.img`, 512 B); the *installer* patches
+///   its LBA field and partition table later (§8.6) — the artifact on
+///   the ISO is the pristine one;
+/// - both are concatenated as `grubpayload.bin` = `boot.img ‖ core.img`
+///   (the documented module layout; the kernel splits at 512 B). The
+///   1 MiB check is the `bios_grub` bound: a `core.img` that no longer
+///   fits p1 must fail the ISO build, not the install.
+const GRUB_ARTIFACTS_SH: &str = "\
+set -e
+grub-mkimage -O i386-pc -o /work/boot/core.img \
+    -p '(hd0,gpt2)/boot/grub' -c /work/boot/early.cfg \
+    biosdisk part_gpt fat multiboot2 normal search search_fs_file
+cp /usr/lib/grub/i386-pc/boot.img /work/boot/boot.img
+core=$(wc -c < /work/boot/core.img)
+[ \"$core\" -le 1048576 ]
+cat /work/boot/boot.img /work/boot/core.img > /work/boot/grubpayload.bin
+ls -l /work/boot/boot.img /work/boot/core.img /work/boot/grubpayload.bin
+";
+
 fn iso(root: &Path) -> bool {
     if !build_kernel(root) {
         return false;
@@ -282,8 +370,32 @@ fn iso(root: &Path) -> bool {
         eprintln!("xtask: cannot copy grub.cfg: {e}");
         return false;
     }
+    // I1b: the config embedded in the installed disk's core.img.
+    if let Err(e) = std::fs::write(iso_root.join("boot/early.cfg"), GRUB_EARLY_CFG) {
+        eprintln!("xtask: cannot write early.cfg: {e}");
+        return false;
+    }
     // Image tag is cheap to rebuild; Docker layer cache makes re-runs fast.
     if !sh(root, "docker", &["build", "-t", TOOLS_IMAGE, "tools"]) {
+        return false;
+    }
+    // I1b: GRUB's boot.img + core.img, concatenated as the `grubpayload`
+    // multiboot2 module (see GRUB_ARTIFACTS_SH). Runs before mkrescue so
+    // both files are inside the ISO.
+    if !sh(
+        root,
+        "docker",
+        &[
+            "run",
+            "--rm",
+            "-v",
+            &format!("{}:/work", iso_root.display()),
+            TOOLS_IMAGE,
+            "sh",
+            "-c",
+            GRUB_ARTIFACTS_SH,
+        ],
+    ) {
         return false;
     }
     sh(
@@ -333,7 +445,7 @@ fn qemu_std_args_ex(
     serial: &str,
     hostfwd: Option<(&str, u16, u16)>,
 ) -> Vec<String> {
-    let args = vec![
+    let mut args = vec![
         "-m".into(),
         "256M".into(),
         "-cdrom".into(),
@@ -345,10 +457,32 @@ fn qemu_std_args_ex(
         // execute — verified in the FS1 milestone: with QEMU's default
         // order the guest hangs in the volume's bootstrap and the ISO
         // never boots. Pinning the ISO first keeps both smokes on GRUB
-        // while leaving the disk bootable once a smoke reboots from it
-        // without a CD (installer milestone GRUB_OK can pass `order=c`).
+        // while `-boot order=c` (the I1b disk-boot phase) boots the
+        // installed target alone.
         "-boot".into(),
         "order=dc".into(),
+    ];
+    args.extend(qemu_device_args(serial, monitor, hostfwd));
+    args
+}
+
+/// The I1b **disk-boot** QEMU arguments: no ISO at all, `-boot order=c`
+/// so SeaBIOS executes the target disk's GRUB `boot.img` from LBA0.
+/// The device set is identical to [`qemu_std_args_ex`] (e1000 for the
+/// kernel's network chain, UHCI + usb-kbd for the USB proof) — the
+/// installed kernel runs its normal boot chain, so the disk-boot proof
+/// exercises the same hardware path the ISO smoke does.
+fn qemu_disk_args(monitor: &str) -> Vec<String> {
+    let mut args = vec!["-m".into(), "256M".into(), "-boot".into(), "order=c".into()];
+    args.extend(qemu_device_args("stdio", monitor, None));
+    args
+}
+
+/// Everything after the boot medium: serial/monitor redirection,
+/// display, and the devices every smoke expects (e1000 with a fixed
+/// MAC, USB + boot keyboard). Shared by the ISO and disk invocations.
+fn qemu_device_args(serial: &str, monitor: &str, hostfwd: Option<(&str, u16, u16)>) -> Vec<String> {
+    let args = vec![
         "-serial".into(),
         serial.into(),
         "-monitor".into(),
@@ -711,6 +845,69 @@ fn qemu_invocation(
     Some(("docker".into(), args, Some(container.into()), None))
 }
 
+/// [`qemu_invocation`] for the **disk-boot phase** (I1b): no ISO, the
+/// installed `target.img` as the only IDE disk, `-boot order=c`. The A3
+/// chat mock is still started (the installed kernel runs its normal,
+/// fail-closed boot chain, and `apps::ai` halts without the mock) — the
+/// in-container `MOCK_LOOP` comes along with the same bind mount; the
+/// host backend's `chat-mock` child serves both ports. Everything else
+/// (serial on stdout, one monitor, e1000, USB) matches [`qemu_invocation`].
+fn qemu_invocation_disk(
+    root: &Path,
+    iso_dir: &Path,
+    container: &str,
+    disk: &Path,
+) -> Option<Invocation> {
+    if let Err(e) = write_chat_mock(iso_dir) {
+        eprintln!(
+            "xtask: cannot write {}: {e}",
+            iso_dir.join("chat-mock-response.txt").display()
+        );
+        return None;
+    }
+    if let Err(e) = write_payload_mock(root, iso_dir) {
+        eprintln!("xtask: cannot build the payload mock: {e}");
+        return None;
+    }
+    // Second monitor port: the install VM's QEMU has already been
+    // stopped, but keeping the two invocations on distinct ports makes
+    // a leaked process impossible to confuse with the next phase.
+    let port = monitor_port_n(root, 2);
+    if host_qemu() {
+        let monitor = format!("tcp:127.0.0.1:{port},server,nowait");
+        let mut args = qemu_disk_args(&monitor);
+        args.push("-drive".into());
+        args.push(format!("file={},if=ide,format=raw", disk.display()));
+        let mock = spawn_chat_mock(root);
+        return Some(("qemu-system-x86_64".into(), args, None, mock));
+    }
+    if !sh(root, "docker", &["build", "-t", TOOLS_IMAGE, "tools"]) {
+        return None;
+    }
+    let mut args: Vec<String> = vec![
+        "run".into(),
+        "--rm".into(),
+        "-i".into(),
+        "--name".into(),
+        container.into(),
+        "-v".into(),
+        format!("{}:/iso", iso_dir.display()),
+        "-p".into(),
+        format!("127.0.0.1:{port}:{port}"),
+        TOOLS_IMAGE.into(),
+        "sh".into(),
+        "-c".into(),
+        MOCK_LOOP.into(),
+        "qemu-system-x86_64".into(),
+    ];
+    let monitor = format!("tcp:0.0.0.0:{port},server,nowait");
+    args.extend(qemu_disk_args(&monitor));
+    let name = disk.file_name()?.to_str()?;
+    args.push("-drive".into());
+    args.push(format!("file=/iso/{name},if=ide,format=raw"));
+    Some(("docker".into(), args, Some(container.into()), None))
+}
+
 /// Remove a container by name if present (stale VM from a killed session).
 fn rm_container(name: &str) {
     let _ = Command::new("docker")
@@ -962,7 +1159,27 @@ fn smoke_install(root: &Path) -> bool {
     ) {
         return false;
     }
-    verify_installed_image(&target)
+    if !verify_installed_image(&target) {
+        return false;
+    }
+    // I1b: the decisive proof — boot the installed disk **alone**, with
+    // no ISO attached, and require the installed kernel's boot chain.
+    if !boot_assert_disk(
+        root,
+        "smoke-install-disk",
+        &DISK_BOOT_MARKERS,
+        DISK_BOOT_TIMEOUT,
+        &target,
+    ) {
+        return false;
+    }
+    println!(
+        "smoke-install: disk boot ok — target.img boots standalone through GRUB ({} + {} + … + {})",
+        DISK_BOOT_MARKERS[0],
+        DISK_BOOT_MARKERS[1],
+        DISK_BOOT_MARKERS[DISK_BOOT_MARKERS.len() - 1]
+    );
+    true
 }
 
 /// S5: the two-VM sshd proof (`cargo xtask smoke-ssh`).
@@ -1585,6 +1802,16 @@ impl MemImage {
     fn len(&self) -> u64 {
         self.0.borrow().len() as u64
     }
+
+    /// Copy `[offset, offset+len)` out of the image, `None` when the
+    /// range is outside it (the bounds stay checked here, like every
+    /// block adapter's).
+    fn range(&self, offset: u64, len: usize) -> Option<Vec<u8>> {
+        let data = self.0.borrow();
+        let start = usize::try_from(offset).ok()?;
+        let end = start.checked_add(len)?;
+        data.get(start..end).map(<[u8]>::to_vec)
+    }
 }
 
 /// The one range check both adapters share: aligned whole sectors,
@@ -1747,11 +1974,86 @@ fn verify_installed_image(path: &Path) -> bool {
             built.len()
         ));
     }
+    // I1b: the disk is *bootable*, not merely populated — LBA0 must be
+    // the patched GRUB boot.img and p1 must hold core.img (compared
+    // against the ISO-build artifact byte-for-byte, with the same block
+    // list the kernel computes; see `verify_grub_image`).
+    if let Err(e) = verify_grub_image(&img, p1.first_lba) {
+        return fail(e);
+    }
     println!(
-        "smoke-install: host verify ok — GPT + FAT16 p2 + installed kernel byte-exact ({} B)",
+        "smoke-install: host verify ok — GPT + FAT16 p2 + installed kernel byte-exact ({} B) \
+         + GRUB boot.img/core.img on LBA0/p1",
         built.len()
     );
     true
+}
+
+/// Host-side proof of I1b's **bootability bytes** (docs/installer.md
+/// §8.6): rebuild what the kernel's `install_grub` must have written
+/// from the ISO-build artifacts (`target/iso-root/boot/grubpayload.bin`
+/// = `boot.img ‖ core.img`, produced by `grub-mkimage` in the tools
+/// image) and compare it with the image on disk:
+///
+/// - LBA0: the artifact's `boot.img` with the BPB + NT-magic/partition
+///   area preserved from the image itself, `kernel_sector` =
+///   p1's first LBA (unaligned u64 LE at 0x5c), `boot_drive = 0xFF`,
+///   and the hard-disk drive-check workaround (`0x66..0x68` = `nop;
+///   nop`) — `grub-setup`'s exact patch set; the protective MBR's
+///   `0xEE` record and `55 AA` must survive.
+/// - p1: `core.img` padded to whole sectors with the block list at
+///   488..512 patched (`term`, `start = p1_first + 1`, `len =
+///   sectors - 1`, `segment = 0x820`) — the contiguous-embedding block
+///   list `grub-setup` emits for a `bios_grub` partition.
+fn verify_grub_image(img: &MemImage, p1_first: u64) -> Result<(), String> {
+    const BOOT_BYTES: usize = 512;
+    const CORE_CAP: usize = 1 << 20;
+    let path = repo_root().join("target/iso-root/boot/grubpayload.bin");
+    let artifact =
+        std::fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    if artifact.len() < 2 * BOOT_BYTES || artifact.len() > BOOT_BYTES + CORE_CAP {
+        return Err(format!(
+            "grubpayload.bin is {} B, outside the 1 KiB..=1 MiB+512 B contract",
+            artifact.len()
+        ));
+    }
+    let (boot_art, core_art) = artifact.split_at(BOOT_BYTES);
+    let core_sectors = core_art.len().div_ceil(BOOT_BYTES);
+    let rest = core_sectors
+        .checked_sub(1)
+        .and_then(|n| u16::try_from(n).ok())
+        .ok_or("core.img block-list length does not fit u16")?;
+
+    // --- LBA0: patched boot.img, partition table preserved ---
+    let mbr = img.range(0, BOOT_BYTES).ok_or("LBA0 out of range")?;
+    let mut expected = boot_art.to_vec();
+    expected[0x03..0x5a].copy_from_slice(&mbr[0x03..0x5a]);
+    expected[0x1b8..0x1fe].copy_from_slice(&mbr[0x1b8..0x1fe]);
+    expected[0x5c..0x64].copy_from_slice(&p1_first.to_le_bytes());
+    expected[0x64] = 0xFF;
+    expected[0x66] = 0x90;
+    expected[0x67] = 0x90;
+    if mbr != expected {
+        return Err("LBA0 is not the patched GRUB boot.img".into());
+    }
+    if mbr[0x1be + 4] != 0xEE || mbr[510..512] != [0x55, 0xAA] {
+        return Err("protective MBR damaged by the GRUB install".into());
+    }
+
+    // --- p1: patched core.img, whole sectors ---
+    let mut core = core_art.to_vec();
+    core.resize(core_sectors * BOOT_BYTES, 0);
+    core[488..500].fill(0); // block-list terminator
+    core[500..508].copy_from_slice(&(p1_first + 1).to_le_bytes());
+    core[508..510].copy_from_slice(&rest.to_le_bytes());
+    core[510..512].copy_from_slice(&0x0820u16.to_le_bytes());
+    let on_disk = img
+        .range(p1_first * BOOT_BYTES as u64, core.len())
+        .ok_or("p1 (bios_grub) is outside the image")?;
+    if on_disk != core {
+        return Err("p1 does not hold the patched GRUB core.img".into());
+    }
+    Ok(())
 }
 
 /// Boot the ISO headless (optionally with `disks` attached as IDE
@@ -1773,11 +2075,49 @@ fn boot_assert(
     keyboard: bool,
 ) -> bool {
     let iso_path = root.join("target/iso-root/os.iso");
-    let Some((prog, args, container, mut mock)) =
-        qemu_invocation(root, &iso_path, &vm_container(root, label), disks)
+    let Some(invocation) = qemu_invocation(root, &iso_path, &vm_container(root, label), disks)
     else {
         return false;
     };
+    drive_vm(root, label, markers, timeout, keyboard, invocation)
+}
+
+/// I1b **disk-boot phase**: boot the installed `disk` alone (no ISO) and
+/// require the installed kernel's markers in order. Same serial drain
+/// and failure dump as [`boot_assert`]; no keyboard phase (the disk
+/// boot proves the boot chain, not the input path — `smoke` owns that).
+fn boot_assert_disk(
+    root: &Path,
+    label: &str,
+    markers: &[&str],
+    timeout: Duration,
+    disk: &Path,
+) -> bool {
+    let iso_dir = match root.join("target/iso-root").canonicalize() {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!("xtask: cannot resolve target/iso-root: {e}");
+            return false;
+        }
+    };
+    let Some(invocation) = qemu_invocation_disk(root, &iso_dir, &vm_container(root, label), disk)
+    else {
+        return false;
+    };
+    drive_vm(root, label, markers, timeout, false, invocation)
+}
+
+/// Spawn `invocation`, drain its serial output, and require `markers` in
+/// order (plus the optional keyboard phase). The body shared by the ISO
+/// and disk-boot asserts.
+fn drive_vm(
+    root: &Path,
+    label: &str,
+    markers: &[&str],
+    timeout: Duration,
+    keyboard: bool,
+    (prog, args, container, mut mock): Invocation,
+) -> bool {
     if let Some(name) = &container {
         rm_container(name);
     }
