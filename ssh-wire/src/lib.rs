@@ -2382,6 +2382,8 @@ pub enum ChannelError {
     BadCommand,
     /// Bytes after the last field.
     TrailingGarbage,
+    /// Peer advertised a window/max_packet we cannot honor (RFC4254 §5.1).
+    BadWindow,
 }
 
 /// A parsed `SSH_MSG_CHANNEL_OPEN` (RFC4254 §5.1).
@@ -2411,6 +2413,14 @@ pub fn parse_channel_open(payload: &[u8]) -> Result<ChannelOpen<'_>, ChannelErro
     let max_packet = r.u32().map_err(read)?;
     if r.pos != payload.len() {
         return Err(ChannelError::TrailingGarbage);
+    }
+    // RFC4254 §5.1: a zero window or a max_packet below one full SSH
+    // packet makes it impossible for the responder to send channel data
+    // without violating the peer's advertised limits (audit F6).
+    // Refuse at parse time so the caller never has to track credit it
+    // cannot honor. 32 KiB is our own outbound packet ceiling.
+    if initial_window == 0 || !(64..=32 * 1024).contains(&max_packet) {
+        return Err(ChannelError::BadWindow);
     }
     Ok(ChannelOpen {
         channel_type,
@@ -5486,6 +5496,23 @@ mod tests {
     /// any channel type for the caller to refuse (the sshd drops on
     /// anything but `"session"` instead of replying
     /// `CHANNEL_OPEN_FAILURE` — see docs/ssh-audit.md).
+    #[test]
+    fn channel_open_refuses_unhonorable_window_and_packet() {
+        let mut p = [0u8; 64];
+        let n = channel_open_session_payload(1, 64 * 1024, 32 * 1024, &mut p).expect("fits");
+        assert!(parse_channel_open(&p[..n]).is_ok());
+        // Zero receive credit: we could never send exec output without
+        // violating RFC4254 §5.1 (audit F6).
+        let mut zero = p[..n].to_vec();
+        let z = n - 8; // initial_window u32 sits before max_packet u32
+        zero[z..z + 4].copy_from_slice(&0u32.to_be_bytes());
+        assert_eq!(parse_channel_open(&zero), Err(ChannelError::BadWindow));
+        // A max_packet too small (< one full SSH packet) is refused too.
+        let mut tiny = p[..n].to_vec();
+        tiny[n - 4..n].copy_from_slice(&8u32.to_be_bytes());
+        assert_eq!(parse_channel_open(&tiny), Err(ChannelError::BadWindow));
+    }
+
     #[test]
     fn channel_open_refuses_truncation_and_giant_lengths() {
         let mut buf = [0u8; 128];

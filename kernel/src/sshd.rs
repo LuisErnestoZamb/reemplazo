@@ -785,7 +785,7 @@ fn channel_phase(stack: &mut Stack, wire: &mut Conn<'_, '_>) -> Wire {
 
     // 1. Channel open.
     let plen = wire.recv_into(stack, &mut payload)?;
-    let client_channel = {
+    let (client_channel, client_max_packet) = {
         let p = &payload[..plen];
         if p.first() != Some(&ssh_wire::SSH_MSG_CHANNEL_OPEN) {
             return Err("expected CHANNEL_OPEN after authentication");
@@ -800,7 +800,10 @@ fn channel_phase(stack: &mut Stack, wire: &mut Conn<'_, '_>) -> Wire {
         if open.channel_type != b"session" {
             return Err("CHANNEL_OPEN type is not session");
         }
-        open.sender_channel
+        // Audit F6: keep the peer's advertised per-packet limit; the
+        // parser already rejected a zero window / sub-64 max_packet,
+        // so every channel send can now be split to fit it.
+        (open.sender_channel, open.max_packet)
     };
 
     let Some(n) = ssh_wire::channel_open_confirmation_payload(
@@ -919,10 +922,21 @@ fn channel_phase(stack: &mut Stack, wire: &mut Conn<'_, '_>) -> Wire {
     let (out, out_len, status) = run_command(&command[..command_len]);
 
     // 4. Data, EOF, exit-status, close.
-    let Some(n) = ssh_wire::channel_data_payload(SERVER_CHANNEL, &out[..out_len], &mut buf) else {
-        return Err("exec output does not fit the channel data packet");
-    };
-    wire.send(stack, &buf[..n])?;
+    // F6: split the exec output into packets that fit the peer's
+    // max_packet (it validated >= 64 in the parser), never violating
+    // the credit it advertised.
+    let mut sent = 0usize;
+    while sent < out_len {
+        let limit = client_max_packet as usize;
+        let chunk = (out_len - sent).min(limit);
+        let Some(n) =
+            ssh_wire::channel_data_payload(SERVER_CHANNEL, &out[sent..sent + chunk], &mut buf)
+        else {
+            return Err("exec output does not fit the channel data packet");
+        };
+        wire.send(stack, &buf[..n])?;
+        sent += chunk;
+    }
     let Some(n) =
         ssh_wire::channel_number_payload(ssh_wire::SSH_MSG_CHANNEL_EOF, SERVER_CHANNEL, &mut buf)
     else {
