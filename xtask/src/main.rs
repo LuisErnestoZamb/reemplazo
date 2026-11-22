@@ -743,9 +743,9 @@ fn smoke(root: &Path) -> bool {
     boot_assert(root, "smoke", &MARKERS, None, true)
 }
 
-/// Installer milestones 1 + FS1 + FS2 + G3's checkout (`BLK_OK`,
-/// `FAT_OK`, `FS_WRITE_OK`, `GIT_CHECKOUT_OK`): build the ISO, write a
-/// 64 MiB
+/// Installer milestones 1 + FS1 + FS2 + FS3 + G3/G4's checkout
+/// (`BLK_OK`, `FAT_OK`, `FS_WRITE_OK`, `FS_TREE_OK`, `GIT_CHECKOUT_OK`):
+/// build the ISO, write a 64 MiB
 /// `target/iso-root/disk.img` that is a **valid FAT16 volume** carrying
 /// the `ata` magic in its boot sector's bootstrap area (see
 /// [`write_disk_image`]), boot with the image attached as an IDE drive,
@@ -753,9 +753,13 @@ fn smoke(root: &Path) -> bool {
 /// `FAT_OK` (the kernel mounted that volume and read `/README.TXT`
 /// back byte for byte), `FS_WRITE_OK` (the kernel *wrote*
 /// `/RESULT.TXT`, re-mounted from scratch and read it back byte-exact,
-/// with `/README.TXT` re-checked for clobbering) and `GIT_CHECKOUT_OK`
-/// (the depth-1 fetch wrote its 8.3 root blobs into the volume and
-/// re-read `/README.md` byte-exact, AGPL fragment checked) in that
+/// with `/README.TXT` re-checked for clobbering), `FS_TREE_OK` (the
+/// kernel created `/sub/dir/deep/nested-long-name-file.txt` and a plain
+/// 8.3 nested file through `fat::write_file_all`, re-mounted and read
+/// both back byte-exact) and `GIT_CHECKOUT_OK` (the depth-1 fetch
+/// checked the **whole** tree out — directories created, long names
+/// through LFN chains — then re-read `/README.md` and the nested
+/// `docs/hardware.md` byte-exact, with the file count asserted) in that
 /// order.
 ///
 /// Note the image is created **after** `iso()` (which wipes
@@ -773,7 +777,13 @@ fn smoke_install(root: &Path) -> bool {
     boot_assert(
         root,
         "smoke-install",
-        &["BLK_OK", "FAT_OK", "FS_WRITE_OK", "GIT_CHECKOUT_OK"],
+        &[
+            "BLK_OK",
+            "FAT_OK",
+            "FS_WRITE_OK",
+            "FS_TREE_OK",
+            "GIT_CHECKOUT_OK",
+        ],
         Some(&disk),
         false,
     )

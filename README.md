@@ -78,7 +78,7 @@ All in Rust, all in this workspace:
 ```sh
 cargo xtask check   # fmt + clippy (host and kernel target) + tests + cross-build
 cargo xtask smoke   # build ISO, boot headless, assert serial markers in order
-cargo xtask smoke-install  # same + FAT16 IDE disk; assert BLK_OK + FAT_OK + FS_WRITE_OK + GIT_CHECKOUT_OK
+cargo xtask smoke-install  # same + FAT16 IDE disk; assert BLK_OK + FAT_OK + FS_WRITE_OK + FS_TREE_OK + GIT_CHECKOUT_OK
 cargo xtask run     # interactive boot in QEMU (Ctrl-C quits)
 cargo test -p mbi <name>   # single test
 ```
@@ -100,12 +100,17 @@ discipline → builtin.
 disk attached and asserts `BLK_OK` (the ATA PIO probe), `FAT_OK` — the
 FAT mount plus a byte-exact `/README.TXT` read — `FS_WRITE_OK`: the
 kernel *writes* `/RESULT.TXT`, re-mounts from scratch and reads it
-back byte-exact (with `/README.TXT` re-checked for clobbering) — and
-`GIT_CHECKOUT_OK`: the depth-1 fetch's 8.3-representable root-level
-blobs are written into the FAT16 volume, re-mounted from scratch and
-`/README.md` is read back byte-exact (AGPL fragment checked). Nested
-paths and long names are counted as skipped until `fat` grows `mkdir`
-and LFN writes.
+back byte-exact (with `/README.TXT` re-checked for clobbering) —
+`FS_TREE_OK`: `write_file_all` creates
+`/sub/dir/deep/nested-long-name-file.txt` (three missing directories
+plus an LFN chain) and a plain 8.3 nested path, re-mounts and reads
+both back byte-exact — and `GIT_CHECKOUT_OK`: the **whole** depth-1
+tree is checked out into the FAT16 volume (directories created as
+needed, long names through LFN writes, symlinks/submodules counted as
+skipped), the written count is asserted against the fetched blob count
+(112 files in 53 dirs at the time of writing), and after a fresh
+re-mount `/README.md` and the nested `docs/hardware.md` are read back
+byte-exact with a content fragment each.
 
 **Notes:**
 
@@ -153,14 +158,14 @@ Milestones landed so far (see `git log` for details):
 - [x] TCP/IP stack migrated to **smoltcp** — hand-rolled frame/DHCP/DNS/TCP code replaced, ~2300 lines removed (docs/smoltcp-eval.md)
 - [x] TLS 1.3 client — HTTPS against github.com:443, pinned root certificate
 - [x] HTTP/1.1 client — `httparse` head + RFC 9112 body framing (HTTP_OK)
-- [x] git over HTTPS — smart-HTTP `ls-remote` advertisement (GIT_LSREMOTE_OK), depth-1 `fetch` via v0 `want`/`deepen 1`/`done` → `git-pack` decode → iterative tree walk (GIT_FETCH_OK), and a root-level checkout into FAT16 with re-mount read-back (GIT_CHECKOUT_OK, `smoke-install`)
+- [x] git over HTTPS — smart-HTTP `ls-remote` advertisement (GIT_LSREMOTE_OK), depth-1 `fetch` via v0 `want`/`deepen 1`/`done` → `git-pack` decode → iterative tree walk (GIT_FETCH_OK), and a **full-tree** checkout into FAT16 — directories, long names, every blob — with a re-mount read-back (GIT_CHECKOUT_OK, `smoke-install`)
 - [x] Shell — serial-console REPL with minimal builtins (ping, resolve, netinfo, …)
 - [x] Keyboard — polled i8042 + set-1 decode feeding the shell's line discipline (QEMU `sendkey` → `KEYBOARD_OK`; MacBook needs UHCI/HID)
 - [ ] sky2 driver (real hardware only)
 - [ ] git, ssh, browser, AI client + editor
 - [ ] ISO installer + network installer
   - [x] Block layer: ATA PIO driver on the legacy IDE primary channel (`cargo xtask smoke-install` asserts `BLK_OK`)
-  - [x] Filesystem: FAT16 reader + writer, `no_std` + `forbid(unsafe_code)` + zero deps (`smoke-install` asserts `FAT_OK` then `FS_WRITE_OK` — write + re-mount read-back; `fat/` crate, 71 adversarial host tests incl. a randomized write oracle)
+  - [x] Filesystem: FAT16 reader + writer + directories + LFN writes, `no_std` + `forbid(unsafe_code)` + zero deps (`smoke-install` asserts `FAT_OK`, `FS_WRITE_OK` — write + re-mount read-back — and `FS_TREE_OK` — nested mkdir + long-name write + re-mount read-back; `fat/` crate, 102 adversarial host tests incl. randomized write/tree oracles)
 
 ## License
 

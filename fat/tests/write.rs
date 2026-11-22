@@ -484,24 +484,39 @@ fn directory_slot_exhaustion_refuses_create() {
 fn invalid_names_are_refused() {
     let mem = Mem::new(image());
     let fs = mount(&mem);
+    // Names no FAT name can represent: FAT-illegal characters (also on
+    // the long-name path) and paths that are not absolute or escape.
+    // (FS2 also refused every long name here; FS3 writes those — see
+    // `tests/tree.rs` — so only genuinely unrepresentable names remain.)
     for path in [
-        "/waytoolongname.txt", // base > 8
-        "/two.dots.txt",       // extension > 3 (and a second dot)
-        "/a.b.c",              // second dot inside the extension
-        "/with space.txt",     // space is not in the legal set
-        "/no space.txt",       // 8 chars, but a space inside
-        "/.hidden",            // empty base
-        "/a+b.txt",            // '+' is not in the legal set
-        "/niño.txt",           // non-ASCII
+        "/a:b.txt",       // ':' is illegal in a long name
+        "/x?y.txt",       // '?'
+        "/a*b.txt",       // '*'
+        "/a\"b.txt",      // '"'
+        "/a<b.txt",       // '<'
+        "/a|b.txt",       // '|'
+        "/a\\b.txt",      // '\'
+        "/bad\u{7f}.txt", // DEL is a control character
+        "/../escape.txt", // traversal
+        "/./here.txt",    // dot component
+        "/SUB//X.TXT",    // empty component
+        "relative.txt",   // not absolute
+        "/",              // no name at all
     ] {
-        assert_eq!(
-            fs.write_file(path, b"x", STAMP),
-            Err(Error::InvalidName),
+        assert!(
+            matches!(
+                fs.write_file(path, b"x", STAMP),
+                Err(Error::InvalidName) | Err(Error::Path)
+            ),
             "{path}"
         );
     }
     // The root is untouched: no entry was created.
     assert_eq!(root_raw(&mem, 7)[0], 0x00);
+    // The former `InvalidName` names are now long names (FS3).
+    fs.write_file("/waytoolongname.txt", b"long", STAMP)
+        .expect("long name is written with an LFN chain");
+    assert_eq!(read_exact(&fs, "/waytoolongname.txt", 4), b"long");
 }
 
 #[test]

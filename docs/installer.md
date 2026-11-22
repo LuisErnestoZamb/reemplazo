@@ -2,7 +2,8 @@
 
 Status: design (research complete) + **FS1 landed** — FAT16 reader and its `FAT_OK`
 smoke marker (§8.1) + **FS2 landed** — FAT16 write path and its `FS_WRITE_OK` marker
-(§8.2). Scope: the two installer deliverables from
+(§8.2) + **FS3 landed** — directories, nested paths and LFN writes, with `FS_TREE_OK`
+and the full-tree git checkout (§8.3). Scope: the two installer deliverables from
 AGENTS.md — *a bootable ISO* and *a network installer that fetches the system over the
 network with the OS's own stack*. Target: 2007 MacBook2,1, GRUB i386-pc boot chain
 (32-bit Apple EFI in BIOS emulation — **no UEFI, no ESP**, see AGENTS.md).
@@ -595,9 +596,60 @@ file operations on FAT16.
   names/stamps, read-only device, subdirectory create, plus a 120-op **xorshift-seeded oracle**
   against a `Vec` model re-mounted after every op); `fat/tests/hostile.rs` stays green (47 FS1
   tests + 1 new mount-hardening test = 48). Total: **71 host tests** in `fat/`.
-- **Still open (FS3+):** crash consistency (journal/flush ordering, drive `FLUSH CACHE`), LFN
-  writes, `mkdir`/unlink as public operations, cross-file cross-link detection (needs a visited set
+- **Still open (FS3+):** crash consistency (journal/flush ordering, drive `FLUSH CACHE`),
+  unlink as a public operation, cross-file cross-link detection (needs a visited set
   — i.e. the heap), FAT32, and the GPT wrapper (milestone 2).
+
+### 8.3 FS3 landed — directories + LFN writes (`FS_TREE_OK`, full checkout)
+
+`fat` now creates directories and writes long names; the G3/G4 checkout is the **whole**
+depth-1 tree instead of root-only 8.3 blobs. Branch `m-fs3`.
+
+- **`mkdir`.** `Fat16::create_dir` / `create_dir_all` (branch `fat/src/tree.rs`): allocate a
+  cluster, zero it (it may have held file data), write `.` (own cluster) and `..` (the parent's
+  first cluster, `0` when the parent is the fixed root), then the parent's entry **last** — the
+  same FAT → data → directory commit order FS2 documents. The fixed root never gets `.`/`..`.
+  Refusals before any mutation: no free cluster (`NoSpace`), no contiguous run of
+  `1 + LFN entries` slots (`NoSpace`), name collision (`Exists`), invalid path (`Path`).
+- **Path API.** `create_dir(path)`, `create_dir_all(path)` (`mkdir -p`, bounded to 32
+  components / 1024 bytes), `write_file_all(path, bytes)` (creates missing parents, then writes)
+  and the existing `read_file`. Every component is validated **before the first write**: absolute,
+  no empty/`.`/`..` component (so no traversal or escape), bounded component count and length.
+  `Fat16::kind(path)` reports `File`/`Dir` for the read side.
+- **LFN writes.** A name that is not 8.3-encodable gets a unique uppercase 8.3 alias
+  (`NAME~N.EXT`, illegal characters dropped, base shrunk for ≥2-digit suffixes, numeric tail
+  probed `1..=9999`, then `NameConflict`) plus the spec's LFN chain: UTF-16LE, 13 units per
+  entry, sequence numbers descending with `0x40` on the physically first entry, the classic
+  rotate-right checksum over the alias, `0x0000` terminator then `0xFFFF` padding, LFN entries
+  written **before** the 8.3 entry. Names > 255 UTF-16 units (a surrogate pair counts twice) and
+  FAT-illegal characters (`/\:*?"<>|`, control bytes) are `InvalidName`. Reusing a deleted slot
+  clears stale LFN parts first, exactly like FS2's create path.
+- **Allocation hint.** The allocator keeps a monotonic search hint (`Cell<u32>`, re-verified
+  against the FAT on every hit, wraps to `2..hint` when the tail is full) so a 2 MiB checkout is
+  a linear scan instead of O(n²) — the difference between ~35 s and ~2 s in QEMU. It is never a
+  cache: every candidate is read back as `0x0000` before it is handed out.
+- **Marker + checkout.** `cargo xtask smoke-install` asserts
+  `["BLK_OK", "FAT_OK", "FS_WRITE_OK", "FS_TREE_OK", "GIT_CHECKOUT_OK"]`: after `FS_WRITE_OK`,
+  the kernel creates `/sub/dir/deep/nested-long-name-file.txt` and `/SUB/DIR/PLAIN.TXT`,
+  re-mounts from scratch and reads both back byte-exact plus the FS2 payloads (`FS_TREE_OK`);
+  then the network phase checks the fetched repo's **whole** tree out (directories created, long
+  names via LFN writes, symlinks/gitlinks counted as skipped), asserts
+  `git: checkout: N of N file(s) written in D dirs, 0 skipped`, re-mounts and reads `/README.md`
+  and the nested `docs/hardware.md` back byte-exact with a content fragment each. Observed this
+  milestone: **112 files in 53 dirs, 0 skipped**.
+- **Host tests:** `fat/tests/tree.rs` — 31 new tests (mkdir round-trips and re-mounts, `.`/`..`
+  clusters and the root special case, nested + deep parent chains, `create_dir_all` idempotence,
+  exact LFN entry bytes against an independent spec oracle, 13/14/26/27-unit and 255-unit
+  boundaries, alias collisions and `~10` probing, alias-vs-short-name avoidance, Unicode and
+  non-BMP names, path-escape refusals, full-disk/no-slot refusals leaving the image
+  byte-identical, stale-LFN clearing, handcrafted chains and checksum corruption, plus a 40-op
+  randomized tree oracle). Total `fat/` suite: **102 host tests** (the 71 FS1/FS2 ones stay
+  green; the one FS2 test that asserted long names are refused now asserts the unrepresentable
+  names that remain refused).
+- **Still open (FS3+):** directories are never grown past their existing extent (a full
+  directory is `NoSpace`; no cluster extension yet), no `unlink`, crash consistency
+  (journal/flush ordering, drive `FLUSH CACHE`), cross-file cross-link detection (needs the
+  heap), FAT32, and the GPT wrapper (milestone 2).
 
 ---
 

@@ -1,6 +1,7 @@
-//! **FAT16** reader (FS1, `FAT_OK`) + writer (FS2, `FS_WRITE_OK`) — the
-//! filesystem half of the installer milestones (`cargo xtask
-//! smoke-install`).
+//! **FAT16** reader (FS1, `FAT_OK`), writer (FS2, `FS_WRITE_OK`) and
+//! directories + long names (FS3, `FS_TREE_OK`) — the filesystem half of
+//! the installer milestones (`cargo xtask smoke-install`), and the write
+//! target of the git checkout (`GIT_CHECKOUT_OK`).
 //!
 //! # Why this crate exists (dependency policy exception (a))
 //!
@@ -62,40 +63,67 @@
 //!
 //! [`Fat16::write_file`] (create-or-overwrite) and [`Fat16::create_file`]
 //! (refuses to clobber — [`Error::Exists`]) implement the minimal honest
-//! write set: create a file in the root directory *or in an existing
-//! subdirectory* (no `mkdir` — creating directories is not supported),
-//! overwrite in place, grow the cluster chain, truncate and free the
-//! tail. The full policy lives in [`write`]'s module docs; the headline
-//! points:
+//! write set: create a file in the root directory or in an existing
+//! subdirectory, overwrite in place, grow the cluster chain, truncate
+//! and free the tail. The full policy lives in [`write`]'s module docs;
+//! the headline points:
 //!
 //! - **Write-through, no `flush()`.** Every FAT sector, data sector and
 //!   directory sector is written to the device inside the operation, in
 //!   the order FAT → data → directory entry (the entry is the single
 //!   field readers consult, so it acts as the operation's commit point).
-//!   **Crash consistency is explicitly NOT a goal of FS2** — no journal,
-//!   no flush barriers, no drive `FLUSH CACHE`; power-loss ordering is a
-//!   later milestone.
-//! - **Names must be 8.3-encodable** (see [`write`]): long names are
-//!   *refused* ([`Error::InvalidName`]), short names are uppercased —
-//!   this crate never writes LFN entries.
+//!   **Crash consistency is explicitly NOT a goal of FS2/FS3** — no
+//!   journal, no flush barriers, no drive `FLUSH CACHE`; power-loss
+//!   ordering is a later milestone.
+//! - **Names are 8.3 or long.** FS2 refused anything not
+//!   8.3-encodable; FS3 ([`tree`]) writes the LFN chain for long names
+//!   behind a unique `~N` alias (see [`tree`]'s module docs for the
+//!   alias and entry-byte rules).
 //! - Every refusal is fail-closed and panic-free: disk full
 //!   ([`Error::NoSpace`]), out-of-range/corrupt chains
 //!   ([`Error::BadChain`], reusing the FS1 validators), a device without
 //!   write support ([`Error::ReadOnly`], the [`BlockDevice::write_at`]
-//!   default), a bad timestamp ([`Error::Stamp`]).
+//!   default), a bad timestamp ([`Error::Stamp`]), an exhausted alias
+//!   space ([`Error::NameConflict`]).
 //!
 //! Timestamps come from the caller (the kernel passes its RTC reading, a
 //! fixed documented value when the clock is dead) — this crate never
 //! invents a clock.
+//!
+//! # FS3: directories and long names
+//!
+//! [`Fat16::create_dir`], [`Fat16::create_dir_all`] and
+//! [`Fat16::write_file_all`] add directory creation (a fresh cluster
+//! with `.`/`..`, the parent's entry written last) and `mkdir -p` path
+//! semantics; [`Fat16::kind`] reports what a path names. The naming
+//! rule is now: 8.3-encodable names are written as 8.3, every other
+//! name gets a generated unique 8.3 alias plus an LFN chain (UTF-16LE,
+//! 13 units per entry, checksum over the alias). Directories are not
+//! grown past their existing extent, there is still no unlink, and
+//! directory writes remain write-through.
 
 #![no_std]
 #![forbid(unsafe_code)]
 
 mod dir;
+/// FS3's directory + long-name half: mkdir, nested paths, LFN writes and
+/// the alias rules live here.
+pub mod tree;
 /// The write half (FS2): [`write::Stamp`] and the writer's module docs
 /// (ordering, naming rule, refusals) live here.
 pub mod write;
 pub use write::Stamp;
+
+/// What a path names — the read-side classification [`Fat16::kind`]
+/// returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// A regular file (including an empty one).
+    File,
+    /// A directory (the root included).
+    Dir,
+}
+
 /// Device-sector granularity the block layer speaks (ATA PIO moves
 /// 512-byte sectors). [`BlockDevice`] implementations must expose a
 /// capacity that is a whole number of these.
@@ -178,12 +206,17 @@ pub enum Error {
     /// No free cluster to grow into, or no free directory slot to create
     /// a file in (disk/directory full).
     NoSpace,
-    /// The name is not 8.3-encodable — see [`write`]'s naming rule.
-    /// This crate never writes LFN entries, so long or exotic names are
-    /// refused rather than silently mangled.
+    /// The name is not representable as a FAT name even with an LFN
+    /// chain: not 8.3-encodable *and* illegal as a long name (a
+    /// `/\:*?"<>|` or control character), longer than 255 UTF-16 units,
+    /// or empty. Refused rather than silently mangled — see [`tree`].
     InvalidName,
+    /// No unique 8.3 alias is available for a long name (`~1`..`~9999`
+    /// are all taken in the directory).
+    NameConflict,
     /// [`Fat16::create_file`] on a path that already exists (use
-    /// [`Fat16::write_file`] to create-or-overwrite).
+    /// [`Fat16::write_file`] to create-or-overwrite) or
+    /// [`Fat16::create_dir`] on a taken name.
     Exists,
     /// The caller's timestamp falls outside FAT's representable range
     /// (year 1980..=2107, valid month/day/hour/minute/second).
@@ -338,6 +371,12 @@ pub struct Fat16<'a, D: BlockDevice + ?Sized> {
     data_start: u32,
     /// Data-cluster count, validated to be inside the FAT16 window.
     clusters: u32,
+    /// Allocation hint: the lowest cluster the last allocation searched
+    /// from. Purely an accelerator — every hit is re-verified against
+    /// the FAT (`0x0000`), and when the tail from here is exhausted the
+    /// allocator scans `2..hint` before giving up, so a cluster freed
+    /// behind the hint is still found. Never a cache of disk state.
+    next_free: core::cell::Cell<u32>,
 }
 
 impl<'a, D: BlockDevice + ?Sized> Fat16<'a, D> {
@@ -478,6 +517,7 @@ impl<'a, D: BlockDevice + ?Sized> Fat16<'a, D> {
             root_entries,
             data_start,
             clusters,
+            next_free: core::cell::Cell::new(2),
         })
     }
 
