@@ -428,13 +428,51 @@ fn chat_mock_response() -> Vec<u8> {
     response
 }
 
+/// Canned mock **streaming** completion (A4): a `text/event-stream`
+/// body with three `delta.content` fragments and the `[DONE]`
+/// terminator, served verbatim with a computed `Content-Length` (the
+/// guest's parser needs a framed body — `nc` never closes before the
+/// client does, so close-delimited would deadlock). The concatenated
+/// fragments are byte-identical to `STREAM_REPLY` in
+/// `kernel/src/apps/ai.rs` (duplicated like `CANNED_REPLY`).
+fn chat_mock_sse_response() -> Vec<u8> {
+    const BODY: &str = concat!(
+        "data: {\"id\":\"chatcmpl-reemplazo-mock-sse\",\"object\":\"chat.completion.chunk\",",
+        "\"created\":1763712000,\"model\":\"reemplazo-mock\",",
+        "\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl-reemplazo-mock-sse\",\"object\":\"chat.completion.chunk\",",
+        "\"created\":1763712000,\"model\":\"reemplazo-mock\",",
+        "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"reemplazo: \"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl-reemplazo-mock-sse\",\"object\":\"chat.completion.chunk\",",
+        "\"created\":1763712000,\"model\":\"reemplazo-mock\",",
+        "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"streamed \"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl-reemplazo-mock-sse\",\"object\":\"chat.completion.chunk\",",
+        "\"created\":1763712000,\"model\":\"reemplazo-mock\",",
+        "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"reply ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+         Cache-Control: no-cache\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        BODY.len()
+    );
+    let mut response = head.into_bytes();
+    response.extend_from_slice(BODY.as_bytes());
+    response
+}
+
 /// Write `chat-mock-response.txt` into the ISO dir (bind-mounted at
 /// `/iso` in the container, plain file for the host backend). Called
 /// from [`qemu_invocation`], i.e. after `iso()` has wiped the dir (the
 /// `disk.img` precedent) and before the VM starts — so it is never
-/// inside the ISO itself, just beside it.
+/// inside the ISO itself, just beside it. A4 adds the SSE variant for
+/// the streaming proof on `:8098`.
 fn write_chat_mock(iso_dir: &Path) -> std::io::Result<()> {
-    std::fs::write(iso_dir.join("chat-mock-response.txt"), chat_mock_response())
+    std::fs::write(iso_dir.join("chat-mock-response.txt"), chat_mock_response())?;
+    std::fs::write(
+        iso_dir.join("chat-mock-sse-response.txt"),
+        chat_mock_sse_response(),
+    )
 }
 
 /// Build the I2 payload the guest fetches with its own stack:
@@ -486,7 +524,8 @@ fn write_payload_mock(root: &Path, iso_dir: &Path) -> std::io::Result<()> {
 
 /// The in-container mock: a **bounded** loop of `nc` one-shot servers
 /// on the container's loopback — `:8099` serves the canned chat
-/// response, `:8080` serves the canned *payload* response (I2: the
+/// response, `:8098` the A4 canned **SSE** response (three deltas +
+/// `[DONE]`), `:8080` serves the canned *payload* response (I2: the
 /// guest's `GET /payload.tar` over its own stack) — backgrounded,
 /// then QEMU is `exec`'d, so QEMU becomes the container's main
 /// process and, when the container stops (`--rm` / `docker rm -f`),
@@ -499,9 +538,13 @@ fn write_payload_mock(root: &Path, iso_dir: &Path) -> std::io::Result<()> {
 /// the guest sends can never pollute the serial log the markers are
 /// read from. Verified end-to-end (`nc -l -s 127.0.0.1 -p 8099` +
 /// delayed and sequential clients) in the A3 commit; `:8080` is the
-/// same shape with `payload-http.txt` (I2).
+/// same shape with `payload-http.txt` (I2), `:8098` the same shape
+/// with `chat-mock-sse-response.txt` (A4).
 const MOCK_LOOP: &str = "for i in 1 2 3 4 5; do \
      nc -l -s 127.0.0.1 -p 8099 < /iso/chat-mock-response.txt > /dev/null 2>&1 || true; \
+     done & \
+     for i in 1 2 3 4 5; do \
+     nc -l -s 127.0.0.1 -p 8098 < /iso/chat-mock-sse-response.txt > /dev/null 2>&1 || true; \
      done & \
      for i in 1 2 3 4 5; do \
      nc -l -s 127.0.0.1 -p 8080 < /iso/payload-http.txt > /dev/null 2>&1 || true; \
@@ -525,6 +568,14 @@ fn serve_chat_mock(root: &Path) {
             exit(1);
         }
     };
+    let sse_file = root.join("target/iso-root/chat-mock-sse-response.txt");
+    let sse = match std::fs::read(&sse_file) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("xtask chat-mock: cannot read {}: {e}", sse_file.display());
+            exit(1);
+        }
+    };
     let payload = match std::fs::read(root.join("target/iso-root/payload-http.txt")) {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -539,6 +590,13 @@ fn serve_chat_mock(root: &Path) {
             exit(1);
         }
     };
+    let sse_listener = match std::net::TcpListener::bind(("127.0.0.1", 8098)) {
+        Ok(listener) => listener,
+        Err(e) => {
+            eprintln!("xtask chat-mock: cannot bind 127.0.0.1:8098: {e}");
+            exit(1);
+        }
+    };
     let payload_listener = match std::net::TcpListener::bind(("127.0.0.1", 8080)) {
         Ok(listener) => listener,
         Err(e) => {
@@ -547,6 +605,7 @@ fn serve_chat_mock(root: &Path) {
         }
     };
     if chat_listener.set_nonblocking(true).is_err()
+        || sse_listener.set_nonblocking(true).is_err()
         || payload_listener.set_nonblocking(true).is_err()
     {
         exit(1);
@@ -555,7 +614,11 @@ fn serve_chat_mock(root: &Path) {
     let mut served = 0usize;
     while served < 10 && Instant::now() < deadline {
         let mut connected = false;
-        for (listener, response) in [(&chat_listener, &chat), (&payload_listener, &payload)] {
+        for (listener, response) in [
+            (&chat_listener, &chat),
+            (&sse_listener, &sse),
+            (&payload_listener, &payload),
+        ] {
             let (mut stream, _) = match listener.accept() {
                 Ok(pair) => pair,
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
@@ -1223,10 +1286,16 @@ fn run_two_vm_ssh(root: &Path, iso_dir: &Path, server_disk: &Path, client_disk: 
 }
 
 /// The A3/A5 chat mock without the `exec` tail: the two-VM script needs
-/// it in the background beside the server VM (same five connections,
-/// same `/iso` response file — VM2 is the only VM that posts).
+/// it in the background beside the server VM (same five connections per
+/// port, same `/iso` response files — VM2 is the only VM that posts).
+/// A4's streaming proof runs on **both** VMs (each boots the normal
+/// chain), so the SSE responder on `:8098` is here too; without it the
+/// kernel's `AI_CHAT_OK` phase would fail closed on the missing mock.
 const MOCK_LOOP_PREFIX: &str = "for i in 1 2 3 4 5; do \
      nc -l -s 127.0.0.1 -p 8099 < /iso/chat-mock-response.txt > /dev/null 2>&1 || true; \
+     done & \
+     for i in 1 2 3 4 5; do \
+     nc -l -s 127.0.0.1 -p 8098 < /iso/chat-mock-sse-response.txt > /dev/null 2>&1 || true; \
      done &";
 
 /// Join already-space-free QEMU arguments into one `sh -c` word list.

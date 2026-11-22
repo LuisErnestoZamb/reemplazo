@@ -219,6 +219,130 @@ pub const SSE_LINE_CAP: usize = 8 * 1024;
 /// Longest accumulated event payload (multi-line `data:` joined with
 /// `\n`). Refused, never truncated.
 pub const SSE_DATA_CAP: usize = 16 * 1024;
+/// Longest streamed reply text kept (A4): `delta.content` fragments are
+/// appended here for display, and bytes past this bound are **counted
+/// and dropped** (the stream itself is separately bounded by the
+/// caller's total-bytes cap). 4 KiB is far more than a text-mode pane
+/// can show and keeps a hostile stream from growing the heap.
+pub const STREAM_TEXT_CAP: usize = 4 * 1024;
+
+/// What consuming one SSE event did to a [`StreamText`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamFlow {
+    /// More events may follow.
+    Continue,
+    /// `data: [DONE]` was seen: the stream is over (later events are
+    /// ignored by [`Sse`] itself).
+    Done,
+}
+
+/// Why a streamed event was refused. Fail-closed: the caller stops the
+/// exchange, it never renders a half-understood payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamError {
+    /// A `data:` payload that was not a chunk object we can read.
+    BadPayload,
+}
+
+/// Accumulates the `delta.content` fragments of an SSE completion in
+/// arrival order — the A4 counterpart of [`ChatResponse`] for the
+/// streaming path.
+///
+/// This type is deliberately pure: it consumes already-dispatched
+/// [`SseEvent`]s (so the SSE framing stays in [`Sse`]) and never
+/// touches a socket, a screen or a clock. The kernel drives it from the
+/// transport loop and renders [`StreamText::text`] as it grows; that is
+/// exactly what the host tests below exercise.
+#[derive(Debug, Default)]
+pub struct StreamText {
+    /// Accumulated, bounded reply text (fragments appended verbatim —
+    /// sanitizing for display is the caller's job).
+    text: String,
+    /// Content-bearing fragments seen.
+    deltas: usize,
+    /// At least one fragment did not fit [`STREAM_TEXT_CAP`].
+    truncated: bool,
+    /// `[DONE]` was dispatched.
+    done: bool,
+}
+
+impl StreamText {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The reply text accumulated so far.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// How many `delta.content` fragments were appended (fragments
+    /// past the cap still count — the count is a wire observation).
+    pub fn deltas(&self) -> usize {
+        self.deltas
+    }
+
+    /// Did any fragment exceed the text bound?
+    pub fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// Has `data: [DONE]` arrived?
+    pub fn is_done(&self) -> bool {
+        self.done
+    }
+
+    /// Consume one dispatched event.
+    ///
+    /// - [`SseEvent::Done`] marks the stream complete and returns
+    ///   [`StreamFlow::Done`] (idempotent: a second `Done` is the same).
+    /// - [`SseEvent::Data`] must hold exactly one streamed chunk (one
+    ///   JSON object); the delta's `content` (when present) is appended
+    ///   in arrival order, bounded by [`STREAM_TEXT_CAP`]. A payload
+    ///   that does not parse as a [`StreamChunk`] is
+    ///   [`StreamError::BadPayload`] — never a silent skip.
+    pub fn push(&mut self, event: &SseEvent) -> Result<StreamFlow, StreamError> {
+        match event {
+            SseEvent::Done => {
+                self.done = true;
+                Ok(StreamFlow::Done)
+            }
+            SseEvent::Data(payload) => {
+                let chunk = StreamChunk::from_slice(payload.as_bytes())
+                    .map_err(|_| StreamError::BadPayload)?;
+                if let Some(delta) = chunk.delta_text() {
+                    self.deltas = self.deltas.saturating_add(1);
+                    let room = STREAM_TEXT_CAP.saturating_sub(self.text.len());
+                    let prefix = prefix_at_most(delta, room);
+                    self.text.push_str(prefix);
+                    if prefix.len() < delta.len() {
+                        self.truncated = true;
+                    }
+                }
+                Ok(StreamFlow::Continue)
+            }
+        }
+    }
+}
+
+/// The longest UTF-8 prefix of `s` that is at most `max` bytes long —
+/// never splits a code point (a split would make the accumulated text
+/// invalid, and the caller's sanitizer works on `str`).
+fn prefix_at_most(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = 0usize;
+    for (index, _) in s.char_indices() {
+        if index > max {
+            break;
+        }
+        end = index;
+    }
+    // `char_indices` may stop before the first char when max < 1:
+    // then only the empty prefix fits.
+    s.get(..end).unwrap_or("")
+}
 
 /// One dispatched SSE event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -838,6 +962,154 @@ mod tests {
         };
         let chunk = StreamChunk::from_slice(payload).expect("chunk");
         assert_eq!(chunk.delta_text(), Some("hi"));
+    }
+
+    // -- streamed text accumulation (A4) --------------------------------------
+
+    fn stream_feed(stream: &mut StreamText, payloads: &[&str]) -> Vec<StreamFlow> {
+        let mut flows = Vec::new();
+        for payload in payloads {
+            let event = SseEvent::Data(String::from(*payload));
+            flows.push(stream.push(&event).expect("valid chunk"));
+        }
+        flows
+    }
+
+    #[test]
+    fn stream_text_accumulates_deltas_in_arrival_order() {
+        let mut stream = StreamText::new();
+        let flows = stream_feed(
+            &mut stream,
+            &[
+                r#"{"choices":[{"index":0,"delta":{"role":"assistant"}}]}"#,
+                r#"{"choices":[{"index":0,"delta":{"content":"reem"}}]}"#,
+                r#"{"choices":[{"index":0,"delta":{"content":"plazo: "}}]}"#,
+                r#"{"choices":[{"index":0,"delta":{"content":"ok"}}]}"#,
+            ],
+        );
+        assert_eq!(flows, vec![StreamFlow::Continue; 4]);
+        assert_eq!(stream.text(), "reemplazo: ok");
+        // The role-only chunk is not a content fragment.
+        assert_eq!(stream.deltas(), 3);
+        assert!(!stream.truncated());
+        assert!(!stream.is_done());
+        stream.push(&SseEvent::Done).expect("done");
+        assert!(stream.is_done());
+        // Idempotent: a second terminator changes nothing.
+        assert_eq!(stream.push(&SseEvent::Done), Ok(StreamFlow::Done));
+        assert_eq!(stream.text(), "reemplazo: ok");
+    }
+
+    #[test]
+    fn stream_text_done_ends_the_flow_not_the_text() {
+        let mut stream = StreamText::new();
+        stream_feed(&mut stream, &[r#"{"choices":[{"delta":{"content":"a"}}]}"#]);
+        assert_eq!(stream.push(&SseEvent::Done), Ok(StreamFlow::Done));
+        assert_eq!(stream.text(), "a");
+    }
+
+    #[test]
+    fn stream_text_refuses_non_chunk_payloads() {
+        for bad in [
+            "",
+            "not json",
+            "[DONE] trailing",
+            r#"{"choices":"nope"}"#,
+            r#"{"choices":[{"delta":null}]}"#,
+            r#"{"id":"x"}"#,
+            "{\"choices\":[{\"delta\":{\"content\":1}}]}",
+        ] {
+            let mut stream = StreamText::new();
+            assert_eq!(
+                stream.push(&SseEvent::Data(String::from(bad))),
+                Err(StreamError::BadPayload),
+                "accepted {bad:?}"
+            );
+            assert_eq!(stream.text(), "", "a refused payload left text behind");
+            assert_eq!(stream.deltas(), 0);
+        }
+    }
+
+    #[test]
+    fn stream_text_delta_without_content_counts_nothing() {
+        let mut stream = StreamText::new();
+        stream_feed(
+            &mut stream,
+            &[
+                r#"{"choices":[]}"#,
+                r#"{"choices":[{"delta":{}}]}"#,
+                r#"{"choices":[{"delta":{"content":null}}]}"#,
+            ],
+        );
+        assert_eq!(stream.text(), "");
+        assert_eq!(stream.deltas(), 0);
+        assert!(!stream.truncated());
+    }
+
+    #[test]
+    fn stream_text_is_bounded_and_counts_dropped_bytes() {
+        let fragment = "x".repeat(1024);
+        let payload = format!(r#"{{"choices":[{{"delta":{{"content":"{fragment}"}}}}]}}"#);
+        let mut stream = StreamText::new();
+        for _ in 0..8 {
+            stream
+                .push(&SseEvent::Data(payload.clone()))
+                .expect("chunk");
+        }
+        assert_eq!(stream.text().len(), STREAM_TEXT_CAP);
+        assert!(stream.text().bytes().all(|b| b == b'x'));
+        assert!(stream.truncated(), "the cap must be recorded, not hidden");
+        // Every fragment was observed on the wire even past the cap.
+        assert_eq!(stream.deltas(), 8);
+    }
+
+    #[test]
+    fn stream_text_never_splits_a_code_point() {
+        let mut stream = StreamText::new();
+        // Fill to one byte below the cap, then offer a two-byte `é`.
+        let filler = "y".repeat(STREAM_TEXT_CAP - 1);
+        let payload = format!(r#"{{"choices":[{{"delta":{{"content":"{filler}"}}}}]}}"#);
+        stream.push(&SseEvent::Data(payload)).expect("filler");
+        assert_eq!(stream.text().len(), STREAM_TEXT_CAP - 1);
+        stream
+            .push(&SseEvent::Data(String::from(
+                r#"{"choices":[{"delta":{"content":"é"}}]}"#,
+            )))
+            .expect("accented");
+        assert_eq!(stream.text().len(), STREAM_TEXT_CAP - 1);
+        assert!(stream.truncated());
+        // The accumulated text is still valid UTF-8 by construction.
+        assert!(core::str::from_utf8(stream.text().as_bytes()).is_ok());
+        // A fragment that fits exactly is appended whole.
+        let mut exact = StreamText::new();
+        let filler = "z".repeat(STREAM_TEXT_CAP);
+        let payload = format!(r#"{{"choices":[{{"delta":{{"content":"{filler}"}}}}]}}"#);
+        exact.push(&SseEvent::Data(payload)).expect("exact");
+        assert_eq!(exact.text().len(), STREAM_TEXT_CAP);
+        assert!(!exact.truncated());
+    }
+
+    #[test]
+    fn stream_end_to_end_sse_events_to_text() {
+        // The whole A4 path on one buffer: raw SSE → Sse → StreamText,
+        // split at every byte boundary of the stream.
+        let stream_bytes = b"data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\n\
+              data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n\
+              data: [DONE]\n\n";
+        for split in 0..=stream_bytes.len() {
+            let mut sse = Sse::new();
+            let mut text = StreamText::new();
+            let mut out = Vec::new();
+            for part in [&stream_bytes[..split], &stream_bytes[split..]] {
+                sse.feed(part, &mut out).expect("feed");
+                for event in out.drain(..) {
+                    let _ = text.push(&event).expect("event");
+                }
+            }
+            assert_eq!(text.text(), "hello", "split at {split}");
+            assert_eq!(text.deltas(), 2);
+            assert!(text.is_done());
+        }
     }
 
     #[test]

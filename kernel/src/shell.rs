@@ -27,7 +27,10 @@ use crate::{keyboard, memory, pit, serial};
 use smoltcp::wire::Ipv4Address;
 
 /// Bytes accepted per input line; the rest is refused with a bell.
-const LINE_CAP: usize = 128;
+/// A4 raised this from 128 to 512 so one typed line can carry a key up
+/// to the config's 512-byte bound (`ai key <token>`); no marker or
+/// builtin depends on the old cap.
+const LINE_CAP: usize = 512;
 
 const PROMPT: &str = "reemplazo> ";
 
@@ -176,8 +179,13 @@ fn execute(stack: &mut Stack, line: &str) {
              \x20 resolve <host>    DNS A lookup\n\
              \x20 tui               full-screen TUI demo (Esc quits)\n\
              \x20 edit              in-memory text editor (Esc quits)\n\
-             \x20 ai <message>      chat completion via the mock endpoint\n\
+             \x20 ai <message>      chat: mock, or the configured endpoint over TLS\n\
+             \x20 ai stream <msg>   streaming SSE demo against the in-container mock\n\
              \x20 ai apply          insert a chat completion into the editor\n\
+             \x20 ai endpoint <url> https endpoint (RAM only)\n\
+             \x20 ai model <name>   model name (RAM only)\n\
+             \x20 ai key <token>    API key (RAM only, never printed)\n\
+             \x20 ai config         show the chat config (key never shown)\n\
              \x20 ssh-auth <hex|path>  ssh publickey auth to github.com (S3)\n\
              \x20 browse <url>      text browser (Tab links, Enter follow, Esc quits)\n\
              \x20 halt              park the CPU"
