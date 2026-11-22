@@ -20,7 +20,7 @@ Estado: **hito 1 completado** (`e53295e`).kernel+apps separados por una frontera
 | Gate | cadena |
 |---|---|
 | `cargo xtask smoke` | 30 markers originales, byte-idénticos — el ISO no lleva módulo `hello` |
-| `cargo xtask smoke-user` | `BOOT_OK … SHELL_OK, ELF_OK, USER_RUN_OK, SYSCALL_OK, USER_RETURN_OK` |
+| `cargo xtask smoke-user` | `BOOT_OK … SHELL_OK, ELF_OK, USER_RUN_OK, SYSCALL_OK, USER_RETURN_OK, SCHED_RR_OK, USER_YIELD_OK, USER_FAULT_OK` (27 marcadores) |
 | `cargo xtask smoke-ssh` | PASS (interop OpenSSH real, intento 1) |
 | `cargo xtask smoke-install` | temporalmente limitado por el presupuesto de 60 s con carga de host >7 (documentado; no es regresión) |
 
@@ -29,7 +29,7 @@ Estado: **hito 1 completado** (`e53295e`).kernel+apps separados por una frontera
 | Hito | estado | qué falta |
 |---|---|---|
 | 1 · frontera mínima | ✅ `e53295e` | — |
-| 2 · RR preventivo por PIT | 🔨 | `SCHED_ACTIVE`, quantum, safely-point, `Yield` real, #PF→kill, `fxsave`/`fxrstor` por PCB |
+| 2 · RR preventivo por PIT | ✅ (mergeado) | quantum 10 ticks, `Yield` real, #PF→kill con #PF real desde CPL3, `fxsave`/`fxrstor` por PCB; deuda: VMA del proceso en `userptr::set_vm` |
 | 3 · consola de usuario | 📋 | `Read`, `Vga*`, proceso `shell`, migrar `apps/screen.rs` como servicio |
 | 4 · FS | 📋 | `Open/Close/Read/Write/Stat`, fds por PCB, editor como proceso |
 | 5 · red/TLS | 📋 | handles opacos para `netstack`/`tls`, estados `Blocked`, migrar AI y browser |

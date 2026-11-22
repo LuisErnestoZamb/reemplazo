@@ -44,9 +44,11 @@ fn syscall_hook(frame: *mut crate::idt::Frame) -> *mut crate::idt::Frame {
             // handed control to the scheduler (hito 1, cooperative).
             return sched::exit_current(frame);
         }
-        syscall::dispatch(f);
+        // Hito 2: Yield/Exit may switch tasks inside the dispatch;
+        // resume with the frame the scheduler chose (rax handshake in
+        // interrupts.S isr_common).
+        syscall::dispatch_resume(f)
     }
-    frame
 }
 
 /// Adapter for the PIT tick hook. `sched::on_tick` latches the

@@ -60,7 +60,7 @@ print was added there. The marker hook is documented in §6.
   if one was installed with `set_exit_hook`; with no process subsystem it
   halts (fail-closed). The hook returns `!` in spirit; if it ever returns,
   the kernel still halts.
-- `yield` is cooperative in milestone 1: returns `0` immediately. The PIT
+- `yield` switches tasks in milestone 2 (`sched::yield_current`); the PIT
   tick becoming a preemptive context switch is milestone 2 (scheduler).
 - `time` is `crate::clock::now_ms()` — the PIT-driven monotonic clock already
   used by smoltcp, so it is consistent with the network stack's deadlines.
@@ -152,5 +152,5 @@ the new marker.
 | `SYSCALL_OK` after `SHELL_OK` | ready (`selftest()`) | 1 line in `shell.rs` + 1 entry in xtask markers |
 | First ELF 'hello' | `m-userland-elf` / `m-elf-loader` | load, map user pages in `0x80…`, register VMA, run |
 | Process lifecycle | `m-scheduler` | `set_exit_hook`, `set_vm` on switch, kill on #PF/#GP |
-| Preemptive tick | milestone 2 | timer-driven context switch (currently `yield` is a no-op) |
+| Preemptive tick | **done (hito 2)** | RR con quantum de 10 ticks, `fxsave`/`fxrstor`, #PF/#GP de CPL3 → kill; `SCHED_RR_OK`, `USER_YIELD_OK`, `USER_FAULT_OK` |
 | Binary fds / larger I/O | deferred | UTF-8-only text console, 64 KiB cap |
