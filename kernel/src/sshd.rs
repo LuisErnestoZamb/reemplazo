@@ -87,6 +87,19 @@ const SESSIONS_PER_CALL: u32 = 2;
 /// Per-receive budget inside a session: a client that stalls is
 /// dropped, never wedged into the boot.
 const STEP_DEADLINE_MS: u64 = OP_DEADLINE_MS;
+/// Absolute budget for a **whole session** (banner → close), checked
+/// by every receive in it (audit F1): the per-step deadline restarts
+/// for each packet, so without this an unauthenticated peer could
+/// trickle one valid message per step forever and hold `serve_once` —
+/// which runs in the boot chain — indefinitely. 120 s is two orders
+/// of magnitude above a legitimate session (seconds, even with the
+/// `idle()` tick granularity).
+const SESSION_DEADLINE_MS: u64 = 120_000;
+/// Non-progress messages (`CHANNEL_WINDOW_ADJUST`/`CHANNEL_EOF`) the
+/// channel loops tolerate before dropping the session (audit F1): a
+/// legitimate peer sends a handful around our tiny exec output; a
+/// flood of them used to restart the step deadline forever.
+const CHANNEL_TOLERANCE_MAX: u32 = 64;
 /// Connection receive buffer: the same bound as the client's.
 const RX_CAP: usize = 4096;
 /// Largest single encrypted payload the server will handle; the
@@ -324,6 +337,12 @@ fn session(
     // SAFETY: single-use static (see `RX`); single core, one connection.
     let rx = unsafe { &mut *addr_of_mut!(RX) };
 
+    // Absolute session budget (audit F1): every receive below checks
+    // this in addition to its own per-step deadline, so no peer can
+    // hold the boot-path `serve_once` alive by trickling valid
+    // messages one step at a time.
+    let session_deadline = clock::now_ms() + SESSION_DEADLINE_MS;
+
     // 1. Banner first (RFC4253 §4.2), then our KEXINIT — a server may
     //    pipeline them; both peers send their identification before
     //    anything else either way.
@@ -344,7 +363,7 @@ fn session(
     // 2. Client banner (≤255 bytes including CRLF), then whatever it
     //    pipelined after it — normally its KEXINIT.
     let mut line = [0u8; ssh_wire::BANNER_MAX];
-    let (ident_len, leftover) = recv_banner(stack, handle, &mut line, rx)?;
+    let (ident_len, leftover) = recv_banner(stack, handle, &mut line, rx, session_deadline)?;
     let mut got = leftover;
     let mut xh = Sha256::new();
     ssh::hash_string(&mut xh, &line[..ident_len]);
@@ -363,7 +382,7 @@ fn session(
 
     // 4. Client KEXINIT: parse, hash I_C then I_S, intersect as
     //    responder.
-    let (s, e, used) = recv_plain(stack, handle, rx, &mut got)?;
+    let (s, e, used) = recv_plain(stack, handle, rx, &mut got, session_deadline)?;
     let negotiated = {
         let Some(payload) = rx.get(s..e) else {
             return Err("KEXINIT payload range out of bounds");
@@ -398,7 +417,7 @@ fn session(
     seq_rx += 1;
 
     // 5. SSH_MSG_KEXDH_INIT → shared secret, exchange hash, signature.
-    let (s, e, used) = recv_plain(stack, handle, rx, &mut got)?;
+    let (s, e, used) = recv_plain(stack, handle, rx, &mut got, session_deadline)?;
     let (derived, session_id) = {
         let Some(payload) = rx.get(s..e) else {
             return Err("KEXDH_INIT payload range out of bounds");
@@ -494,7 +513,7 @@ fn session(
     //    after it are already ciphertext — `EncryptedRx` starts there.
     send_plain(stack, handle, &[ssh_wire::SSH_MSG_NEWKEYS])?;
     seq_tx += 1;
-    let (s, e, used) = recv_plain(stack, handle, rx, &mut got)?;
+    let (s, e, used) = recv_plain(stack, handle, rx, &mut got, session_deadline)?;
     {
         let Some(payload) = rx.get(s..e) else {
             return Err("NEWKEYS payload range out of bounds");
@@ -527,6 +546,7 @@ fn session(
         enc_rx: &mut enc_rx,
         seq_tx: &mut seq_tx,
         seq_rx: &mut seq_rx,
+        session_deadline,
     };
     let mut service_accepted = false;
     let mut failures = 0u32;
@@ -539,6 +559,12 @@ fn session(
         };
         match msg {
             ssh_wire::SSH_MSG_SERVICE_REQUEST => {
+                // Audit F1: exactly one service request per session —
+                // a repeat used to re-answer forever (each within its
+                // own step deadline), pinning the boot-path serve.
+                if service_accepted {
+                    return Err("duplicate SERVICE_REQUEST");
+                }
                 let Ok(name) = ssh_wire::parse_service_request(p) else {
                     return Err("malformed SERVICE_REQUEST");
                 };
@@ -742,6 +768,9 @@ fn channel_phase(stack: &mut Stack, wire: &mut Conn<'_, '_>) -> Wire {
     let mut command = [0u8; ssh_wire::EXEC_COMMAND_MAX];
     let mut command_len = 0usize;
     let want_reply;
+    // Audit F1: non-progress messages are tolerated, not unbounded —
+    // a flood of them used to restart the step deadline forever.
+    let mut tolerated = 0u32;
     loop {
         let plen = wire.recv_into(stack, &mut payload)?;
         let mut found: Option<Found> = None;
@@ -773,7 +802,12 @@ fn channel_phase(stack: &mut Stack, wire: &mut Conn<'_, '_>) -> Wire {
                         found = Some(Found::Exec(req.want_reply));
                     }
                 }
-                ssh_wire::SSH_MSG_CHANNEL_WINDOW_ADJUST | ssh_wire::SSH_MSG_CHANNEL_EOF => {}
+                ssh_wire::SSH_MSG_CHANNEL_WINDOW_ADJUST | ssh_wire::SSH_MSG_CHANNEL_EOF => {
+                    tolerated += 1;
+                    if tolerated > CHANNEL_TOLERANCE_MAX {
+                        return Err("too many non-progress channel messages before exec");
+                    }
+                }
                 other => {
                     serial_println!("sshd: unexpected message {other} before exec");
                     return Err("unexpected message before exec");
@@ -841,6 +875,10 @@ fn channel_phase(stack: &mut Stack, wire: &mut Conn<'_, '_>) -> Wire {
     serial_println!("sshd: exec status {status}, channel closing");
 
     // 5. Wait (bounded) for the client's close; either way we are done.
+    //    Audit F1: EOF/WINDOW_ADJUST no longer keep this alive
+    //    unbounded — both a message counter and the session deadline
+    //    (funneled through `wire.recv_into`) end the wait.
+    let mut tolerated = 0u32;
     loop {
         let plen = wire.recv_into(stack, &mut payload)?;
         let done = {
@@ -848,7 +886,13 @@ fn channel_phase(stack: &mut Stack, wire: &mut Conn<'_, '_>) -> Wire {
             match p.first() {
                 Some(&ssh_wire::SSH_MSG_CHANNEL_CLOSE) => true,
                 Some(&ssh_wire::SSH_MSG_CHANNEL_EOF)
-                | Some(&ssh_wire::SSH_MSG_CHANNEL_WINDOW_ADJUST) => false,
+                | Some(&ssh_wire::SSH_MSG_CHANNEL_WINDOW_ADJUST) => {
+                    tolerated += 1;
+                    if tolerated > CHANNEL_TOLERANCE_MAX {
+                        return Err("too many non-progress messages while closing");
+                    }
+                    false
+                }
                 _ => return Err("expected CHANNEL_CLOSE"),
             }
         };
@@ -902,6 +946,7 @@ fn recv_banner(
     handle: SocketHandle,
     line: &mut [u8; ssh_wire::BANNER_MAX],
     rx: &mut [u8],
+    session_deadline: u64,
 ) -> Result<(usize, usize), &'static str> {
     let mut got = 0usize;
     let deadline = clock::now_ms() + STEP_DEADLINE_MS;
@@ -936,6 +981,12 @@ fn recv_banner(
         if clock::now_ms() > deadline {
             return Err("timeout waiting for the client banner");
         }
+        // The session's absolute budget (audit F1) outlives every
+        // per-step restart: a peer trickling valid bytes can keep this
+        // loop alive one step at a time, never one session.
+        if clock::now_ms() > session_deadline {
+            return Err("session deadline exceeded (banner)");
+        }
     }
 }
 
@@ -952,6 +1003,7 @@ fn recv_plain(
     handle: SocketHandle,
     rx: &mut [u8],
     got: &mut usize,
+    session_deadline: u64,
 ) -> Result<(usize, usize, usize), &'static str> {
     let deadline = clock::now_ms() + STEP_DEADLINE_MS;
     loop {
@@ -968,6 +1020,11 @@ fn recv_plain(
         }
         if clock::now_ms() > deadline {
             return Err("timeout waiting for a plaintext packet");
+        }
+        // Absolute session budget (audit F1): this step deadline
+        // restarts per packet, the session one never does.
+        if clock::now_ms() > session_deadline {
+            return Err("session deadline exceeded (plaintext)");
         }
         match ssh::recv_ready(stack, handle, &mut rx[*got..]) {
             ssh::Chunk::Ready(n) => *got += n,
@@ -988,6 +1045,9 @@ struct Conn<'a, 'b> {
     enc_rx: &'a mut ssh_wire::EncryptedRx<'b>,
     seq_tx: &'a mut u32,
     seq_rx: &'a mut u32,
+    /// Absolute session budget (audit F1): every encrypted receive
+    /// checks it in addition to its per-step deadline.
+    session_deadline: u64,
 }
 
 impl Conn<'_, '_> {
@@ -1047,6 +1107,14 @@ impl Conn<'_, '_> {
             }
             if clock::now_ms() > deadline {
                 return Err("timeout waiting for an encrypted packet");
+            }
+            // Absolute session budget (audit F1): this is the funnel
+            // every encrypted packet flows through (pre-auth, auth,
+            // channel), so the session deadline here bounds them all —
+            // including a peer that answers each step within its own
+            // deadline forever.
+            if clock::now_ms() > self.session_deadline {
+                return Err("session deadline exceeded");
             }
             let n = match self.enc_rx.spare() {
                 Ok(space) => match ssh::recv_ready(stack, self.handle, space) {

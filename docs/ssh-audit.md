@@ -41,7 +41,7 @@ closed, and `service`/`method`/`algorithm` are all checked before the decision.
 
 ---
 
-## F1 — No overall session deadline: remote unauthenticated wedge of the boot path (**alto**)
+## F1 — No overall session deadline: remote unauthenticated wedge of the boot path (**alto**, **FIXED** — absolute `SESSION_DEADLINE_MS` in every receive + `duplicate SERVICE_REQUEST` guard + `CHANNEL_TOLERANCE_MAX` counters in both channel loops)
 
 - **Where:** `kernel/src/sshd.rs:506-563` (pre-auth loop), `:717-774`
   (pre-exec loop), `:816-830` (close-wait loop); deadline constant
@@ -77,7 +77,7 @@ closed, and `service`/`method`/`algorithm` are all checked before the decision.
   before auth, max N (`e.g. 64`) `WINDOW_ADJUST`/`EOF` in the two channel
   loops — each violation an `Err` (drop) with a bounded reason.
 
-## F2 — Session-error path never closes the socket (**medio**)
+## F2 — Session-error path never closes the socket (**medio**, **FIXED** — the `Err` arm `abort()`s the socket before returning; also closed the pcap symptom class)
 
 - **Where:** `kernel/src/sshd.rs:254-258` (`Err` arm returns) vs. the orderly
   close at `:263-279` (only reached from the `Ok` arm).
