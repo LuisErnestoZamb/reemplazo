@@ -267,6 +267,7 @@ fn sys_vga_dims() -> i64 {
 fn sys_vga_put(x: u64, y: u64, glyph: u64, attr: u64) -> i64 {
     let perm = claim_or_check();
     if perm != 0 {
+        crate::rtc::trace(0xB1); // EPERM on VgaPutCell
         return perm;
     }
     if x > u16::MAX as u64 || y > u16::MAX as u64 || glyph > u8::MAX as u64 || attr > u8::MAX as u64
@@ -274,8 +275,10 @@ fn sys_vga_put(x: u64, y: u64, glyph: u64, attr: u64) -> i64 {
         return EINVAL;
     }
     if vgaservice::put(x as usize, y as usize, glyph as u8, attr as u8) {
+        crate::rtc::trace(0xB2); // staged ok
         0
     } else {
+        crate::rtc::trace(0xB3); // vgaservice::put refused
         EINVAL
     }
 }
@@ -295,6 +298,7 @@ fn sys_vga_flush() -> i64 {
         return perm;
     }
     vgaservice::flush();
+    crate::rtc::trace(0xB4); // flushed
     0
 }
 

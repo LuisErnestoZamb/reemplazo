@@ -254,8 +254,9 @@ pub extern "C" fn main() -> ! {
     // interactive REPL below still runs afterwards for automated tests.
     if let Some((cols, rows)) = sys::console_dims() {
         draw_editor_frame(cols, rows);
-        // ~8 s of busy yields so the frame is readable on hardware.
-        for _ in 0..80 { let _ = sys::yield_now(); }
+        // 25 s of yields: long enough to notice on real hardware even
+        // if the operator is not looking at the exact moment it starts.
+        for _ in 0..250 { let _ = sys::yield_now(); }
     }
 
     // One-line REPL for the smoke's keyboard phase (unchanged contract).
