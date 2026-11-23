@@ -306,6 +306,9 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
     }
 
     if let Some(stack) = stack.as_mut() {
+        // Hito 5: expose the live network stack to user processes via
+        // the syscall boundary (opaque handles only).
+        crate::userland::net::register(stack);
         stack.set_static_ipv4();
         stack.prove_ping(); // NET_OK (ARP sniff) + PING_OK
         stack.wait_lease(); // DHCP_OK — slirp values asserted

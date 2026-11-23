@@ -21,6 +21,7 @@ pub mod fs;
 pub mod ipc;
 pub mod load;
 pub mod module;
+pub mod net;
 pub mod process;
 pub mod sched;
 pub mod spawn;

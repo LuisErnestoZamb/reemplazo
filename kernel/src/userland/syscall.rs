@@ -110,6 +110,14 @@ fn dispatch_inner(frame: &mut Frame) -> (i64, *mut Frame) {
                     ],
                 )
             })
+            .or_else(|| {
+                crate::userland::net::dispatch_net(
+                    n,
+                    [
+                        frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
+                    ],
+                )
+            })
             .unwrap_or(ENOSYS),
             ptr,
         ),

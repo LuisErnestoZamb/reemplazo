@@ -32,8 +32,8 @@ Estado: **hito 1 completado** (`e53295e`).kernel+apps separados por una frontera
 | 2 · RR preventivo por PIT | ✅ (mergeado) | quantum 10 ticks, `Yield` real, #PF→kill con #PF real desde CPL3, `fxsave`/`fxrstor` por PCB; `userptr::set_vm` publicado en cada switch (hito 2b) |
 | 3 · consola de usuario | ✅ (mergeado) | syscalls 4–9 (`Read`, `VgaDims/PutCell/Clear/Flush/Peek`), `vgaservice.rs` con diff contra `0xb8000`, proceso `user/shell` con REPL; deuda: publicar `owns_console` desde el PCB |
 | 4 · FS | ✅ (mergeado) | syscalls 10–15, fds opacos por PID, volumen RAM acotado, `user/edit` con readback byte-exacto; deuda: volumen FAT-backed real, `Seek`, persistencia |
-| 5 · red/TLS | 📋 | handles opacos para `netstack`/`tls`, estados `Blocked`, migrar AI y browser |
-| 6 · git/ssh/instalador | ✅ (mergeado) | syscalls 22–27 (`Spawn/Waitpid/Kill/IpcSend/Recv/Close`), `user/git` con hijo real + readback byte-exacto; deuda: `/GIT.ELF` usa el slot único del módulo `hello`, falta segundo módulo/p2 FAT-backed; migrar ABI a `userlib` |
+| 5 · red/TLS | ✅ (mergeado) | syscalls 16–21, handles opacos por PID, whitelist de hosts, `USER_NET_OK`; deuda: race Yield/PIT mitigada con polls internos, `tls_open` fail-closed con `FATAL`, migrar AI/browser |
+| 6 · git/ssh/instalador | ✅ código (slot compartido) | syscalls 22–27 (`Spawn/Waitpid/Kill/IpcSend/Recv/Close`), `user/git` con hijo real + readback byte-exacto; deuda: `/GIT.ELF` usa el slot único del módulo `hello`, falta segundo módulo/p2 FAT-backed; migrar ABI a `userlib` |
 | 7 · corte total | 📋 | migrar apps interactivas a userland; **conservar los boot proofs** (`apps::{tui,editor,ai,browse}::boot_proof` en `main.rs`, productores de la cadena de 30) o convertirlos en módulos `#[cfg]`; `shell::run` solo fallback; `USER_ONLY_OK` |
 
 ## Deuda y decisiones

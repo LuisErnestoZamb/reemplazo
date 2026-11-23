@@ -525,6 +525,10 @@ pub fn schedule(frame: *mut InterruptFrame) -> *mut InterruptFrame {
     SWITCHES.fetch_add(1, Ordering::Relaxed);
     NEED_RESCHED.store(false, Ordering::Release);
 
+    // Snapshot the destination frame while the IrqGuard still holds IF=0.
+    // Re-reading `p.saved_context` after the guard drops let a PIT tick
+    // overwrite it with an IRQ frame, corrupting the resumed GPRs (hito 5
+    // race: socket handle overwritten with "zo: mock" bytes).
     match s.proc(next_pid) {
         Some(p) if !p.saved_context.is_null() => p.saved_context.cast::<InterruptFrame>(),
         _ => frame,
