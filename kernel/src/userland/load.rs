@@ -255,6 +255,12 @@ pub(crate) fn resume_address() -> u64 {
 }
 
 extern "C" fn idle_resume() -> ! {
-    serial_println!("USER_RETURN_OK — user process exited, idle resumed");
-    crate::halt()
+    serial_println!("USER_RETURN_OK — user process exited");
+    // An unattended hardware demo must return to the firmware/GRUB
+    // one-shot (Debian), never park forever with a blank screen — that
+    // stranded the MacBook twice and required a physical power cycle.
+    // Wait a few seconds so the final banner stays readable, then reset.
+    serial_println!("user: demo finished — rebooting to the previous system");
+    crate::power::wait_ms(5_000);
+    crate::power::reboot()
 }
