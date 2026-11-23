@@ -289,7 +289,14 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
     if demo {
         // Hardware demo: the slirp mocks (10.0.2.2:8099) do not exist on
         // the real LAN, so skip the network proofs and run the staged
-        // userland ELF + the interactive shell directly.
+        // userland ELF + the interactive shell directly. Still bring up a
+        // static address + netlog so a remote operator can watch the
+        // markers over TCP (the MacBook has no serial port).
+        if let Some(stack) = stack.as_mut() {
+            stack.set_static_ipv4_at(hwtest::ADDR, hwtest::PREFIX, hwtest::GW);
+            let _ = stack.netlog_listen(crate::netlog::PORT);
+            serial_println!("hw: demo netlog on :{}", crate::netlog::PORT);
+        }
         serial_println!("hw: demo mode — userland + shell, no network proofs");
         crate::userland::boot_proof();
         match stack.as_mut() {

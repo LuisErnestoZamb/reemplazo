@@ -138,6 +138,7 @@ fn main() {
         "build" => build_kernel(&root),
         "user" => build_user(&root),
         "smoke-user" => smoke_user(&root),
+        "demo" => demo_qemu(&root),
         "iso" => iso(&root),
         "smoke" => smoke(&root),
         "smoke-install" => smoke_install(&root),
@@ -526,7 +527,7 @@ ls -l /work/boot/boot.img /work/boot/core.img /work/boot/grubpayload.bin
 ";
 
 fn iso(root: &Path) -> bool {
-    iso_inner(root, false, false)
+    iso_inner(root, false, false, false)
 }
 
 /// Hard cap on the `hello` module: the kernel's capture buffer is 4 MiB
@@ -611,7 +612,7 @@ fn stage_hello_module(root: &Path, iso_root: &Path, cfg_path: &Path) {
 /// authorized client's raw public key) and the GRUB config loads it
 /// as the multiboot2 module `sshd`, which switches the kernel into
 /// `crate::hwtest` (static address, sshd, no smoke chain).
-fn iso_inner(root: &Path, hwtest: bool, user_mode: bool) -> bool {
+fn iso_inner(root: &Path, hwtest: bool, user_mode: bool, demo: bool) -> bool {
     if !build_kernel(root) {
         return false;
     }
@@ -710,6 +711,20 @@ fn iso_inner(root: &Path, hwtest: bool, user_mode: bool) -> bool {
     // SHELL_OK (the module is captured before `memory::init`).
     if user_mode {
         stage_git_module(root, &iso_root, &boot_dir.join("grub.cfg"));
+    }
+    if demo {
+        // Repro of the MacBook `reemplazo-user` entry: the `demo` module
+        // makes the kernel skip the slirp-only proofs and run userland.
+        let _ = std::fs::write(iso_root.join("boot/demo.flag"), b"demo");
+        let cfg_path = boot_dir.join("grub.cfg");
+        if let Ok(cfg) = std::fs::read_to_string(&cfg_path) {
+            let cfg = cfg.replacen(
+                "    boot\n",
+                "    module2 /boot/demo.flag demo\n    boot\n",
+                1,
+            );
+            let _ = std::fs::write(&cfg_path, cfg);
+        }
     }
     // I1b: the config embedded in the installed disk's core.img.
     if let Err(e) = std::fs::write(iso_root.join("boot/early.cfg"), GRUB_EARLY_CFG) {
@@ -1814,7 +1829,7 @@ fn smoke_netinstall_real(_root: &Path) -> bool {
 /// server's serial (with every drop/auth reason — the exact
 /// diagnosis the real MacBook needs) is printed live as `hwtest| …`.
 fn hwtest(root: &Path) -> bool {
-    if !iso_inner(root, true, false) {
+    if !iso_inner(root, true, false, false) {
         return false;
     }
     let iso_dir = root.join("target/iso-root");
@@ -2074,6 +2089,62 @@ fn netlog_probe(container: &str) -> Result<usize, String> {
 /// module and asserts the hito-1 markers (ELF_OK, USER_RUN_OK,
 /// SYSCALL_OK, USER_RETURN_OK) plus hito 2 (SCHED_RR_OK, USER_YIELD_OK,
 /// USER_FAULT_OK) after the unchanged boot chain.
+/// QEMU repro of the MacBook `reemplazo-user` GRUB entry (hello+demo,
+/// no sshd): prints the full serial so a triple fault / hang is visible.
+fn demo_qemu(root: &Path) -> bool {
+    if !iso_inner(root, false, true, true) {
+        return false;
+    }
+    let container = vm_container(root, "demo");
+    rm_container(&container);
+    let iso_root = root.join("target/iso-root");
+    let monitor = format!("tcp:127.0.0.1:{},server,nowait", monitor_port(root));
+    let args = qemu_std_args_ex("/iso/os.iso", &monitor, "stdio", None);
+    let mut child = match Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "-i",
+            "--name",
+            &container,
+            "-v",
+            &format!("{}:/iso", iso_root.display()),
+            "reemplazo-tools",
+            "qemu-system-x86_64",
+        ])
+        .args(&args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("demo: docker: {e}");
+            return false;
+        }
+    };
+    let rx = spawn_line_reader(&mut child);
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let mut ok = false;
+    while let Ok(line) = rx.recv_timeout(
+        deadline
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_millis(1)),
+    ) {
+        println!("demo| {line}");
+        if line.contains("demo mode") || line.contains("USER_RUN_OK") {
+            ok = true;
+        }
+        if line.contains("FATAL") || line.contains("EXC:") || line.contains("PANIC") {
+            break;
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    rm_container(&container);
+    ok
+}
+
 fn smoke_user(root: &Path) -> bool {
     let markers: Vec<&str> = vec![
         "BOOT_OK",
@@ -2118,7 +2189,7 @@ fn smoke_user(root: &Path) -> bool {
         "USER_YIELD_OK",
         "USER_FAULT_OK",
     ];
-    if !iso_inner(root, false, true) {
+    if !iso_inner(root, false, true, false) {
         return false;
     }
     boot_assert(root, "smoke-user", &markers, SMOKE_TIMEOUT, &[], &[], true)
