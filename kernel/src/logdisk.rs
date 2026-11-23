@@ -98,6 +98,12 @@ pub fn enabled() -> bool {
     unsafe { ENABLED }
 }
 
+/// Number of records accepted by the disk so far. Used by the SSH
+/// bring-up probe to report the log state without a serial port.
+pub fn count() -> u32 {
+    unsafe { SEQ }
+}
+
 /// Append one 512-byte record. `code` is a stable phase id; `label` is a
 /// short ASCII tag. Truncates the label and silently stops at capacity —
 /// logging must never become a boot failure path.

@@ -1023,7 +1023,7 @@ fn run_command(
     stack: &mut Stack,
     command: &[u8],
 ) -> ([u8; ssh_wire::EXEC_COMMAND_MAX], usize, u32) {
-    const UNKNOWN: &[u8] = b"sshd: unknown command (echo|reboot|showcase)\n";
+    const UNKNOWN: &[u8] = b"sshd: unknown command (echo|reboot|showcase|logstatus)\n";
     let mut out = [0u8; ssh_wire::EXEC_COMMAND_MAX];
     let rest = command.trim_ascii();
     if let Some(args) = rest.strip_prefix(b"echo")
@@ -1034,6 +1034,24 @@ fn run_command(
         out[..len].copy_from_slice(&msg[..len]);
         out[len] = b'\n';
         return (out, len + 1, 0);
+    }
+    if rest == b"logstatus" {
+        // Bring-up diagnostic over the one channel this machine has.
+        // Reports whether a provisioned log disk was found and attempts
+        // a real write so a high-LBA AHCI failure is visible remotely.
+        let before = crate::logdisk::count();
+        if crate::logdisk::enabled() {
+            crate::logdisk::log(0xE3, b"SSH log probe");
+        }
+        let text = alloc::format!(
+            "log: enabled={} records={}->{}\n",
+            crate::logdisk::enabled(),
+            before,
+            crate::logdisk::count()
+        );
+        let len = text.len().min(out.len());
+        out[..len].copy_from_slice(text.as_bytes());
+        return (out, len, 0);
     }
     if rest == b"showcase" {
         // Remote visual demo: run the three full-screen apps on the
