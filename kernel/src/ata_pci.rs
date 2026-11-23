@@ -84,6 +84,7 @@ pub(crate) struct PciIde {
     cmd: u16,
     ctl: u16,
     pub(crate) sectors: u32,
+    unit: u8,
 }
 
 impl PciIde {
@@ -91,6 +92,7 @@ impl PciIde {
         cmd: 0,
         ctl: 0,
         sectors: 0,
+        unit: 0,
     };
 
     fn data(&self) -> u16 {
@@ -183,13 +185,13 @@ impl PciIde {
         }
     }
 
-    fn select(&self, unit: u8, lba: u32) {
+    fn select(&self, lba: u32) {
         // SAFETY: PCI BAR I/O ports; drive select then four alternate
         // status reads give the required >=400 ns settle time.
         unsafe {
             outb(
                 self.drive_head(),
-                0xE0 | (unit << 4) | (((lba >> 24) as u8) & 0x0F),
+                0xE0 | (self.unit << 4) | (((lba >> 24) as u8) & 0x0F),
             );
             for _ in 0..4 {
                 let _ = inb(self.alt_status());
@@ -212,7 +214,7 @@ impl PciIde {
             let Some(sector) = buf.get_mut(i * 512..i * 512 + 512) else {
                 return false;
             };
-            self.select(0, sector_lba);
+            self.select(sector_lba);
             if !self.wait_bsy_clear() {
                 return false;
             }
@@ -253,7 +255,7 @@ impl PciIde {
             let Some(sector) = buf.get(i * 512..i * 512 + 512) else {
                 return false;
             };
-            self.select(0, sector_lba);
+            self.select(sector_lba);
             if !self.wait_bsy_clear() {
                 return false;
             }
@@ -280,29 +282,10 @@ impl PciIde {
     }
 }
 
-/// Find the ICH7 SATA-in-IDE controller and bring up its first channel.
-/// Silent when absent (the QEMU smokes have no such device) or when no
-/// drive answers IDENTIFY — logging then simply stays disabled.
-pub(crate) fn probe(scan: &Scan) -> Option<PciIde> {
-    let Some(dev) = scan.find(ICH7_SATA_IDE.0, ICH7_SATA_IDE.1) else {
-        mark(0, 0, 0, 0, 0);
-        return None;
-    };
-    // Firmware normally leaves I/O + bus master enabled (Linux sees
-    // them set). Set them explicitly: a PIO-only path still needs the
-    // channel's I/O decode turned on.
-    let command = crate::pci::read32(dev.location, 0x04);
-    crate::pci::write32(dev.location, 0x04, command | 0x05);
-
-    let bar0 = crate::pci::read32(dev.location, 0x10);
-    let bar1 = crate::pci::read32(dev.location, 0x14);
-    if bar0 & 1 == 0 || bar1 & 1 == 0 {
-        mark(1, bar0, bar1, 0, 0);
-        return None; // memory-mapped or unimplemented: not our contract
-    }
-    mark(2, bar0, bar1, 0, 0);
-    let cmd = (bar0 & 0xFFF8) as u16;
-    let ctl = (bar1 & 0xFFFC) as u16;
+/// Try one (command, control, unit) combination with a bounded
+/// software reset and IDENTIFY. Returns the channel's capacity when a
+/// real ATA disk answers.
+fn identify_channel(cmd: u16, ctl: u16, unit: u8) -> Option<PciIde> {
     if cmd == 0 || ctl == 0 {
         return None;
     }
@@ -310,12 +293,12 @@ pub(crate) fn probe(scan: &Scan) -> Option<PciIde> {
         cmd,
         ctl,
         sectors: 0,
+        unit,
     };
     let (cmd_out, ctl_out) = (u32::from(cmd), u32::from(ctl));
 
-    // IDENTIFY unit 0 with bounded polls. The channel may still be in
-    // whatever state the previous firmware left it in, so issue the
-    // ATA software reset first (device-control SRST bit, then clear).
+    // The channel may still be in whatever state firmware left it in:
+    // issue an ATA software reset (SRST) first, then let it settle.
     // SAFETY: PCI BAR I/O ports; single-core boot, IRQ masked.
     let id = unsafe {
         outb(ch.alt_status(), 0x04);
@@ -326,7 +309,7 @@ pub(crate) fn probe(scan: &Scan) -> Option<PciIde> {
         for _ in 0..4 {
             let _ = inb(ch.alt_status());
         }
-        ch.select(0, 0);
+        ch.select(0);
         if !ch.wait_bsy_clear() {
             mark(5, cmd_out, ctl_out, 0, inb(ch.status()));
             return None;
@@ -348,7 +331,6 @@ pub(crate) fn probe(scan: &Scan) -> Option<PciIde> {
         words
     };
     if id[0] & 0x8000 != 0 {
-        mark(2, cmd_out, ctl_out, 0, 0);
         return None;
     }
     let sectors = u32::from(id[60]) | (u32::from(id[61]) << 16);
@@ -358,4 +340,44 @@ pub(crate) fn probe(scan: &Scan) -> Option<PciIde> {
     }
     mark(4, cmd_out, ctl_out, sectors, 0);
     Some(PciIde { sectors, ..ch })
+}
+
+/// Find the ICH7 SATA-in-IDE controller and bring up **every** channel/
+/// unit that answers IDENTIFY (Linux maps `[ P0 P2 -- -- ]`, so the
+/// boot disk may be master or slave of either channel). Silent when
+/// absent (the QEMU smokes have no such device).
+pub(crate) fn probe_all(scan: &Scan) -> alloc::vec::Vec<PciIde> {
+    let mut found = alloc::vec::Vec::new();
+    let Some(dev) = scan.find(ICH7_SATA_IDE.0, ICH7_SATA_IDE.1) else {
+        mark(0, 0, 0, 0, 0);
+        return found;
+    };
+    // Firmware normally leaves I/O + bus master enabled; set them
+    // explicitly so the channel's I/O decode is on either way.
+    let command = crate::pci::read32(dev.location, 0x04);
+    crate::pci::write32(dev.location, 0x04, command | 0x05);
+
+    let bar0 = crate::pci::read32(dev.location, 0x10);
+    let bar1 = crate::pci::read32(dev.location, 0x14);
+    let bar2 = crate::pci::read32(dev.location, 0x18);
+    let bar3 = crate::pci::read32(dev.location, 0x1C);
+    if bar0 & 1 == 0 || bar1 & 1 == 0 {
+        mark(1, bar0, bar1, 0, 0);
+        return found;
+    }
+    mark(2, bar0, bar1, 0, 0);
+    let channels = [(bar0, bar1), (bar2, bar3)];
+    for (cmd_bar, ctl_bar) in channels {
+        if cmd_bar & 1 == 0 || ctl_bar & 1 == 0 {
+            continue;
+        }
+        let cmd = (cmd_bar & 0xFFF8) as u16;
+        let ctl = (ctl_bar & 0xFFFC) as u16;
+        for unit in 0..2u8 {
+            if let Some(ch) = identify_channel(cmd, ctl, unit) {
+                found.push(ch);
+            }
+        }
+    }
+    found
 }

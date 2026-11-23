@@ -277,11 +277,13 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
         // The MacBook's ICH7 SATA controller is in IDE mode (class
         // 01/01/8f), so neither the AHCI nor the legacy-ISA probe sees
         // its disk. Bind the PCI-native IDE channel directly.
-        if !crate::logdisk::enabled()
-            && let Some(channel) = crate::ata_pci::probe(&scan)
-            && crate::logdisk::init_pci(&channel)
-        {
-            crate::logdisk::log(0x18, b"log disk (pci-ide)");
+        if !crate::logdisk::enabled() {
+            for channel in crate::ata_pci::probe_all(&scan) {
+                if crate::logdisk::init_pci(&channel) {
+                    crate::logdisk::log(0x18, b"log disk (pci-ide)");
+                    break;
+                }
+            }
         }
     }
     let _ = &log_disk_owner; // keep the borrow alive until kernel_main ends
