@@ -1123,21 +1123,15 @@ Ese paso destruye la tabla de particiones actual de Debian y solo debe hacerse
 cuando el operador esté delante de la máquina y haya decidido reemplazar Debian.
 No está automatizado a propósito.
 
-## Watchdog del bring-up: limitación observada en hardware (2026-11-22)
+## Nota de diagnóstico: watchdog del bring-up (2026-11-22)
 
-El watchdog de 10 min en `hwtest::run` solo se evalúa **después** de que
-`serve_once` devuelve. Una conexión TCP que se mantiene abierta (o una
-serie de conexiones rápidas que reinician la ventana de aceptación)
-puede mantener `serve_once` ocupado y retrasar indefinidamente la
-evaluación del presupuesto. En un ciclo de pruebas con 40 sondas TCP
-seguidas, la máquina quedó sin respuesta (ni Debian ni :2222/:2224) y
-hizo falta apagarla con el botón de encendido.
+**Corrección**: una foto de la VGA en hardware real confirmó que el
+watchdog **sí funciona**: imprime `hw: serve round ended (45010 ms of
+600000 budget)`, luego `(90020 ms ...)`, re-listenando sshd cada 45 s.
+Un diagnóstico anterior (basado solo en ping/SSH fallidos) concluyó
+erróneamente que el watchdog estaba colgado. La causa real de la falta
+de respuesta era **conectividad Ethernet** (sin link), no el kernel.
 
-Mitigación provisional: **una sola conexión a la vez, con timeout corto
-y pausa entre intentos**; nunca sondear :2222 con `nc -z` en bucle
-(cada sondeo consume una de las 2 ventanas de `serve_once`).
-
-Fix pendiente: presupuesto **absoluto** comprobado desde el tick del PIT
-(independiente de `serve_once`), o un deadline global pasado a
-`sshd::serve_once` que fuerce el retorno aunque haya un cliente activo.
-Hasta entonces, el watchdog no garantiza el retorno a Debian.
+Lección: en hardware sin serial, verificar `SSHD_LISTEN_OK` / los
+contadores del budget en la VGA **antes** de deducir un fallo del
+watchdog desde el host.
