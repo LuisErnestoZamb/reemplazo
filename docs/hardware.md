@@ -1122,3 +1122,22 @@ marker en LBA0 del disco destino (offset 62 del sector, sin tocar BPB ni `55 AA`
 Ese paso destruye la tabla de particiones actual de Debian y solo debe hacerse
 cuando el operador esté delante de la máquina y haya decidido reemplazar Debian.
 No está automatizado a propósito.
+
+## Watchdog del bring-up: limitación observada en hardware (2026-11-22)
+
+El watchdog de 10 min en `hwtest::run` solo se evalúa **después** de que
+`serve_once` devuelve. Una conexión TCP que se mantiene abierta (o una
+serie de conexiones rápidas que reinician la ventana de aceptación)
+puede mantener `serve_once` ocupado y retrasar indefinidamente la
+evaluación del presupuesto. En un ciclo de pruebas con 40 sondas TCP
+seguidas, la máquina quedó sin respuesta (ni Debian ni :2222/:2224) y
+hizo falta apagarla con el botón de encendido.
+
+Mitigación provisional: **una sola conexión a la vez, con timeout corto
+y pausa entre intentos**; nunca sondear :2222 con `nc -z` en bucle
+(cada sondeo consume una de las 2 ventanas de `serve_once`).
+
+Fix pendiente: presupuesto **absoluto** comprobado desde el tick del PIT
+(independiente de `serve_once`), o un deadline global pasado a
+`sshd::serve_once` que fuerce el retorno aunque haya un cliente activo.
+Hasta entonces, el watchdog no garantiza el retorno a Debian.
