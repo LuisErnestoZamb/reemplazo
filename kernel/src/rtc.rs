@@ -102,3 +102,18 @@ fn cmos_read(reg: u8) -> u8 {
         inb(DATA)
     }
 }
+
+/// Write a byte of battery-backed CMOS NVRAM (offset `0x40`, general
+/// purpose — outside the RTC's time/alarm registers). Survives a warm
+/// reset, so a hardware demo can leave a trace of the last point it
+/// reached and a remote operator can read it from Debian after the
+/// watchdog/fault reboots the machine.
+pub fn trace(code: u8) {
+    // SAFETY: 0x70/0x71 are the standard CMOS pair on every target
+    // (verified on the MacBook and QEMU); 0x40 is a general-purpose
+    // NVRAM byte, no RTC function depends on it.
+    unsafe {
+        outb(INDEX, 0x40);
+        outb(DATA, code);
+    }
+}

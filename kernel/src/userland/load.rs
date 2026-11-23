@@ -207,6 +207,7 @@ pub(crate) fn boot_proof() {
                 raw.len()
             );
             serial_println!("ELF_OK"); // machine-checked by `cargo xtask smoke`
+            crate::rtc::trace(0xA3); // ELF parsed+mapped
             let cr3 = process.space.root.start_phys();
             let entry = process.entry;
             let ustack = process.user_stack_top;

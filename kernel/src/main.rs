@@ -301,7 +301,9 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
             let _ = stack;
         }
         serial_println!("hw: demo mode — userland + shell, no network proofs");
+        crate::rtc::trace(0xA1); // demo entered
         crate::userland::boot_proof();
+        crate::rtc::trace(0xA2); // ELF mapped and user process ran
         match stack.as_mut() {
             Some(stack) => shell::run(stack, &payloads),
             None => halt(),
