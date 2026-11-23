@@ -1042,18 +1042,35 @@ fn run_command(
         // — no reboot, no GRUB, no disk changes.
         serial_println!("ssh: showcase — TUI, editor, browser on VGA");
         crate::apps::tui::boot_proof();
-        crate::power::wait_ms(5_000);
+        crate::power::wait_ms(12_000);
         serial_println!("ssh: showcase — editor");
         crate::apps::editor::boot_proof();
-        crate::power::wait_ms(5_000);
+        crate::power::wait_ms(12_000);
         serial_println!("ssh: showcase — browser");
         crate::apps::browse::boot_proof(stack);
-        crate::power::wait_ms(5_000);
-        // Leave a visible banner until the next app or the watchdog.
+        crate::power::wait_ms(12_000);
+        // Leave a visible banner written DIRECTLY to the text buffer:
+        // the boot_proof calls above clear the real VGA at exit, and
+        // vga::mirror only stages into the console buffer, so a mirrored
+        // banner would be invisible here. put_cell writes hardware cells.
         crate::vga::clear_screen();
-        crate::vga::mirror(format_args!(
-            "=== reemplazo: TUI + editor + browser corrieron en VGA ===\n===> SSH showcase completo — vuelve a Debian por el watchdog <===\n"
-        ));
+        static BANNER: &[u8] = b"=== reemplazo: TUI + editor + browser on VGA ===";
+        let (cols, _rows) = crate::vga::dims().unwrap_or((80, 25));
+        let start = cols.saturating_sub(BANNER.len()) / 2;
+        for (i, &ch) in BANNER.iter().enumerate() {
+            let x = start.saturating_add(i);
+            if x < cols {
+                crate::vga::put_cell(x, 10, ch, 0x1F); // white on blue
+            }
+        }
+        let hint = b"--- SSH showcase complete ---";
+        let hx = cols.saturating_sub(hint.len()) / 2;
+        for (i, &ch) in hint.iter().enumerate() {
+            let x = hx.saturating_add(i);
+            if x < cols {
+                crate::vga::put_cell(x, 12, ch, 0x0F);
+            }
+        }
         let msg = b"showcase ok: tui + editor + browser drawn on VGA\n";
         let len = msg.len().min(out.len());
         out[..len].copy_from_slice(&msg[..len]);
