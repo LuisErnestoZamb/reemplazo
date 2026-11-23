@@ -56,13 +56,20 @@ pub(crate) fn probe(scan: &Scan) -> bool {
     unsafe {
         write8(base, SOFTWARE_RESET, 0x01);
         let mut spins = 0u32;
+        let mut reset_ok = true;
         while read8_reset(base) & 1 != 0 {
             spins += 1;
             if spins > POLL_LIMIT {
-                report("sdhost reset timeout", 0xEB);
-                return false;
+                reset_ok = false;
+                break;
             }
             core::hint::spin_loop();
+        }
+        // Some ICH7 SD implementations never clear the reset bit
+        // (notably with no card inserted). That is a diagnostic, not a
+        // reason to discard readable capability registers.
+        if !reset_ok {
+            report("sdhost reset bit stuck (no card?)", 0xEB);
         }
         let caps = read32(base, CAPABILITIES);
         let state = read32(base, PRESENT_STATE);

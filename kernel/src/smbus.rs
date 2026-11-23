@@ -24,7 +24,6 @@ const POLL_LIMIT: u32 = 2_000_000;
 const STS_BUSY: u8 = 0x01;
 const STS_ERR: u8 = 0x1C;
 const CNT_START: u8 = 0x40;
-const PROTOCOL_QUICK: u8 = 0x04;
 const PROTOCOL_BYTE: u8 = 0x08;
 
 pub(crate) struct Smbus {
@@ -86,25 +85,13 @@ impl Smbus {
         Some(data)
     }
 
-    /// SMBus quick write: the cheapest "is anybody at this address?"
-    /// probe. A NAK shows up as a status error, not a hang.
-    fn present(&self, addr: u8) -> bool {
-        // SAFETY: see `transact`.
-        unsafe {
-            outb(self.base, 0xFF);
-            outb(self.base + 4, addr << 1);
-            outb(self.base + 2, PROTOCOL_QUICK | CNT_START);
-        }
-        wait_start(self.base) && wait_done(self.base).is_some()
-    }
-
     fn read_byte(&self, addr: u8, cmd: u8) -> Option<u8> {
         self.transact(addr, cmd, true, PROTOCOL_BYTE)
     }
 }
 
-/// Probe the controller, then record the 7-bit devices that answer.
-/// Returns `false` when absent so the aggregator can mark it "not found".
+/// Bring up the controller and probe the Apple SMC address once.
+/// Returns `false` when the controller is absent.
 pub(crate) fn probe(scan: &Scan) -> bool {
     let Some(dev) = scan.find(ICH7_SMBUS.0, ICH7_SMBUS.1) else {
         return false;
@@ -125,31 +112,23 @@ pub(crate) fn probe(scan: &Scan) -> bool {
     let bus = Smbus { base };
     serial_println!("smbus: ICH7 at {:#x}", base);
 
-    let mut found = 0usize;
-    for addr in 0x08u8..=0x77 {
-        if bus.present(addr) {
-            serial_println!("smbus: device at 0x{:02X}", addr);
-            let line = alloc::format!("smbus device 0x{addr:02X} answered");
+    // The ICH7 does not report NAK for Quick writes the way the older
+    // SMBus hosts do: a blanket 0x08..0x77 scan returned 111 "devices".
+    // Do not invent hardware. Probe only the known Apple SMC address
+    // and record the raw byte as a bring-up hint, not as a device list.
+    let smc_byte = bus.read_byte(0x10, 0x30);
+    match smc_byte {
+        Some(byte) => {
+            let line = alloc::format!("smc 0x10 raw byte={byte:#x} (protocol pending)");
             let mut tag = [0u8; 112];
             let n = line.len().min(tag.len());
             tag[..n].copy_from_slice(&line.as_bytes()[..n]);
-            crate::logdisk::log(0xE4, &tag[..n]);
-            found += 1;
+            crate::logdisk::log(0xE5, &tag[..n]);
+            serial_println!("smbus: smc 0x10 raw byte={byte:#x}");
         }
+        None => serial_println!("smbus: no SMC answer at 0x10"),
     }
-    // A read of the SMC's "fan number" register (0x30 on Apple SMC)
-    // from the usual 0x10 address, recorded only when it answers.
-    if bus.present(0x10)
-        && let Some(n) = bus.read_byte(0x10, 0x30)
-    {
-        let line = alloc::format!("smc 0x10 fan-count byte={n:#x}");
-        let mut tag = [0u8; 112];
-        let len = line.len().min(tag.len());
-        tag[..len].copy_from_slice(&line.as_bytes()[..len]);
-        crate::logdisk::log(0xE5, &tag[..len]);
-    }
-    serial_println!("smbus: {found} devices answered");
-    let line = alloc::format!("smbus: {found} devices on 0x{base:x}");
+    let line = alloc::format!("smbus ready at {base:#x}; SMC protocol pending");
     crate::logdisk::log(0xE6, line.as_bytes());
     true
 }

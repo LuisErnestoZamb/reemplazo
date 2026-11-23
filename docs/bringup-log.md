@@ -119,3 +119,28 @@ The six `NEEDS_DRIVER` PCI functions are:
 The disk was found on the **second** PCI IDE channel (`0x20c0`/
 `0x20e8`, Linux's `MAP [ P0 P2 -- -- ]`), not the first — hence
 `probe_all` tries both channels and both units.
+
+## Driver backlog after the second bring-up round (2026-11-22)
+
+Brought up and logged on real hardware:
+
+- **EHCI USB** (`00:1d.7`): reset, RUN, 8-port inventory. All ports empty.
+- **SMBus** (`00:1f.3`): ICH7 controller enabled at `0xefa0`. A blanket
+  address scan reported 111 "devices" because the ICH7 does not surface
+  NAKs the way older SMBus hosts do; that scan was **removed** rather
+  than trusted. One raw SMC byte is recorded as a hint.
+- **SD host** (`00:07.0`): MMIO registers readable, but the reset bit
+  never clears on this controller (no card). Recorded as a diagnostic;
+  the device stays tagged `NEEDS_DRIVER` until card enumeration works.
+
+Still genuinely missing, with the concrete blocker:
+
+| Device | Why it is not a small driver |
+|---|---|
+| HDA audio `8086:27d8` | DMA ring buffers + codec verb/widget graph; no audio path yet |
+| ath9k `168c:0024` | needs firmware upload, 802.11 MAC, WPA crypto |
+| FireWire `11c1:5811` | OHCI-1394 async/isochronous DMA descriptor engine |
+| Apple SMC | SMBus bus is up, but the SMC command/response protocol is not implemented |
+
+The inventory now reports `missing=4` (down from 6); EHCI and SMBus no
+longer carry the tag once their drivers initialise.
