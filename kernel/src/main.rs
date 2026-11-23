@@ -124,6 +124,10 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
     // MacBook exposes no serial port. The multiboot tag re-checks this
     // (`vga::sync`) as soon as the boot information is parsed.
     vga::init(0xB8000, 80, 25, 160);
+    // Earliest possible CMOS trace: before the IDT/GDT changes and the
+    // whole boot chain. If a hardware boot resets with trace 0x01, the
+    // fault happened before kernel_main (entry.S/paging/mbi).
+    crate::rtc::trace(0x01);
     serial_println!("reemplazo kernel: long mode, multiboot2 handoff");
     init_logger();
 
@@ -166,7 +170,9 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
         }
     };
 
+    crate::rtc::trace(0x02); // MBI + memory + heap OK, about to arm IDT
     arm_interrupts();
+    crate::rtc::trace(0x03); // IDT/GDT/PIT armed
     // Userland boundary (GDT6/TSS + int 0x80 gate already installed by
     // entry.S/idt.rs): register the syscall and scheduler callbacks.
     crate::userland::install_hooks();
