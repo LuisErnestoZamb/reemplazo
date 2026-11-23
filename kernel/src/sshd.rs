@@ -1044,15 +1044,20 @@ fn run_command(
             crate::logdisk::log(0xE3, b"SSH log probe");
         }
         let (probes, fail, ahci, ide) = crate::logdisk::diagnostics();
+        let (pcistate, bar0, bar1, psec) = crate::ata_pci::diagnostics();
         let text = alloc::format!(
-            "log: enabled={} records={}->{} probes={} fail=0x{:02X} ahci={} ide={}\n",
+            "log: enabled={} records={}->{} probes={} fail=0x{:02X} ahci={} ide={} pciide={} bar0={:#x} bar1={:#x} sectors={}\n",
             crate::logdisk::enabled(),
             before,
             crate::logdisk::count(),
             probes,
             fail,
             ahci,
-            ide
+            ide,
+            pcistate,
+            bar0,
+            bar1,
+            psec
         );
         let len = text.len().min(out.len());
         out[..len].copy_from_slice(text.as_bytes());
