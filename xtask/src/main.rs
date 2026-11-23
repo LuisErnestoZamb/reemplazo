@@ -242,6 +242,12 @@ fn read_log(root: &Path) -> bool {
             break;
         }
         let seq = u16::from_le_bytes([chunk[8], chunk[9]]);
+        // The kernel restarts its sequence at 0 on every boot; sectors
+        // beyond the newest record still hold the previous boot's data.
+        // A sequence mismatch marks the end of the current log.
+        if usize::from(seq) != index {
+            break;
+        }
         let code = chunk[12];
         let label = &chunk[24..136];
         let end = label.iter().position(|&b| b == 0).unwrap_or(label.len());

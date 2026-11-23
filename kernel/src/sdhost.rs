@@ -73,6 +73,10 @@ pub(crate) fn probe(scan: &Scan) -> bool {
         }
         let caps = read32(base, CAPABILITIES);
         let state = read32(base, PRESENT_STATE);
+        if caps == 0 && state == 0 {
+            report("sdhost MMIO unreadable (BAR not powered?)", 0xEE);
+            return false;
+        }
         let card = state & (1 << 16) != 0;
         let line = alloc::format!(
             "sdhost ready at {base:#x} caps={caps:#x} card={}",
