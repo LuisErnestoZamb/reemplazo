@@ -1,0 +1,12 @@
+[package]
+name = "user-logger"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Standalone workspace root (like user/edit): xtask builds it with its own
+# RUSTFLAGS/CARGO_TARGET_DIR so the kernel's codegen is never affected.
+[workspace]
+
+[dependencies]
+userlib = { path = "../../userlib" }

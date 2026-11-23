@@ -195,6 +195,7 @@ pub(crate) fn load(raw: &[u8]) -> Result<LoadedProcess, LoadError> {
 /// `FATAL: elf:` + halt for a present but malformed module.
 pub(crate) fn boot_proof() {
     let Some(raw) = module::hello_bytes() else {
+        crate::logdisk::log(0xE1, b"no user module");
         return;
     };
     match load(raw) {
@@ -208,6 +209,7 @@ pub(crate) fn boot_proof() {
             );
             serial_println!("ELF_OK"); // machine-checked by `cargo xtask smoke`
             crate::rtc::trace(0xA3); // ELF parsed+mapped
+            crate::logdisk::log(0xA3, b"ELF mapped");
             let cr3 = process.space.root.start_phys();
             let entry = process.entry;
             let ustack = process.user_stack_top;
@@ -223,6 +225,7 @@ pub(crate) fn boot_proof() {
             // process's own kernel stack; cr3/kstack come from the page
             // table we just built. Interrupts are masked on the boot path.
             serial_println!("USER_RUN_OK pid={pid} entry={entry:#x}");
+            crate::logdisk::log(0xA6, b"PCB spawned");
             let frame = match crate::userland::sched::first_frame(pid) {
                 Some(f) => f,
                 None => {
@@ -241,6 +244,7 @@ pub(crate) fn boot_proof() {
         }
         Err(e) => {
             serial_println!("FATAL: elf: {:?}", e);
+            crate::logdisk::log(0xE2, b"ELF load failed");
             crate::halt();
         }
     }
@@ -256,6 +260,7 @@ pub(crate) fn resume_address() -> u64 {
 
 extern "C" fn idle_resume() -> ! {
     serial_println!("USER_RETURN_OK — user process exited");
+    crate::logdisk::log(0xA7, b"user exited");
     // An unattended hardware demo must return to the firmware/GRUB
     // one-shot (Debian), never park forever with a blank screen — that
     // stranded the MacBook twice and required a physical power cycle.

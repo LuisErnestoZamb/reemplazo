@@ -44,6 +44,9 @@ pub const NR_SOCK_SEND: u64 = 18;
 pub const NR_SOCK_RECV: u64 = 19;
 pub const NR_SOCK_CLOSE: u64 = 20;
 pub const NR_TLS_UPGRADE: u64 = 21;
+// Persistent bring-up log (mirrors kernel/src/userland/log.rs).
+pub const NR_LOG_WRITE: u64 = 28;
+pub const NR_LOG_READ: u64 = 29;
 
 // --- Hito 4: open flags and wire layouts ---------------------------------
 /// Read-only access (the default).
@@ -181,6 +184,23 @@ pub fn vga_peek(x: u16, y: u16) -> Option<(u8, u8)> {
         let packed = packed as u64;
         Some((packed as u8, (packed >> 8) as u8))
     }
+}
+
+// --- Persistent bring-up log ---------------------------------------------
+
+/// Append a short ASCII line to the on-disk bring-up log. `0` on success,
+/// negative errno when the log was not provisioned or the argument is
+/// invalid. Payloads longer than 112 bytes are rejected, not truncated.
+#[inline]
+pub fn log_write(bytes: &[u8]) -> i64 {
+    arch::syscall2(NR_LOG_WRITE, bytes.as_ptr() as u64, bytes.len() as u64)
+}
+
+/// Read one 512-byte log record by index. `0`/positive on success,
+/// negative errno when unavailable. `buf` must be exactly 512 bytes.
+#[inline]
+pub fn log_read(seq: u32, buf: &mut [u8; 512]) -> i64 {
+    arch::syscall3(NR_LOG_READ, seq as u64, buf.as_mut_ptr() as u64, 512)
 }
 
 // --- Hito 4: filesystem syscalls -----------------------------------------

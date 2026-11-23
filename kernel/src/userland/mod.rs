@@ -20,6 +20,7 @@ pub mod elf;
 pub mod fs;
 pub mod ipc;
 pub mod load;
+pub mod log;
 pub mod module;
 pub mod net;
 pub mod process;

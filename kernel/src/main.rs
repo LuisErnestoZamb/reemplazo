@@ -36,6 +36,7 @@ mod idt;
 mod install;
 mod keyboard;
 mod keyfile;
+mod logdisk;
 mod memory;
 mod pci;
 mod pic;
@@ -128,6 +129,7 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
     // whole boot chain. If a hardware boot resets with trace 0x01, the
     // fault happened before kernel_main (entry.S/paging/mbi).
     crate::rtc::trace(0x01);
+    crate::logdisk::early(0x11); // kernel_main entered
     serial_println!("reemplazo kernel: long mode, multiboot2 handoff");
     init_logger();
 
@@ -171,8 +173,10 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
     };
 
     crate::rtc::trace(0x02); // MBI + memory + heap OK, about to arm IDT
+    crate::logdisk::early(0x12); // MBI + memory + heap OK
     arm_interrupts();
     crate::rtc::trace(0x03); // IDT/GDT/PIT armed
+    crate::logdisk::early(0x13); // IDT/GDT/PIT armed
     // Userland boundary (GDT6/TSS + int 0x80 gate already installed by
     // entry.S/idt.rs): register the syscall and scheduler callbacks.
     crate::userland::install_hooks();
@@ -186,6 +190,7 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
     // xtask added `-usb -device usb-kbd` — the marker chain there is
     // untouched); `FATAL: usb:` + halt when one is present but broken.
     crate::usb::init(&scan);
+    crate::logdisk::early(0x14); // PCI scan + USB done
     // Installer milestone BLK_OK: prints only when a drive on the legacy
     // primary channel answers IDENTIFY *and* LBA0 carries the installer
     // magic — the main smoke has no disk, so its marker chain is untouched.
@@ -227,6 +232,13 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
     let source_disk = ide_drive
         .map(ata::Disk::Ide)
         .or_else(|| ahci_drive.map(ata::Disk::ahci));
+    // Persistent bring-up log: the driver stays in ring 0 (no IOMMU on
+    // the ICH7), but the formatting/viewing application is userland.
+    // Logging is inert unless the disk region was explicitly provisioned.
+    if let Some(disk) = source_disk.as_ref() {
+        crate::logdisk::init(disk);
+        crate::logdisk::log(0x15, b"disk probed");
+    }
     // The install target is probed **once, here** — before either
     // proof runs: the first install rewrites LBA0 (the protective
     // MBR), which is where the `reemplazo-target-v1` wipe marker
@@ -308,8 +320,18 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
         }
         serial_println!("hw: demo mode — userland + shell, no network proofs");
         crate::rtc::trace(0xA1); // demo entered
+        crate::logdisk::log(0xA1, b"demo entered");
+        crate::logdisk::log(
+            if stack.is_some() { 0xA4 } else { 0xA5 },
+            if stack.is_some() {
+                b"nic up"
+            } else {
+                b"no nic"
+            },
+        );
         crate::userland::boot_proof();
         crate::rtc::trace(0xA2); // ELF mapped and user process ran
+        crate::logdisk::log(0xA2, b"user process ran");
         match stack.as_mut() {
             Some(stack) => shell::run(stack, &payloads),
             None => halt(),

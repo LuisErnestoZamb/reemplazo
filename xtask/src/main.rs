@@ -23,7 +23,7 @@
 //! falls back to the same container (Homebrew can't build QEMU on macOS 13).
 
 use std::cell::RefCell;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio, exit};
@@ -123,6 +123,260 @@ fn monitor_port_n(root: &Path, n: u64) -> u16 {
     49152 + ((checkout_hash(root).wrapping_add(n)) % 16384) as u16
 }
 
+// --- Persistent bring-up log (host half) --------------------------------
+//
+// The kernel writes fixed records into a raw gap near the end of the
+// disk; these two commands provision the region once and read it back
+// from Debian after the watchdog reboots. No kernel source or QEMU
+// smoke changes: an unprovisioned region stays untouched by the OS.
+
+fn log_host() -> (String, String, String, u32) {
+    let host = std::env::var("REEMPLAZO_LOG_HOST").unwrap_or_else(|_| "luis@192.168.1.71".into());
+    let key = std::env::var("REEMPLAZO_LOG_KEY").unwrap_or_else(|_| {
+        format!(
+            "{}/.ssh/mac_legacy_rescue",
+            std::env::var("HOME").unwrap_or_default()
+        )
+    });
+    let dev = std::env::var("REEMPLAZO_LOG_DEV").unwrap_or_else(|_| "/dev/sda".into());
+    let lba = std::env::var("REEMPLAZO_LOG_LBA")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(234_440_708);
+    (host, key, dev, lba)
+}
+
+fn log_ssh(host: &str, key: &str, script: &str) -> bool {
+    matches!(
+        Command::new("ssh")
+            .args([
+                "-i",
+                key,
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "BatchMode=yes",
+                host,
+                script,
+            ])
+            .status(),
+        Ok(s) if s.success()
+    )
+}
+
+/// Write the provisioning header into the unused gap before the backup
+/// GPT. `conv=notrunc` keeps the GPT intact; the region is outside every
+/// partition (the MacBook's sda3 ends at 234440703, backup GPT starts at
+/// 234441615) and outside GRUB's block list.
+fn provision_log(root: &Path) -> bool {
+    let (host, key, dev, lba) = log_host();
+    let mut header = [0u8; 512];
+    header[..16].copy_from_slice(b"REEMPLAZO-LOG-v1");
+    let local = root.join("target/log-header.bin");
+    if std::fs::create_dir_all(local.parent().unwrap()).is_err()
+        || std::fs::write(&local, header).is_err()
+    {
+        eprintln!("provisionlog: cannot write {local:?}");
+        return false;
+    }
+    let remote = "/tmp/reemplazo-log-header.bin";
+    if !matches!(
+        Command::new("scp")
+            .args(["-i", &key, &local.to_string_lossy(), &format!("{host}:{remote}")])
+            .status(),
+        Ok(s) if s.success()
+    ) {
+        eprintln!("provisionlog: scp failed");
+        return false;
+    }
+    let script = format!(
+        "sudo -n dd if={remote} of={dev} bs=512 seek={lba} count=1 conv=notrunc status=none && sudo -n dd if={dev} bs=512 skip={lba} count=1 status=none | head -c 16"
+    );
+    if !log_ssh(&host, &key, &script) {
+        eprintln!("provisionlog: dd failed (is Debian up? is sudo passwordless?)");
+        return false;
+    }
+    println!("provisionlog: magic written at LBA {lba} of {dev}");
+    true
+}
+
+/// Fetch the log records and print them. Records are 512 bytes; the
+/// first sector is the provisioning header, so records start at LBA+1.
+fn read_log(root: &Path) -> bool {
+    let (host, key, dev, lba) = log_host();
+    let remote = "/tmp/reemplazo-log.bin";
+    let script = format!(
+        "sudo -n dd if={dev} bs=512 skip={lba} count=901 of={remote} status=none && chmod 644 {remote}"
+    );
+    if !log_ssh(&host, &key, &script) {
+        eprintln!("readlog: dd failed (is Debian up?)");
+        return false;
+    }
+    let local = root.join("target/reemplazo-log.bin");
+    if !matches!(
+        Command::new("scp")
+            .args(["-i", &key, &format!("{host}:{remote}"), &local.to_string_lossy()])
+            .status(),
+        Ok(s) if s.success()
+    ) {
+        eprintln!("readlog: scp failed");
+        return false;
+    }
+    let bytes = match std::fs::read(&local) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("readlog: cannot read {local:?}: {e}");
+            return false;
+        }
+    };
+    if bytes.len() < 512 || &bytes[..16] != b"REEMPLAZO-LOG-v1" {
+        eprintln!("readlog: region at LBA {lba} is not provisioned");
+        return false;
+    }
+    let mut count = 0usize;
+    let records = (bytes.len() - 512) / 512;
+    for index in 0..records {
+        let at = 512 + index * 512;
+        let chunk = &bytes[at..at + 512];
+        if &chunk[..8] != b"RLOGv1\0\0" {
+            break;
+        }
+        let seq = u16::from_le_bytes([chunk[8], chunk[9]]);
+        let code = chunk[12];
+        let label = &chunk[24..136];
+        let end = label.iter().position(|&b| b == 0).unwrap_or(label.len());
+        let text = String::from_utf8_lossy(&label[..end]);
+        println!("log[{seq:>3}] code=0x{code:02X} {text}");
+        count += 1;
+    }
+    println!("readlog: {count} records from LBA {} ({local:?})", lba + 1);
+    true
+}
+
+/// QEMU proof of the persistent log path: boots the demo ISO with a
+/// provisioned FAT16 disk, runs `user/logger` in ring 3, then decodes the
+/// records from the disk image on the host. This is the regression net
+/// before touching real hardware (where there is no serial port).
+fn logtest(root: &Path) -> bool {
+    // SAFETY: xtask is single-threaded here; no other thread reads this
+    // variable while the demo ISO is being staged.
+    unsafe { std::env::set_var("REEMPLAZO_DEMO_MODULE", "logger") };
+    if !iso_inner(root, false, true, true) {
+        return false;
+    }
+    let iso_root = root.join("target/iso-root");
+    let disk = iso_root.join("disk.img");
+    if let Err(e) = write_disk_image(&disk) {
+        eprintln!("logtest: cannot create disk image: {e}");
+        return false;
+    }
+    let sectors = DISK_IMAGE_BYTES / 512;
+    let base = (sectors - 940) as usize;
+    let header_at = base * 512;
+    if let Err(e) = (|| -> std::io::Result<()> {
+        let mut f = std::fs::OpenOptions::new().write(true).open(&disk)?;
+        f.seek(SeekFrom::Start(header_at as u64))?;
+        f.write_all(b"REEMPLAZO-LOG-v1")?;
+        Ok(())
+    })() {
+        eprintln!("logtest: cannot provision header: {e}");
+        return false;
+    }
+    println!("logtest: provisioned LBA {base}");
+
+    let container = vm_container(root, "logtest");
+    rm_container(&container);
+    let monitor = format!("tcp:127.0.0.1:{},server,nowait", monitor_port_n(root, 7));
+    let mut args = qemu_std_args_fw("/iso/os.iso", &monitor, "stdio", &[]);
+    args.push("-drive".into());
+    args.push("file=/iso/disk.img,if=ide,format=raw".into());
+    let mut child = match Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "-i",
+            "--name",
+            &container,
+            "-v",
+            &format!("{}:/iso", iso_root.display()),
+            "reemplazo-tools",
+            "qemu-system-x86_64",
+        ])
+        .args(&args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("logtest: docker: {e}");
+            return false;
+        }
+    };
+    let rx = spawn_line_reader(&mut child);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut provisioned = false;
+    let mut user_ran = false;
+    let mut fatal = false;
+    while let Ok(line) = rx.recv_timeout(
+        deadline
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_millis(1)),
+    ) {
+        println!("logtest| {line}");
+        if line.contains("log: provisioned") {
+            provisioned = true;
+        }
+        if line.contains("USER_RUN_OK") || line.contains("ELF_OK") {
+            user_ran = true;
+        }
+        if line.contains("FATAL") || line.contains("EXC:") || line.contains("PANIC") {
+            fatal = true;
+            break;
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    rm_container(&container);
+    if !provisioned || !user_ran || fatal {
+        eprintln!("logtest: boot proof incomplete");
+        return false;
+    }
+    let bytes = match std::fs::read(&disk) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("logtest: cannot read disk back: {e}");
+            return false;
+        }
+    };
+    if bytes.len() < header_at + 1024 || &bytes[header_at..header_at + 16] != b"REEMPLAZO-LOG-v1" {
+        eprintln!("logtest: header lost");
+        return false;
+    }
+    let mut count = 0usize;
+    for index in 0..32usize {
+        let at = header_at + 512 + index * 512;
+        let chunk = &bytes[at..at + 512];
+        if &chunk[..8] != b"RLOGv1\0\0" {
+            break;
+        }
+        let label = &chunk[24..136];
+        let end = label.iter().position(|&b| b == 0).unwrap_or(label.len());
+        println!(
+            "logtest| record[{index}] code=0x{:02X} {}",
+            chunk[12],
+            String::from_utf8_lossy(&label[..end])
+        );
+        count += 1;
+    }
+    if count < 4 {
+        eprintln!("logtest: expected >=4 records, got {count}");
+        return false;
+    }
+    println!("logtest: PASS — {count} records survived in the disk image");
+    true
+}
+
 fn main() {
     let cmd = std::env::args().nth(1).unwrap_or_default();
     let root = repo_root();
@@ -146,9 +400,12 @@ fn main() {
         "smoke-netinstall-real" => smoke_netinstall_real(&root),
         "run" => run(&root),
         "hwtest" => hwtest(&root),
+        "provisionlog" => provision_log(&root),
+        "readlog" => read_log(&root),
+        "logtest" => logtest(&root),
         _ => {
             eprintln!(
-                "usage: cargo xtask <check|build|user|iso|smoke|smoke-user|smoke-install|smoke-ssh|smoke-netinstall-real|run|hwtest>"
+                "usage: cargo xtask <check|build|user|iso|smoke|smoke-user|smoke-install|smoke-ssh|smoke-netinstall-real|run|hwtest|provisionlog|readlog|logtest>"
             );
             false
         }
@@ -716,15 +973,25 @@ fn iso_inner(root: &Path, hwtest: bool, user_mode: bool, demo: bool) -> bool {
         stage_net_module(root, &iso_root, &boot_dir.join("grub.cfg"));
     }
     if demo {
-        // The demo boots the *real* user editor (hito 7): build it with
-        // the code-model=large flag scoped to that crate, and stage it
-        // as the `hello` module (the U1 loader's single capture slot).
-        let edit_manifest = root.join("user/edit/Cargo.toml");
-        let edit_status = Command::new("cargo")
+        // The demo boots a *real* user process (hito 7): either the
+        // editor (default) or the persistent log viewer, selected with
+        // REEMPLAZO_DEMO_MODULE=logger. Both crates have their own
+        // workspace, so CARGO_TARGET_DIR must point at that crate's
+        // target dir — reading the root `target/` here used to stage a
+        // STALE ELF (the cause of "QEMU passed, hardware showed nothing").
+        let use_logger = std::env::var("REEMPLAZO_DEMO_MODULE").as_deref() == Ok("logger");
+        let (crate_dir, binary) = if use_logger {
+            ("logger", "user-logger")
+        } else {
+            ("edit", "user-edit")
+        };
+        let manifest = root.join(format!("user/{crate_dir}/Cargo.toml"));
+        let target_dir = root.join(format!("user/{crate_dir}/target"));
+        let status = Command::new("cargo")
             .args([
                 "build",
                 "--manifest-path",
-                &edit_manifest.to_string_lossy(),
+                &manifest.to_string_lossy(),
                 "--release",
                 "--target",
                 "x86_64-unknown-none",
@@ -733,15 +1000,22 @@ fn iso_inner(root: &Path, hwtest: bool, user_mode: bool, demo: bool) -> bool {
                 "RUSTFLAGS",
                 "-C target-cpu=x86-64 -C relocation-model=static -C code-model=large",
             )
+            .env("CARGO_TARGET_DIR", &target_dir)
             .current_dir(root)
             .status();
-        if !matches!(edit_status, Ok(s) if s.success()) {
-            eprintln!("demo: cannot build user-edit");
+        if !matches!(status, Ok(s) if s.success()) {
+            eprintln!("demo: cannot build user-{crate_dir}");
             return false;
         }
-        let edit_elf = root.join("target/x86_64-unknown-none/release/user-edit");
-        if let Ok(bytes) = std::fs::read(&edit_elf) {
-            let _ = std::fs::write(iso_root.join("boot/hello.elf"), bytes);
+        let elf = target_dir.join("x86_64-unknown-none/release").join(binary);
+        match std::fs::read(&elf) {
+            Ok(bytes) => {
+                let _ = std::fs::write(iso_root.join("boot/hello.elf"), bytes);
+            }
+            Err(e) => {
+                eprintln!("demo: cannot read {}: {e}", elf.display());
+                return false;
+            }
         }
         let _ = std::fs::write(iso_root.join("boot/demo.flag"), b"demo");
         let cfg_path = boot_dir.join("grub.cfg");
