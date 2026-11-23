@@ -44,6 +44,27 @@ const EARLY_CAP: usize = 32;
 static mut EARLY: [u8; EARLY_CAP] = [0; EARLY_CAP];
 static mut EARLY_LEN: usize = 0;
 
+/// Bring-up diagnostics exposed over SSH (`logstatus`): how many disks
+/// were tried and why the last one was rejected. 0 = ok, 1 = LBA out of
+/// range, 2 = sector read failed, 3 = magic mismatch.
+static mut PROBES: u32 = 0;
+static mut LAST_FAIL: u8 = 0xFF;
+static mut AHCI_SEEN: u32 = 0;
+static mut IDE_SEEN: u32 = 0;
+
+pub fn diagnostics() -> (u32, u8, u32, u32) {
+    // SAFETY: single-core boot, these are written only during init.
+    unsafe { (PROBES, LAST_FAIL, AHCI_SEEN, IDE_SEEN) }
+}
+
+pub fn note_disks(ahci: u32, ide: u32) {
+    // SAFETY: see above.
+    unsafe {
+        AHCI_SEEN = ahci;
+        IDE_SEEN = ide;
+    }
+}
+
 /// Record a pre-disk phase code. Safe before `init`; replayed on it.
 pub fn early(code: u8) {
     // SAFETY: single-core boot, no other caller of these statics.
@@ -63,14 +84,19 @@ fn base_lba(disk: &ata::Disk) -> Option<u32> {
 /// region was explicitly provisioned. A failed read or a missing magic
 /// leaves the module inert: no sector is ever written.
 pub fn init(disk: &ata::Disk) -> bool {
+    // SAFETY: single-core boot; only init writes these counters.
+    unsafe { PROBES += 1 };
     let Some(base) = base_lba(disk) else {
+        unsafe { LAST_FAIL = 1 };
         return false;
     };
     let mut header = [0u8; 512];
     if !disk.read_sectors(base, &mut header) {
+        unsafe { LAST_FAIL = 2 };
         return false;
     }
     if &header[..16] != HEADER_MAGIC {
+        unsafe { LAST_FAIL = 3 };
         return false;
     }
     // SAFETY: single-core boot; no IRQ handler touches these statics and
@@ -91,6 +117,7 @@ pub fn init(disk: &ata::Disk) -> bool {
         }
         EARLY_LEN = 0;
     }
+    unsafe { LAST_FAIL = 0 };
     true
 }
 

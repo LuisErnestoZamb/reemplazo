@@ -1043,11 +1043,16 @@ fn run_command(
         if crate::logdisk::enabled() {
             crate::logdisk::log(0xE3, b"SSH log probe");
         }
+        let (probes, fail, ahci, ide) = crate::logdisk::diagnostics();
         let text = alloc::format!(
-            "log: enabled={} records={}->{}\n",
+            "log: enabled={} records={}->{} probes={} fail=0x{:02X} ahci={} ide={}\n",
             crate::logdisk::enabled(),
             before,
-            crate::logdisk::count()
+            crate::logdisk::count(),
+            probes,
+            fail,
+            ahci,
+            ide
         );
         let len = text.len().min(out.len());
         out[..len].copy_from_slice(text.as_bytes());

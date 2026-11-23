@@ -248,7 +248,13 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
         crate::logdisk::log(0x15, b"disk probed");
     }
     if source_disk.is_none() && !crate::logdisk::enabled() {
-        for disk in crate::ahci::list(&scan) {
+        let ahci_disks = crate::ahci::list(&scan);
+        let ide_disks = crate::ata::list();
+        crate::logdisk::note_disks(
+            ahci_disks.len() as u32,
+            ide_disks.iter().filter(|d| d.is_some()).count() as u32,
+        );
+        for disk in ahci_disks {
             let disk = ata::Disk::ahci(disk);
             if crate::logdisk::init(&disk) {
                 log_disk_owner = Some(disk);
@@ -257,7 +263,7 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
             }
         }
         if !crate::logdisk::enabled() {
-            for drive in crate::ata::list().into_iter().flatten() {
+            for drive in ide_disks.into_iter().flatten() {
                 let disk = ata::Disk::Ide(drive);
                 if crate::logdisk::init(&disk) {
                     log_disk_owner = Some(disk);
