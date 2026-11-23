@@ -294,8 +294,11 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
         // markers over TCP (the MacBook has no serial port).
         if let Some(stack) = stack.as_mut() {
             stack.set_static_ipv4_at(hwtest::ADDR, hwtest::PREFIX, hwtest::GW);
-            let _ = stack.netlog_listen(crate::netlog::PORT);
-            serial_println!("hw: demo netlog on :{}", crate::netlog::PORT);
+            // No netlog in demo mode: with no boot network chain there is
+            // no safe place to pump the stack (extra polls corrupt the
+            // mock-backed proofs). Use the VGA/serial on hardware and
+            // `cargo xtask demo` for a full serial capture in QEMU.
+            let _ = stack;
         }
         serial_println!("hw: demo mode — userland + shell, no network proofs");
         crate::userland::boot_proof();

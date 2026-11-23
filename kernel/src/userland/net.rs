@@ -138,6 +138,13 @@ fn pool_handle(index: usize) -> Option<SocketHandle> {
     unsafe { (*POOL.0.get())[index] }
 }
 
+/// Drive one stack iteration so netlog (and any other socket-backed
+/// service) makes progress while userland runs without the boot network
+/// chain. Fail-soft: no registered stack → no-op.
+pub fn pump() {
+    let _ = with_stack(|stack| stack.poll());
+}
+
 /// Run `f` with the registered kernel stack. `None` means the integrator
 /// did not call `register` (fail closed — no user process can touch the
 /// network stack by accident).
