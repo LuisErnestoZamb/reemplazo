@@ -229,10 +229,15 @@ fn read_log(root: &Path) -> bool {
             return false;
         }
     };
-    if bytes.len() < 512 || &bytes[..16] != b"REEMPLAZO-LOG-v1" {
+    if bytes.len() < 1024 || &bytes[..16] != b"REEMPLAZO-LOG-v1" {
         eprintln!("readlog: region at LBA {lba} is not provisioned");
         return false;
     }
+    if &bytes[512..520] != b"RLOGv1\0\0" {
+        eprintln!("readlog: no records from the current boot");
+        return false;
+    }
+    let nonce = [bytes[522], bytes[523]];
     let mut count = 0usize;
     let records = (bytes.len() - 512) / 512;
     for index in 0..records {
@@ -242,10 +247,9 @@ fn read_log(root: &Path) -> bool {
             break;
         }
         let seq = u16::from_le_bytes([chunk[8], chunk[9]]);
-        // The kernel restarts its sequence at 0 on every boot; sectors
-        // beyond the newest record still hold the previous boot's data.
-        // A sequence mismatch marks the end of the current log.
-        if usize::from(seq) != index {
+        // The kernel restarts both the sequence and the sector contents
+        // on every boot; stale sectors keep a *different* boot nonce.
+        if [chunk[10], chunk[11]] != nonce || usize::from(seq) != index {
             break;
         }
         let code = chunk[12];

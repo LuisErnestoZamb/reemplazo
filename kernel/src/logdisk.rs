@@ -43,6 +43,10 @@ static mut PCI: crate::ata_pci::PciIde = crate::ata_pci::PciIde::ZERO;
 static mut USE_PCI: bool = false;
 static mut ENABLED: bool = false;
 static mut SEQ: u32 = 0;
+/// Random per-boot tag; lets the host reader stop at the last record
+/// of the current boot instead of showing stale sectors from an older
+/// one (their sequence numbers restart at 0 too).
+static mut BOOT_NONCE: u16 = 0;
 
 fn read_at(lba: u32, buf: &mut [u8; 512]) -> bool {
     // SAFETY: single-core boot; the backend is set once by init and no
@@ -152,6 +156,7 @@ fn init_sectors(sectors: u32, transport: &'static str) -> bool {
     unsafe {
         ENABLED = true;
         SEQ = 0;
+        BOOT_NONCE = (crate::entropy::boot_entropy() ^ crate::clock::now_ms() as u32) as u16;
     }
     serial_println!("log: provisioned at LBA {base} on {transport}");
     log(0x01, b"log ready");
@@ -209,6 +214,7 @@ pub fn log(code: u8, label: &[u8]) {
     let mut buf = [0u8; 512];
     buf[..8].copy_from_slice(RECORD_MAGIC);
     buf[8..12].copy_from_slice(&seq.to_le_bytes());
+    buf[10..12].copy_from_slice(&unsafe { BOOT_NONCE }.to_le_bytes());
     buf[12] = code;
     let now = crate::clock::now_ms().to_le_bytes();
     buf[16..24].copy_from_slice(&now[..8]);
