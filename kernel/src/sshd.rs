@@ -942,7 +942,7 @@ fn channel_phase(stack: &mut Stack, wire: &mut Conn<'_, '_>) -> Wire {
     let mut sbuf = [0u8; SANITIZE_CAP];
     let text = ssh::sanitize(&command[..command_len], &mut sbuf);
     serial_println!("sshd: exec request: {text}");
-    let (out, out_len, status) = run_command(&command[..command_len]);
+    let (out, out_len, status) = run_command(stack, &command[..command_len]);
 
     // 4. Data, EOF, exit-status, close.
     // F6: split the exec output into packets that fit the peer's
@@ -1019,8 +1019,11 @@ fn channel_phase(stack: &mut Stack, wire: &mut Conn<'_, '_>) -> Wire {
 /// The S5b internal command handler: `echo <args>` only. A real shell
 /// (pipes, builtins, git-upload-pack) is the later shell/session
 /// milestone; this exists so bytes demonstrably cross the channel.
-fn run_command(command: &[u8]) -> ([u8; ssh_wire::EXEC_COMMAND_MAX], usize, u32) {
-    const UNKNOWN: &[u8] = b"sshd: unknown command (echo|reboot)\n";
+fn run_command(
+    stack: &mut Stack,
+    command: &[u8],
+) -> ([u8; ssh_wire::EXEC_COMMAND_MAX], usize, u32) {
+    const UNKNOWN: &[u8] = b"sshd: unknown command (echo|reboot|showcase)\n";
     let mut out = [0u8; ssh_wire::EXEC_COMMAND_MAX];
     let rest = command.trim_ascii();
     if let Some(args) = rest.strip_prefix(b"echo")
@@ -1031,6 +1034,30 @@ fn run_command(command: &[u8]) -> ([u8; ssh_wire::EXEC_COMMAND_MAX], usize, u32)
         out[..len].copy_from_slice(&msg[..len]);
         out[len] = b'\n';
         return (out, len + 1, 0);
+    }
+    if rest == b"showcase" {
+        // Remote visual demo: run the three full-screen apps on the
+        // MacBook's VGA with a pause between each so a human at the
+        // monitor can see them. Launched over SSH from the dev machine
+        // — no reboot, no GRUB, no disk changes.
+        serial_println!("ssh: showcase — TUI, editor, browser on VGA");
+        crate::apps::tui::boot_proof();
+        crate::power::wait_ms(5_000);
+        serial_println!("ssh: showcase — editor");
+        crate::apps::editor::boot_proof();
+        crate::power::wait_ms(5_000);
+        serial_println!("ssh: showcase — browser");
+        crate::apps::browse::boot_proof(stack);
+        crate::power::wait_ms(5_000);
+        // Leave a visible banner until the next app or the watchdog.
+        crate::vga::clear_screen();
+        crate::vga::mirror(format_args!(
+            "=== reemplazo: TUI + editor + browser corrieron en VGA ===\n===> SSH showcase completo — vuelve a Debian por el watchdog <===\n"
+        ));
+        let msg = b"showcase ok: tui + editor + browser drawn on VGA\n";
+        let len = msg.len().min(out.len());
+        out[..len].copy_from_slice(&msg[..len]);
+        return (out, len, 0);
     }
     if rest == b"reboot" {
         // Remote recovery: the operator can always return the machine
