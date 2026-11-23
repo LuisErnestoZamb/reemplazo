@@ -36,8 +36,40 @@ const LABEL_LEN: usize = 112;
 /// Borrowed disk from `kernel_main`. Its stack slot outlives every call
 /// here (kernel_main never returns), so this is valid for the whole boot.
 static mut DISK: *const ata::Disk = core::ptr::null();
+/// PCI-native IDE channel on the ICH7 SATA controller (the real
+/// MacBook). Owned by value — `PciIde` holds only port numbers and a
+/// capacity, no DMA frames — so no lifetime gymnastics are needed.
+static mut PCI: crate::ata_pci::PciIde = crate::ata_pci::PciIde::ZERO;
+static mut USE_PCI: bool = false;
 static mut ENABLED: bool = false;
 static mut SEQ: u32 = 0;
+
+fn read_at(lba: u32, buf: &mut [u8; 512]) -> bool {
+    // SAFETY: single-core boot; the backend is set once by init and no
+    // IRQ handler touches these statics.
+    unsafe {
+        if USE_PCI {
+            core::ptr::addr_of!(PCI).read().read_sectors(lba, buf)
+        } else if !DISK.is_null() {
+            (&*DISK).read_sectors(lba, buf)
+        } else {
+            false
+        }
+    }
+}
+
+fn write_at(lba: u32, buf: &[u8; 512]) -> bool {
+    // SAFETY: see `read_at`.
+    unsafe {
+        if USE_PCI {
+            core::ptr::addr_of!(PCI).read().write_sectors(lba, buf)
+        } else if !DISK.is_null() {
+            (&*DISK).write_sectors(lba, buf)
+        } else {
+            false
+        }
+    }
+}
 /// Phase codes recorded before the disk is probed, replayed in order by
 /// `init`. This is what makes a reset *before* the PCI scan diagnosable.
 const EARLY_CAP: usize = 32;
@@ -76,22 +108,40 @@ pub fn early(code: u8) {
     }
 }
 
-fn base_lba(disk: &ata::Disk) -> Option<u32> {
-    disk.sectors().checked_sub(LOG_LBA_FROM_END)
+/// Bind the boot's already-probed disk (installer source). The borrow
+/// lives in `kernel_main` for the whole boot.
+pub fn init(disk: &ata::Disk) -> bool {
+    // SAFETY: single-core boot; no IRQ handler touches these statics.
+    unsafe {
+        DISK = disk;
+        USE_PCI = false;
+    }
+    init_sectors(disk.sectors(), disk.transport())
 }
 
-/// Bind the boot's already-probed disk and enable logging only when the
-/// region was explicitly provisioned. A failed read or a missing magic
-/// leaves the module inert: no sector is ever written.
-pub fn init(disk: &ata::Disk) -> bool {
-    // SAFETY: single-core boot; only init writes these counters.
+/// Bind a PCI-native IDE channel (ICH7 SATA-in-IDE mode). Owned by value;
+/// no borrow outlives the call.
+pub fn init_pci(ch: &crate::ata_pci::PciIde) -> bool {
+    // SAFETY: see `init`.
+    unsafe {
+        PCI = *ch;
+        DISK = core::ptr::null();
+        USE_PCI = true;
+    }
+    init_sectors(ch.sectors, "pci-ide")
+}
+
+/// Enable logging only when the region carries the provisioning magic.
+/// A failed read or missing magic leaves the module inert: no sector is
+/// ever written.
+fn init_sectors(sectors: u32, transport: &'static str) -> bool {
     unsafe { PROBES += 1 };
-    let Some(base) = base_lba(disk) else {
+    let Some(base) = sectors.checked_sub(LOG_LBA_FROM_END) else {
         unsafe { LAST_FAIL = 1 };
         return false;
     };
     let mut header = [0u8; 512];
-    if !disk.read_sectors(base, &mut header) {
+    if !read_at(base, &mut header) {
         unsafe { LAST_FAIL = 2 };
         return false;
     }
@@ -99,14 +149,11 @@ pub fn init(disk: &ata::Disk) -> bool {
         unsafe { LAST_FAIL = 3 };
         return false;
     }
-    // SAFETY: single-core boot; no IRQ handler touches these statics and
-    // `disk` is a live borrow from kernel_main's stack for the whole boot.
     unsafe {
-        DISK = disk;
         ENABLED = true;
         SEQ = 0;
     }
-    serial_println!("log: provisioned at LBA {base} on {}", disk.transport());
+    serial_println!("log: provisioned at LBA {base} on {transport}");
     log(0x01, b"log ready");
     // SAFETY: see the single-core contract above.
     unsafe {
@@ -134,14 +181,25 @@ pub fn count() -> u32 {
 /// Append one 512-byte record. `code` is a stable phase id; `label` is a
 /// short ASCII tag. Truncates the label and silently stops at capacity —
 /// logging must never become a boot failure path.
+fn log_base() -> Option<u32> {
+    // SAFETY: single-core boot; backend set once by init.
+    unsafe {
+        let sectors = if USE_PCI {
+            core::ptr::addr_of!(PCI).read().sectors
+        } else if !DISK.is_null() {
+            (&*DISK).sectors()
+        } else {
+            0
+        };
+        sectors.checked_sub(LOG_LBA_FROM_END)
+    }
+}
+
 pub fn log(code: u8, label: &[u8]) {
-    let (on, ptr) = unsafe { (ENABLED, DISK) };
-    if !on || ptr.is_null() {
+    if !unsafe { ENABLED } {
         return;
     }
-    // SAFETY: see `init` — the borrowed disk outlives this call.
-    let disk = unsafe { &*ptr };
-    let Some(base) = base_lba(disk) else {
+    let Some(base) = log_base() else {
         return;
     };
     let seq = unsafe { SEQ };
@@ -156,7 +214,7 @@ pub fn log(code: u8, label: &[u8]) {
     buf[16..24].copy_from_slice(&now[..8]);
     let n = label.len().min(LABEL_LEN);
     buf[24..24 + n].copy_from_slice(&label[..n]);
-    if disk.write_sectors(base + 1 + seq, &buf) {
+    if write_at(base + 1 + seq, &buf) {
         unsafe { SEQ += 1 };
     }
 }
@@ -164,16 +222,13 @@ pub fn log(code: u8, label: &[u8]) {
 /// Read record `seq` into `out` (caller passes 512 bytes). Returns false
 /// when the log is off, the index is out of range or the disk read fails.
 pub fn read(seq: u32, out: &mut [u8; 512]) -> bool {
-    let (on, ptr) = unsafe { (ENABLED, DISK) };
-    if !on || ptr.is_null() || seq >= LOG_SECTORS - 1 {
+    if !unsafe { ENABLED } || seq >= LOG_SECTORS - 1 {
         return false;
     }
-    // SAFETY: see `init`.
-    let disk = unsafe { &*ptr };
-    let Some(base) = base_lba(disk) else {
+    let Some(base) = log_base() else {
         return false;
     };
-    if !disk.read_sectors(base + 1 + seq, out) {
+    if !read_at(base + 1 + seq, out) {
         return false;
     }
     &out[..8] == RECORD_MAGIC

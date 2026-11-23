@@ -76,3 +76,28 @@ For a machine whose last partition ends closer to the backup GPT, choose
 a different gap and set `REEMPLAZO_LOG_LBA` **and** the kernel's
 `LOG_LBA_FROM_END` together. Never provision over GRUB's block list or a
 filesystem area.
+
+## Hardware inventory (hito de bring-up)
+
+`kernel/src/hwdetect.rs` walks the boot's PCI scan right after the log
+is bound and records one line per function:
+
+- `0xD0` — driver present; `0xD1` — `NEEDS_DRIVER` (bring-up backlog);
+- `0xD2` — non-PCI platform device (SMC/fan, audio, Wi-Fi, SuperDrive,
+  Bluetooth); `0xD3` — inventory complete; `0xD4` — `devices=N missing=M`.
+
+This is what answers "what did this machine actually give us?" on a
+board with no serial cable: `cargo xtask readlog` shows the inventory
+after the watchdog reboots.
+
+### Real-hardware finding (2026-11-22)
+
+The MacBook's disk controller is **not AHCI**. `lspci` reports
+`00:1f.2 IDE interface [0101] 8086:27c4` with `ata_piix` and BARs
+`0x20c8`/`0x20ec` — ICH7-M SATA in **IDE mode**. The AHCI probe
+(class `01/06/01`) and the legacy-ISA probe (`0x1f0`) both miss it,
+which is why the first bring-up log had zero records. `kernel/src/
+ata_pci.rs` adds a minimal PIO/LBA28 driver for those PCI BARs (the
+log LBA 234440708 is below the 2^28 ceiling, so no LBA48 is needed).
+The installer's source/target selection is untouched: QEMU smokes
+keep their byte-identical IDE path.

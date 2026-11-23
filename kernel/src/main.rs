@@ -22,6 +22,7 @@ mod serial;
 mod ahci;
 mod apps;
 mod ata;
+mod ata_pci;
 mod browser;
 mod e1000;
 mod entropy;
@@ -31,6 +32,7 @@ mod git_fetch;
 mod git_push;
 mod git_store;
 mod heap;
+mod hwdetect;
 mod hwtest;
 mod idt;
 mod install;
@@ -272,8 +274,24 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
                 }
             }
         }
+        // The MacBook's ICH7 SATA controller is in IDE mode (class
+        // 01/01/8f), so neither the AHCI nor the legacy-ISA probe sees
+        // its disk. Bind the PCI-native IDE channel directly.
+        if !crate::logdisk::enabled()
+            && let Some(channel) = crate::ata_pci::probe(&scan)
+            && crate::logdisk::init_pci(&channel)
+        {
+            crate::logdisk::log(0x18, b"log disk (pci-ide)");
+        }
     }
     let _ = &log_disk_owner; // keep the borrow alive until kernel_main ends
+
+    // Hardware inventory: every PCI function plus the non-PCI platform
+    // devices, with a NEEDS_DRIVER tag for anything this OS cannot yet
+    // drive. Runs right after the log is bound so the records survive
+    // a reset even on a machine with no serial port.
+    crate::hwdetect::run(&scan);
+
     // The install target is probed **once, here** — before either
     // proof runs: the first install rewrites LBA0 (the protective
     // MBR), which is where the `reemplazo-target-v1` wipe marker
