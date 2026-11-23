@@ -101,3 +101,21 @@ ata_pci.rs` adds a minimal PIO/LBA28 driver for those PCI BARs (the
 log LBA 234440708 is below the 2^28 ceiling, so no LBA48 is needed).
 The installer's source/target selection is untouched: QEMU smokes
 keep their byte-identical IDE path.
+
+### Inventory captured on the real MacBook (2026-11-22)
+
+`cargo xtask readlog` returned 34 records: `devices=20 missing=6`.
+The six `NEEDS_DRIVER` PCI functions are:
+
+| LBA slot | Device | Function |
+|---|---|---|
+| 00:07.0 | `8086:27a3` | SD controller |
+| 00:1b.0 | `8086:27d8` | HDA audio |
+| 00:1d.7 | `8086:27cc` | EHCI USB |
+| 00:1f.3 | `8086:27da` | SMBus (Apple SMC / fans) |
+| 02:00.0 | `168c:0024` | Atheros Wi-Fi |
+| 03:03.0 | `11c1:5811` | FireWire |
+
+The disk was found on the **second** PCI IDE channel (`0x20c0`/
+`0x20e8`, Linux's `MAP [ P0 P2 -- -- ]`), not the first — hence
+`probe_all` tries both channels and both units.

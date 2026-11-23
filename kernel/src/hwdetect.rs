@@ -30,8 +30,12 @@ fn classify(dev: &Device) -> (&'static str, bool) {
         (0x8086, 0x100E) => return ("e1000", false),
         (0x11AB, 0x4362) => return ("sky2", false),
         (0x8086, 0x27C4) => return ("pci-ide (log path)", false),
-        (0x8086, 0x27D8) => return (NEEDS_DRIVER, true),
-        (0x168C, 0x0023) => return (NEEDS_DRIVER, true),
+        (0x8086, 0x27D8) => return ("HDA audio", true),
+        (0x8086, 0x27A3) => return ("SD controller", true),
+        (0x8086, 0x27CC) => return ("EHCI USB", true),
+        (0x8086, 0x27DA) => return ("SMBus / SMC", true),
+        (0x168C, 0x0023) | (0x168C, 0x0024) => return ("ath9k wifi", true),
+        (0x11C1, 0x5811) => return ("FireWire", true),
         _ => {}
     }
     // Class-code fallbacks for devices whose exact ID we have not
