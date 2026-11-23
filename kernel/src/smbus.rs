@@ -31,10 +31,30 @@ pub(crate) struct Smbus {
     base: u16,
 }
 
+/// Wait for the controller to actually assert BUSY after START. Without
+/// this step every address looks successful: reading status too early
+/// sees BUSY=0 and an error-free byte, which produced 111 fake devices
+/// on the first hardware run.
+fn wait_start(base: u16) -> bool {
+    let mut spins = 0u32;
+    loop {
+        // SAFETY: see `transact` — BAR-validated I/O port.
+        let st = unsafe { inb(base) };
+        if st & STS_BUSY != 0 {
+            return true;
+        }
+        spins += 1;
+        if spins > POLL_LIMIT {
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+}
+
 fn wait_done(base: u16) -> Option<u8> {
     let mut spins = 0u32;
     loop {
-        // SAFETY: see `status`.
+        // SAFETY: see `transact`.
         let st = unsafe { inb(base) };
         if st & STS_BUSY == 0 {
             return if st & STS_ERR != 0 { None } else { Some(st) };
@@ -56,6 +76,9 @@ impl Smbus {
             outb(self.base + 3, cmd);
             outb(self.base + 2, protocol | CNT_START);
         }
+        if !wait_start(self.base) {
+            return None;
+        }
         let st = wait_done(self.base)?;
         // SAFETY: see `transact`.
         let data = unsafe { inb(self.base + 5) };
@@ -72,7 +95,7 @@ impl Smbus {
             outb(self.base + 4, addr << 1);
             outb(self.base + 2, PROTOCOL_QUICK | CNT_START);
         }
-        wait_done(self.base).is_some()
+        wait_start(self.base) && wait_done(self.base).is_some()
     }
 
     fn read_byte(&self, addr: u8, cmd: u8) -> Option<u8> {
