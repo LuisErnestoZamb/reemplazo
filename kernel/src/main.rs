@@ -46,8 +46,10 @@ mod pit;
 mod port;
 mod power;
 mod rtc;
+mod sdhost;
 mod shell;
 mod sky2;
+mod smbus;
 mod ssh;
 mod sshd;
 mod tls;
@@ -58,6 +60,8 @@ mod vga;
 // The network chain runs on smoltcp (docs/smoltcp-eval.md — M2):
 // e1000 is the phy::Device, the old per-protocol drivers are gone.
 mod clock;
+mod drivers;
+mod ehci;
 mod netlog;
 mod netstack;
 
@@ -287,6 +291,11 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
         }
     }
     let _ = &log_disk_owner; // keep the borrow alive until kernel_main ends
+
+    // Optional drivers for the devices the first inventory tagged as
+    // missing. They run before the inventory so a successful bring-up
+    // removes the NEEDS_DRIVER tag. All are silent on QEMU.
+    crate::drivers::init(&scan);
 
     // Hardware inventory: every PCI function plus the non-PCI platform
     // devices, with a NEEDS_DRIVER tag for anything this OS cannot yet

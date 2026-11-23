@@ -81,6 +81,9 @@ pub(crate) fn run(scan: &Scan) {
     let mut missing = 0usize;
     for dev in scan.devices.iter().flatten() {
         let (driver, needs) = classify(dev);
+        // A driver that actually initialised stops advertising the
+        // device as undriven; the label already names the right driver.
+        let needs = needs && !crate::drivers::covers(dev);
         let line = format!(
             "PCI {} {:04x}:{:04x} class {:02x}{:02x} {}",
             dev.location, dev.vendor_id, dev.device_id, dev.class, dev.subclass, driver
