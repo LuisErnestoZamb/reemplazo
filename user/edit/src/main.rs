@@ -183,6 +183,52 @@ fn expect(ok: bool, what: &[u8]) {
 }
 
 #[unsafe(no_mangle)]
+/// Paint a real editor frame on the user's VGA console through the
+/// Vga* syscalls (hito 3): title bar, line-number gutter, a few lines of
+/// the document, an inverse cursor and a status bar. Unlike the internal
+/// gap-buffer proofs, this is what a human at the MacBook actually sees.
+fn draw_editor_frame(cols: u16, rows: u16) {
+    let _ = sys::vga_clear();
+    let put = |x: u16, y: u16, ch: u8, attr: u8| {
+        let _ = sys::vga_put_cell(x, y, ch, attr);
+    };
+    let text = b"reemplazo/editor  /NOTES.TXT  [user process, ring 3]";
+    for (i, &c) in text.iter().enumerate() {
+        if i < cols as usize { put(i as u16, 0, c, 0x1F); }
+    }
+    let lines: [&[u8]; 5] = [
+        b"// reemplazo - from-scratch OS",
+        b"fn main() {",
+        b"    println!(\"hello from userland\");",
+        b"}",
+        b"",
+    ];
+    let gutter = 5u16;
+    for (row, line) in lines.iter().enumerate() {
+        let y = 2 + row as u16;
+        if y >= rows.saturating_sub(2) { break; }
+        // gutter: line number
+        let num = [b'0' + (row + 1) as u8];
+        put(1, y, b'0' + (row + 1) as u8, 0x0E);
+        put(2, y, b' ', 0x07);
+        let _ = num;
+        for (i, &c) in line.iter().enumerate() {
+            let x = gutter + i as u16;
+            if x >= cols { break; }
+            put(x, y, c, 0x07);
+        }
+    }
+    // inverse cursor at start of line 3
+    put(gutter, 4, b' ', 0x70);
+    let status = b"-- INSERT --  utf8[bytes]  Ln 3, Col 1  |  Esc: exit  Ctrl-S: save";
+    let sy = rows.saturating_sub(1);
+    for (i, &c) in status.iter().enumerate() {
+        if i < cols as usize { put(i as u16, sy, c, 0x70); }
+    }
+    let _ = sys::vga_flush();
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn main() -> ! {
     // First syscall: VgaDims both claims console ownership and makes the
     // kernel publish this process's VMAs for every later user buffer.
@@ -203,6 +249,14 @@ pub extern "C" fn main() -> ! {
 
     fs_proof();
     editor_proof();
+
+    // Paint the editor for a human watching the MacBook's VGA. The
+    // interactive REPL below still runs afterwards for automated tests.
+    if let Some((cols, rows)) = sys::console_dims() {
+        draw_editor_frame(cols, rows);
+        // ~8 s of busy yields so the frame is readable on hardware.
+        for _ in 0..80 { let _ = sys::yield_now(); }
+    }
 
     // One-line REPL for the smoke's keyboard phase (unchanged contract).
     sys::write_str("uedit> ");

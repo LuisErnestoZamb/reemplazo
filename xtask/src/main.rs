@@ -716,6 +716,33 @@ fn iso_inner(root: &Path, hwtest: bool, user_mode: bool, demo: bool) -> bool {
         stage_net_module(root, &iso_root, &boot_dir.join("grub.cfg"));
     }
     if demo {
+        // The demo boots the *real* user editor (hito 7): build it with
+        // the code-model=large flag scoped to that crate, and stage it
+        // as the `hello` module (the U1 loader's single capture slot).
+        let edit_manifest = root.join("user/edit/Cargo.toml");
+        let edit_status = Command::new("cargo")
+            .args([
+                "build",
+                "--manifest-path",
+                &edit_manifest.to_string_lossy(),
+                "--release",
+                "--target",
+                "x86_64-unknown-none",
+            ])
+            .env(
+                "RUSTFLAGS",
+                "-C target-cpu=x86-64 -C relocation-model=static -C code-model=large",
+            )
+            .current_dir(root)
+            .status();
+        if !matches!(edit_status, Ok(s) if s.success()) {
+            eprintln!("demo: cannot build user-edit");
+            return false;
+        }
+        let edit_elf = root.join("target/x86_64-unknown-none/release/user-edit");
+        if let Ok(bytes) = std::fs::read(&edit_elf) {
+            let _ = std::fs::write(iso_root.join("boot/hello.elf"), bytes);
+        }
         let _ = std::fs::write(iso_root.join("boot/demo.flag"), b"demo");
         let cfg_path = boot_dir.join("grub.cfg");
         if let Ok(cfg) = std::fs::read_to_string(&cfg_path) {
