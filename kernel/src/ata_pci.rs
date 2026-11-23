@@ -38,12 +38,13 @@ const ICH7_SATA_IDE: (u16, u16) = (0x8086, 0x27C4);
 
 /// Boot-time snapshot for the SSH `logstatus` diagnostic: 0 = no
 /// matching PCI function, 1 = BARs not I/O, 2 = IDENTIFY failed,
-/// 3 = zero capacity, 4 = bound successfully.
-pub(crate) fn diagnostics() -> (u8, u32, u32, u32) {
+/// 3 = zero capacity, 4 = bound successfully, 5 = BSY never cleared,
+/// 6 = DRQ never asserted, 7 = IDENTIFY ERROR bit set.
+pub(crate) fn diagnostics() -> (u8, u32, u32, u32, u8) {
     // SAFETY: single-core boot; written only by `probe` at boot.
     unsafe {
         let d = core::ptr::addr_of!(DIAG).read();
-        (d.state, d.bar0, d.bar1, d.sectors)
+        (d.state, d.bar0, d.bar1, d.sectors, d.status)
     }
 }
 
@@ -52,6 +53,7 @@ struct Diag {
     bar0: u32,
     bar1: u32,
     sectors: u32,
+    status: u8,
 }
 
 static mut DIAG: Diag = Diag {
@@ -59,9 +61,10 @@ static mut DIAG: Diag = Diag {
     bar0: 0,
     bar1: 0,
     sectors: 0,
+    status: 0,
 };
 
-fn mark(state: u8, bar0: u32, bar1: u32, sectors: u32) {
+fn mark(state: u8, bar0: u32, bar1: u32, sectors: u32, status: u8) {
     // SAFETY: see `diagnostics`.
     unsafe {
         core::ptr::addr_of_mut!(DIAG).write(Diag {
@@ -69,6 +72,7 @@ fn mark(state: u8, bar0: u32, bar1: u32, sectors: u32) {
             bar0,
             bar1,
             sectors,
+            status,
         });
     }
 }
@@ -281,7 +285,7 @@ impl PciIde {
 /// drive answers IDENTIFY — logging then simply stays disabled.
 pub(crate) fn probe(scan: &Scan) -> Option<PciIde> {
     let Some(dev) = scan.find(ICH7_SATA_IDE.0, ICH7_SATA_IDE.1) else {
-        mark(0, 0, 0, 0);
+        mark(0, 0, 0, 0, 0);
         return None;
     };
     // Firmware normally leaves I/O + bus master enabled (Linux sees
@@ -293,10 +297,10 @@ pub(crate) fn probe(scan: &Scan) -> Option<PciIde> {
     let bar0 = crate::pci::read32(dev.location, 0x10);
     let bar1 = crate::pci::read32(dev.location, 0x14);
     if bar0 & 1 == 0 || bar1 & 1 == 0 {
-        mark(1, bar0, bar1, 0);
+        mark(1, bar0, bar1, 0, 0);
         return None; // memory-mapped or unimplemented: not our contract
     }
-    mark(2, bar0, bar1, 0);
+    mark(2, bar0, bar1, 0, 0);
     let cmd = (bar0 & 0xFFF8) as u16;
     let ctl = (bar1 & 0xFFFC) as u16;
     if cmd == 0 || ctl == 0 {
@@ -309,39 +313,49 @@ pub(crate) fn probe(scan: &Scan) -> Option<PciIde> {
     };
     let (cmd_out, ctl_out) = (u32::from(cmd), u32::from(ctl));
 
-    // IDENTIFY unit 0 with bounded polls. Packet devices and empty
-    // slots fail the same way: no sector capacity, no bind.
+    // IDENTIFY unit 0 with bounded polls. The channel may still be in
+    // whatever state the previous firmware left it in, so issue the
+    // ATA software reset first (device-control SRST bit, then clear).
     // SAFETY: PCI BAR I/O ports; single-core boot, IRQ masked.
     let id = unsafe {
+        outb(ch.alt_status(), 0x04);
+        for _ in 0..4 {
+            let _ = inb(ch.alt_status());
+        }
+        outb(ch.alt_status(), 0x00);
+        for _ in 0..4 {
+            let _ = inb(ch.alt_status());
+        }
         ch.select(0, 0);
         if !ch.wait_bsy_clear() {
-            mark(2, cmd_out, ctl_out, 0);
+            mark(5, cmd_out, ctl_out, 0, inb(ch.status()));
             return None;
         }
         outb(ch.command(), CMD_IDENTIFY);
         if !ch.wait_drq() {
-            mark(2, cmd_out, ctl_out, 0);
+            mark(6, cmd_out, ctl_out, 0, inb(ch.status()));
             return None;
         }
         let mut words = [0u16; 256];
         for word in &mut words {
             *word = inw(ch.data());
         }
-        if inb(ch.status()) & ST_ERR != 0 {
-            mark(2, cmd_out, ctl_out, 0);
+        let final_status = inb(ch.status());
+        if final_status & ST_ERR != 0 {
+            mark(7, cmd_out, ctl_out, 0, final_status);
             return None;
         }
         words
     };
     if id[0] & 0x8000 != 0 {
-        mark(2, cmd_out, ctl_out, 0);
+        mark(2, cmd_out, ctl_out, 0, 0);
         return None;
     }
     let sectors = u32::from(id[60]) | (u32::from(id[61]) << 16);
     if sectors == 0 {
-        mark(3, cmd_out, ctl_out, 0);
+        mark(3, cmd_out, ctl_out, 0, 0);
         return None;
     }
-    mark(4, cmd_out, ctl_out, sectors);
+    mark(4, cmd_out, ctl_out, sectors, 0);
     Some(PciIde { sectors, ..ch })
 }
