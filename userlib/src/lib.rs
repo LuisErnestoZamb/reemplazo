@@ -37,6 +37,13 @@ pub const NR_FS_READ: u64 = 12;
 pub const NR_FS_WRITE: u64 = 13;
 pub const NR_STAT: u64 = 14;
 pub const NR_READDIR: u64 = 15;
+// Hito 5 — network service (mirrors kernel/src/userland/net.rs).
+pub const NR_DNS_RESOLVE: u64 = 16;
+pub const NR_SOCK_CONNECT: u64 = 17;
+pub const NR_SOCK_SEND: u64 = 18;
+pub const NR_SOCK_RECV: u64 = 19;
+pub const NR_SOCK_CLOSE: u64 = 20;
+pub const NR_TLS_UPGRADE: u64 = 21;
 
 // --- Hito 4: open flags and wire layouts ---------------------------------
 /// Read-only access (the default).
@@ -65,6 +72,8 @@ pub const EINVAL: i64 = -1;
 pub const EFAULT: i64 = -2;
 pub const EPERM: i64 = -13;
 pub const ENOSYS: i64 = -38;
+/// `SockRecv` had no data ready: call `yield_now` and retry (hito 5).
+pub const EAGAIN: i64 = -11;
 
 /// Write `s` to stdout (fd 1). Returns the byte count, or a negative errno.
 #[inline]
@@ -262,6 +271,80 @@ pub fn dirent_name<'a>(record: &[u8], out: &'a mut [u8; DIRENT_NAME]) -> Option<
     }
     out[..n].copy_from_slice(&record[2..2 + n]);
     Some(&out[..n])
+}
+
+// --- Hito 5: network syscalls ---------------------------------------------
+
+/// Resolve `name` through the kernel-owned DNS socket. On success writes
+/// four IPv4 octets into `out[..4]` and returns them packed **big-endian**
+/// (`10.0.2.3` → `0x0a00_0203`); a negative value is an errno. Only IPv4
+/// literals and hosts on the kernel's TLS/DNS whitelist are accepted —
+/// the kernel never hands a resolver object to user space.
+#[inline]
+pub fn dns_resolve(name: &[u8], out: &mut [u8]) -> i64 {
+    arch::syscall4(
+        NR_DNS_RESOLVE,
+        name.as_ptr() as u64,
+        name.len() as u64,
+        out.as_mut_ptr() as u64,
+        out.len() as u64,
+    )
+}
+
+/// Open a TCP connection to `ip` (exactly four octets) and `port`. Returns
+/// an opaque handle (negative = errno); the kernel owns the socket and
+/// polls it, the process only ever holds the handle.
+#[inline]
+pub fn sock_connect(ip: &[u8], port: u16) -> i64 {
+    arch::syscall3(
+        NR_SOCK_CONNECT,
+        ip.as_ptr() as u64,
+        ip.len() as u64,
+        port as u64,
+    )
+}
+
+/// Send up to `bytes.len()` bytes on an opaque socket handle.
+#[inline]
+pub fn sock_send(handle: i64, bytes: &[u8]) -> i64 {
+    arch::syscall3(
+        NR_SOCK_SEND,
+        handle as u64,
+        bytes.as_ptr() as u64,
+        bytes.len() as u64,
+    )
+}
+
+/// Receive bytes into `buf`. Returns the byte count, `0` on peer FIN or
+/// [`EAGAIN`] when nothing is ready yet (then `yield_now` and retry), or a
+/// negative errno.
+#[inline]
+pub fn sock_recv(handle: i64, buf: &mut [u8]) -> i64 {
+    arch::syscall3(
+        NR_SOCK_RECV,
+        handle as u64,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+    )
+}
+
+/// Close an opaque socket handle. `0` on success, negative errno otherwise.
+#[inline]
+pub fn sock_close(handle: i64) -> i64 {
+    arch::syscall1(NR_SOCK_CLOSE, handle as u64)
+}
+
+/// Upgrade a connected plain handle to TLS for `host`. The kernel checks
+/// `host` against the pinned-root whitelist before doing any handshake and
+/// returns a **new** opaque handle (negative = errno).
+#[inline]
+pub fn tls_upgrade(handle: i64, host: &[u8]) -> i64 {
+    arch::syscall3(
+        NR_TLS_UPGRADE,
+        handle as u64,
+        host.as_ptr() as u64,
+        host.len() as u64,
+    )
 }
 
 /// The one piece of unsafe in this crate: the raw `int 0x80` wrappers.
