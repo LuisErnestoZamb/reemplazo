@@ -235,10 +235,39 @@ pub extern "C" fn kernel_main(magic: u32, mbi_addr: u64) -> ! {
     // Persistent bring-up log: the driver stays in ring 0 (no IOMMU on
     // the ICH7), but the formatting/viewing application is userland.
     // Logging is inert unless the disk region was explicitly provisioned.
-    if let Some(disk) = source_disk.as_ref() {
-        crate::logdisk::init(disk);
+    // The installer's `probe` above only returns a disk whose LBA0 has
+    // the *installer* magic — the MacBook has GRUB there, so that probe
+    // finds nothing. For the log we therefore probe by the LOG header
+    // instead: `ahci::list`/`ata::list` don't filter on LBA0. The owner
+    // stays alive in this stack frame for the whole boot (logdisk only
+    // borrows it).
+    let mut log_disk_owner: Option<ata::Disk> = None;
+    if let Some(disk) = source_disk.as_ref()
+        && crate::logdisk::init(disk)
+    {
         crate::logdisk::log(0x15, b"disk probed");
     }
+    if source_disk.is_none() && !crate::logdisk::enabled() {
+        for disk in crate::ahci::list(&scan) {
+            let disk = ata::Disk::ahci(disk);
+            if crate::logdisk::init(&disk) {
+                log_disk_owner = Some(disk);
+                crate::logdisk::log(0x16, b"log disk (ahci)");
+                break;
+            }
+        }
+        if !crate::logdisk::enabled() {
+            for drive in crate::ata::list().into_iter().flatten() {
+                let disk = ata::Disk::Ide(drive);
+                if crate::logdisk::init(&disk) {
+                    log_disk_owner = Some(disk);
+                    crate::logdisk::log(0x17, b"log disk (ide)");
+                    break;
+                }
+            }
+        }
+    }
+    let _ = &log_disk_owner; // keep the borrow alive until kernel_main ends
     // The install target is probed **once, here** — before either
     // proof runs: the first install rewrites LBA0 (the protective
     // MBR), which is where the `reemplazo-target-v1` wipe marker

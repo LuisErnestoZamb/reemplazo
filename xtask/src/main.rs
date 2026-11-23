@@ -206,7 +206,7 @@ fn read_log(root: &Path) -> bool {
     let (host, key, dev, lba) = log_host();
     let remote = "/tmp/reemplazo-log.bin";
     let script = format!(
-        "sudo -n dd if={dev} bs=512 skip={lba} count=901 of={remote} status=none && chmod 644 {remote}"
+        "sudo -n dd if={dev} bs=512 skip={lba} count=901 of={remote} status=none && sudo -n chmod 644 {remote}"
     );
     if !log_ssh(&host, &key, &script) {
         eprintln!("readlog: dd failed (is Debian up?)");

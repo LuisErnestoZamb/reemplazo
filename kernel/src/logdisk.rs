@@ -62,16 +62,16 @@ fn base_lba(disk: &ata::Disk) -> Option<u32> {
 /// Bind the boot's already-probed disk and enable logging only when the
 /// region was explicitly provisioned. A failed read or a missing magic
 /// leaves the module inert: no sector is ever written.
-pub fn init(disk: &ata::Disk) {
+pub fn init(disk: &ata::Disk) -> bool {
     let Some(base) = base_lba(disk) else {
-        return;
+        return false;
     };
     let mut header = [0u8; 512];
     if !disk.read_sectors(base, &mut header) {
-        return;
+        return false;
     }
     if &header[..16] != HEADER_MAGIC {
-        return;
+        return false;
     }
     // SAFETY: single-core boot; no IRQ handler touches these statics and
     // `disk` is a live borrow from kernel_main's stack for the whole boot.
@@ -91,6 +91,7 @@ pub fn init(disk: &ata::Disk) {
         }
         EARLY_LEN = 0;
     }
+    true
 }
 
 pub fn enabled() -> bool {
